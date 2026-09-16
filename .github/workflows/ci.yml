@@ -1,0 +1,116 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'New pre-release tag matching the source version, e.g. v0.2.0-rc1'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2025
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: 8.0.x
+      - id: version
+        name: Read source version
+        shell: powershell
+        run: |
+          $version = ([xml](Get-Content src\RemoteMonitorSlave\RemoteMonitorSlave.csproj -Raw)).Project.PropertyGroup.Version
+          if ($version -notmatch '^\d+\.\d+\.\d+$') { throw 'Invalid source version.' }
+          "value=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+      - name: Release build, self-tests, and ZIP packages
+        shell: powershell
+        run: .\scripts\build-package.ps1
+      - name: Build offline installers and checksums
+        shell: powershell
+        run: .\scripts\build-installers.ps1
+      - name: Confirm installer smoke host
+        shell: powershell
+        run: |
+          $version = [Environment]::OSVersion.Version
+          if ($version.Major -lt 10 -or $version.Build -lt 22000) { throw "Installer smoke host is below the Slave minimum: $version" }
+          Write-Host "Smoke host: $version (GitHub Windows Server runner; final Win11 field verification remains separate)."
+      - name: Install, upgrade, and uninstall smoke checks
+        shell: powershell
+        run: .\scripts\test-installers.ps1 -Role Both
+      - name: Show self-test output
+        if: always()
+        shell: powershell
+        run: Get-ChildItem dist\verification-*\*.log -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "=== $($_.Name) ==="; Get-Content $_.FullName }
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: Messenger-Remote-Control-v${{ steps.version.outputs.value }}-windows
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            dist/Messenger-Remote-Control-Master-Setup-${{ steps.version.outputs.value }}.exe
+            dist/Messenger-Remote-Control-Slave-Setup-${{ steps.version.outputs.value }}.exe
+            dist/Messenger-Remote-Control-v${{ steps.version.outputs.value }}-win7-win11-net48.zip
+            dist/Messenger-Remote-Control-Slave-v${{ steps.version.outputs.value }}-win11-net48.zip
+            dist/SHA256SUMS.txt
+
+  release:
+    if: github.event_name == 'workflow_dispatch'
+    needs: build
+    runs-on: windows-2025
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: Messenger-Remote-Control-v${{ needs.build.outputs.version }}-windows
+          path: dist
+      - name: Verify and publish immutable pre-release
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = ([xml](Get-Content src\RemoteMonitorSlave\RemoteMonitorSlave.csproj -Raw)).Project.PropertyGroup.Version
+          if ($env:GITHUB_REPOSITORY -cne 'yunhyok/Messenger-Remote-Control' -or $env:GITHUB_REF -cne 'refs/heads/main') {
+            throw 'Pre-releases may only be published from yunhyok/Messenger-Remote-Control main.'
+          }
+          if ($version -cne '${{ needs.build.outputs.version }}' -or
+              $env:RELEASE_TAG -cnotmatch ('^v' + [regex]::Escape($version) + '-rc[1-9][0-9]*$')) {
+            throw 'release_tag must be a new v<source-version>-rcN tag.'
+          }
+          $head = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0 -or $head -cne $env:GITHUB_SHA) { throw 'Checkout does not match the workflow commit.' }
+          .\scripts\check-release-assets.ps1 -AssetDirectory dist
+
+          $existingTag = git ls-remote --tags origin "refs/tags/$env:RELEASE_TAG"
+          if ($LASTEXITCODE -ne 0) { throw 'Unable to verify remote tags.' }
+          if ($existingTag) { throw 'Release tag already exists. Choose a new rc number; assets are never overwritten.' }
+          try {
+            $null = Invoke-RestMethod -Uri "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/releases/tags/$env:RELEASE_TAG" -Headers @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/vnd.github+json' }
+            throw 'Release already exists. Choose a new rc number; assets are never overwritten.'
+          } catch {
+            if ($null -eq $_.Exception.Response -or [int]$_.Exception.Response.StatusCode -ne 404) { throw }
+          }
+
+          $files = @(
+            (Resolve-Path "dist\Messenger-Remote-Control-Master-Setup-$version.exe").Path,
+            (Resolve-Path "dist\Messenger-Remote-Control-Slave-Setup-$version.exe").Path,
+            (Resolve-Path "dist\Messenger-Remote-Control-v$version-win7-win11-net48.zip").Path,
+            (Resolve-Path "dist\Messenger-Remote-Control-Slave-v$version-win11-net48.zip").Path,
+            (Resolve-Path 'dist\SHA256SUMS.txt').Path
+          )
+          gh api --method POST "repos/$env:GITHUB_REPOSITORY/git/refs" -f "ref=refs/tags/$env:RELEASE_TAG" -f "sha=$env:GITHUB_SHA" --silent
+          if ($LASTEXITCODE -ne 0) { throw 'Unable to create a new release tag at the workflow commit.' }
+          gh release create $env:RELEASE_TAG --verify-tag --prerelease --target $env:GITHUB_SHA --title "Messenger Remote Control $env:RELEASE_TAG" --notes "Pre-release build from commit $env:GITHUB_SHA. Includes separate offline Master and Slave installers, full and Slave-only ZIP packages, and SHA256SUMS.txt." @files
+          if ($LASTEXITCODE -ne 0) { throw 'gh release publish failed.' }
