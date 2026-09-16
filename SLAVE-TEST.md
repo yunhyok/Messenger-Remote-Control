@@ -2,7 +2,7 @@
 
 기존에 완료한 PowerSI 시험과 진행 중인 HFSS 시험을 반복하지 않습니다. 이 절차는 새 Master→Slave→메신저 보고 경로만 짧게 확인합니다.
 
-1. Slave 설치 파일 또는 Slave ZIP을 오프라인 Workstation으로 옮겨 실행합니다. 제목의 `Messenger Remote Control Slave v0.2.0`을 확인합니다. PowerSI와 HFSS는 그대로 둡니다.
+1. Slave 설치 파일 또는 Slave ZIP을 오프라인 Workstation으로 옮겨 실행합니다. 제목의 `Messenger Remote Control Slave v0.2.0`을 확인합니다. 작은 화면에서는 창의 스크롤로 하단 상태를 확인할 수 있습니다. PowerSI와 HFSS는 그대로 둡니다.
 2. 기존 연결 설정과 LM Studio 설정을 확인하고 Slave를 Start합니다. 설정이 꺼져 있거나 모델이 없으면 우선 그 상태에서 보고되는 복구 안내를 확인해도 됩니다.
 3. Master가 연결된 상태에서 모바일 나와의 대화에 `pwrsi`를 한 번 보냅니다. 최대 2분의 조회·정리 시간 뒤 분할 회신의 마지막 부분까지 확인합니다.
 4. 대상마다 이름과 PID가 있고, 원문/OCR 출처와 수집 시각이 구분되는지 봅니다. 긴 이름은 처음 전체로, 같은 보고서의 반복에서는 축약되어야 합니다.

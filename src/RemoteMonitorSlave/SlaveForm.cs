@@ -96,7 +96,9 @@ namespace RemoteMonitorSlave
             Font = new Font("Segoe UI", 9F);
             AutoScaleMode = AutoScaleMode.Dpi;
             ClientSize = new Size(840, 812);
-            MinimumSize = Size;
+            AutoScroll = true;
+            AutoScrollMinSize = ClientSize;
+            MinimumSize = new Size(640, 480);
             StartPosition = FormStartPosition.CenterScreen;
             dataPath = testDirectory ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "RemoteMonitorSlave");
             log = new SlaveLog(Path.Combine(dataPath, "logs"));
@@ -2081,8 +2083,22 @@ namespace RemoteMonitorSlave
                     form.ClearPowerSi();
                     using (var reader = new FileStream(form.log.Path, FileMode.Open, FileAccess.Read, FileShare.None))
                         if (reader.Length == 0) throw new InvalidOperationException("Slave log unavailable while form alive.");
+                    // A shown window is needed for WinForms to lay out and scroll visible child controls.
+                    form.ShowInTaskbar = false;
+                    form.Opacity = 0;
+                    form.Show();
                     foreach (Control control in form.Controls)
-                        if (!form.ClientRectangle.Contains(control.Bounds)) throw new InvalidOperationException("Slave control clipped.");
+                        if (!form.DisplayRectangle.Contains(control.Bounds))
+                            throw new InvalidOperationException("Slave control outside scrollable content: " + control.GetType().Name + " " + control.Bounds);
+                    form.ClientSize = new Size(640, 480);
+                    form.PerformLayout();
+                    if (!form.VerticalScroll.Visible || !form.HorizontalScroll.Visible)
+                        throw new InvalidOperationException("Small Slave window does not expose scrollbars.");
+                    form.AutoScrollPosition = new Point(0, form.DisplayRectangle.Height);
+                    if (form.anchorState.Top < 0 || form.anchorState.Bottom > form.ClientSize.Height)
+                        throw new InvalidOperationException("Slave Pending/status line is unreachable in a small window: " +
+                            form.anchorState.Bounds + " / " + form.ClientRectangle + " / " + form.AutoScrollPosition);
+                    Console.WriteLine("PASS: small Slave window scrolls to the final Pending/status line");
                 }
             }
             finally { if (Directory.Exists(directory)) Directory.Delete(directory, true); }
