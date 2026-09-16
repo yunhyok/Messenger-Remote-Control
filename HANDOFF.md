@@ -49,14 +49,21 @@ Verified locally on 2026-09-16, Windows 10 Pro 22H2 build 19045, installed .NET 
 
 CI verification passed on Windows Server 2025 build 26100: [run 35072841733](https://github.com/yunhyok/Messenger-Remote-Control/actions/runs/35072841733), source `abfc973d7493a5208f92564fdfd6dc4285763305`.
 Both Release builds and actual EXE self-tests passed. Both generated installers passed installation, same-version repair, installed EXE self-tests, metadata/shortcut/uninstall registration, removal and local-data preservation checks. This runner had no existing real settings; isolated sentinels and the unchanged empty set of known real settings paths were verified.
-CI also passed native owned-window foreground, bounded rejection, live copy/input and small-window scroll reachability checks. All four package checksums and ZIP entry allowlists passed. Release dispatch rebuilds the final source checkpoint and repeats these checks before publication; public download verification follows publication.
+CI also passed native owned-window foreground, bounded rejection, live copy/input and small-window scroll reachability checks. All four package checksums and ZIP entry allowlists passed. The release dispatch repeated these checks on the final release source and passed; delivery verification is recorded below.
 
 Not field-verified: actual Windows 7 SP1 Master, actual Windows 11 Slave, a clean PC missing .NET 4.8 (including prerequisite UAC/reboot behavior), physically disconnected installation, and the real KI-Messenger/PowerSI mobile path. The installer has no network-download operation and the Master runtime payload is embedded, but these structural checks do not substitute for a clean offline Win7 test. Same-version repair is not evidence of upgrading from a prior released installer; this is the first installer version.
 Local foreground-dependent input checks explicitly skipped when the test process lacked interactive foreground rights; the corresponding CI owned-window checks passed. These are not actual PowerSI/메신저 field passes. Do not repeat completed long PowerSI/HFSS trials.
 
 ## 6. Delivery
 
-Use CI `workflow_dispatch` with `release_tag=v0.2.0-rc1`.
-Publish only the two role installers, full ZIP, Slave-only ZIP and `SHA256SUMS.txt`.
-Check the public repository, main/tag source SHA, downloaded package contents, EXE versions and SHA256 before final delivery.
+[v0.2.0-rc1 pre-release](https://github.com/yunhyok/Messenger-Remote-Control/releases/tag/v0.2.0-rc1) was published by [workflow_dispatch run 35073530837](https://github.com/yunhyok/Messenger-Remote-Control/actions/runs/35073530837). Both build and release jobs passed.
+The immutable tag and embedded EXE source version point to `68f0368d0583ad6795e655b18eeb030c58e6be73`. Later changes to this handoff/test-guide record are documentation only; the release assets are not replaced.
+The repository is Public with default branch main. All five expected assets were downloaded without authentication and verified: GitHub asset digests and sizes, four SHA256SUMS entries, exact ZIP entry allowlists, 0.2.0 setup/product versions, 0.2.0.0 EXE file versions and the embedded source commit. The Slave EXE is identical in both ZIPs.
+
+- [Master installer](https://github.com/yunhyok/Messenger-Remote-Control/releases/download/v0.2.0-rc1/Messenger-Remote-Control-Master-Setup-0.2.0.exe)
+- [Slave installer](https://github.com/yunhyok/Messenger-Remote-Control/releases/download/v0.2.0-rc1/Messenger-Remote-Control-Slave-Setup-0.2.0.exe)
+- [Slave-only ZIP](https://github.com/yunhyok/Messenger-Remote-Control/releases/download/v0.2.0-rc1/Messenger-Remote-Control-Slave-v0.2.0-win11-net48.zip), SHA256 `428897904F1BADFA243A466685C07A56A29105F4E194CAB552A08C3E22EB9FC7`
+- [Full ZIP](https://github.com/yunhyok/Messenger-Remote-Control/releases/download/v0.2.0-rc1/Messenger-Remote-Control-v0.2.0-win7-win11-net48.zip) and [SHA256SUMS.txt](https://github.com/yunhyok/Messenger-Remote-Control/releases/download/v0.2.0-rc1/SHA256SUMS.txt)
+
+Publish future candidates with a new rc tag through the same CI workflow; never overwrite this verified tag or its assets. Keep private evidence, configuration and company data out of releases.
 See [INSTALL.md](INSTALL.md), [SLAVE-TEST.md](SLAVE-TEST.md) and [WIN7-TEST.md](WIN7-TEST.md).
