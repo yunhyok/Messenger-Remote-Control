@@ -112,5 +112,15 @@ jobs:
           )
           gh api --method POST "repos/$env:GITHUB_REPOSITORY/git/refs" -f "ref=refs/tags/$env:RELEASE_TAG" -f "sha=$env:GITHUB_SHA" --silent
           if ($LASTEXITCODE -ne 0) { throw 'Unable to create a new release tag at the workflow commit.' }
-          gh release create $env:RELEASE_TAG --verify-tag --prerelease --target $env:GITHUB_SHA --title "Messenger Remote Control $env:RELEASE_TAG" --notes "Pre-release build from commit $env:GITHUB_SHA. Includes separate offline Master and Slave installers, full and Slave-only ZIP packages, and SHA256SUMS.txt." @files
+          $notes = @(
+            "PowerSI on-demand messenger reports and offline Master/Slave installers, built from commit $env:GITHUB_SHA.",
+            '',
+            'Commands: help, total status, pwrsi. Pending targets return only their name, PID and Pending. Full names, bounded Output excerpts, local LM Studio recovery and multipart replies are included.',
+            '',
+            "Download the installer for each role or the portable ZIP. The Master installer embeds Microsoft .NET Framework 4.8. See [installation and operation](https://github.com/$env:GITHUB_REPOSITORY/blob/$env:RELEASE_TAG/INSTALL.md) and SHA256SUMS.txt.",
+            '',
+            'CI on Windows Server 2025 passed both builds, actual EXE self-tests, and both installer install/repair/uninstall/configuration-preservation checks. Actual Win7 SP1 Master, Win11 Slave, a clean offline PC missing .NET 4.8 and the real messenger/PowerSI mobile path remain field-unverified. Existing HFSS and completed PowerSI tests were not restarted.'
+          )
+          $notes | Set-Content -LiteralPath release-notes.md -Encoding UTF8
+          gh release create $env:RELEASE_TAG --verify-tag --prerelease --target $env:GITHUB_SHA --title "Messenger Remote Control $env:RELEASE_TAG" --notes-file release-notes.md @files
           if ($LASTEXITCODE -ne 0) { throw 'gh release publish failed.' }

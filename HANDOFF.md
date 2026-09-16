@@ -47,10 +47,12 @@ Verified locally on 2026-09-16, Windows 10 Pro 22H2 build 19045, installed .NET 
 - Setup and EXE file versions are 0.2.0.0. User-facing product version is 0.2.0.
 - No existing real Master configuration files were present on this test account; preservation evidence is the isolated sentinels plus the unchanged empty set of known real settings paths.
 
-CI Windows Server 2025 installation verification and public release/download verification are pending at this source checkpoint. Update this section after the CI verification run, before release dispatch.
+CI verification passed on Windows Server 2025 build 26100: [run 35072841733](https://github.com/yunhyok/Messenger-Remote-Control/actions/runs/35072841733), source `abfc973d7493a5208f92564fdfd6dc4285763305`.
+Both Release builds and actual EXE self-tests passed. Both generated installers passed installation, same-version repair, installed EXE self-tests, metadata/shortcut/uninstall registration, removal and local-data preservation checks. This runner had no existing real settings; isolated sentinels and the unchanged empty set of known real settings paths were verified.
+CI also passed native owned-window foreground, bounded rejection, live copy/input and small-window scroll reachability checks. All four package checksums and ZIP entry allowlists passed. Release dispatch rebuilds the final source checkpoint and repeats these checks before publication; public download verification follows publication.
 
 Not field-verified: actual Windows 7 SP1 Master, actual Windows 11 Slave, a clean PC missing .NET 4.8 (including prerequisite UAC/reboot behavior), physically disconnected installation, and the real KI-Messenger/PowerSI mobile path. The installer has no network-download operation and the Master runtime payload is embedded, but these structural checks do not substitute for a clean offline Win7 test. Same-version repair is not evidence of upgrading from a prior released installer; this is the first installer version.
-Foreground-dependent input checks explicitly skipped when the test process lacked interactive foreground rights. Native owned-window and pure/synthetic checks passed. Do not describe those skips as field passes or repeat completed long PowerSI/HFSS trials.
+Local foreground-dependent input checks explicitly skipped when the test process lacked interactive foreground rights; the corresponding CI owned-window checks passed. These are not actual PowerSI/메신저 field passes. Do not repeat completed long PowerSI/HFSS trials.
 
 ## 6. Delivery
 
