@@ -51,6 +51,6 @@ powershell -ExecutionPolicy Bypass -File scripts/check-release-assets.ps1
 
 빌드 PC는 .NET SDK와 Windows 빌드 환경이 필요합니다. Windows 10 개발 PC에서 설치 검사를 실행할 때는 `test-installers.ps1 -Role Master`로 Master만 검사합니다. Slave의 Windows 11 설치 조건을 우회하지 않습니다. 인스톨러 빌드는 Inno Setup 7.1.0과 Microsoft 런타임 배포본을 공식 경로에서 받아 SHA256과 서명을 확인해 캐시합니다. 다운로드만 준비하려면 `build-installers.ps1 -DependenciesOnly`를 사용합니다. 이후 설치 파일 자체는 오프라인에서 동작합니다.
 
-CI의 `workflow_dispatch`에 `release_tag=v0.2.1-rc1`을 지정하면 일치하는 소스 버전의 새 태그와 pre-release를 만듭니다. 이미 존재하는 태그를 덮어쓰지 않습니다. CI는 Windows Server 2025에서 두 역할을 검사하며, 실제 Windows 7 SP1·Windows 11 또는 현장 PowerSI/메신저 확인을 대신하지 않습니다. 실제 검증 결과는 [HANDOFF.md](HANDOFF.md)에 기록합니다.
+CI의 `workflow_dispatch`에 `release_tag=v0.2.1`을 지정하면 일치하는 소스 버전의 새 태그와 정식 Release를 만들고 Latest로 표시합니다. 이미 존재하는 태그를 덮어쓰지 않으며, 다음 배포는 소스 버전을 올려 새 태그를 사용합니다. CI는 Windows Server 2025에서 두 역할을 검사하며, 실제 Windows 7 SP1·Windows 11 또는 현장 PowerSI/메신저 확인을 대신하지 않습니다. 실제 검증 결과는 [HANDOFF.md](HANDOFF.md)에 기록합니다.
 
 참조: [Inno Setup 공식 지원 환경](https://jrsoftware.org/ishelp/topic_whatisinnosetup.htm), [Microsoft .NET Framework 배포 지침](https://learn.microsoft.com/en-us/dotnet/framework/deployment/deployment-guide-for-developers).

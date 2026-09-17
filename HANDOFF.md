@@ -1,5 +1,9 @@
 # Messenger Remote Control v0.2.1 handoff
 
+## Stable release policy — 2026-09-18
+
+The user requested regular Releases rather than pre-releases. CI now accepts the exact `v<source-version>` tag and publishes a stable Release marked Latest. The v0.2.1 application behavior and compatibility are unchanged; this update changes delivery only. Existing RC tags/assets remain historical and are not overwritten. Publish v0.2.1 through CI, then verify public release flags, latest selection, source/tag, asset contents and hashes before recording delivery below.
+
 ## Current update — 2026-09-17
 
 - User-requested production notifications: a bound, locally started plain-command session sends `Master Ready`, sends the fixed processing/wait notice before a `pwrsi` or `total status` query, sends the result parts, then sends `Master Ready` again. No notice is attempted before the self-chat/window is selected and validated. Help skips the slow-query notice.
@@ -84,5 +88,5 @@ The repository is Public with default branch main. All five expected assets were
 - [Slave-only ZIP](https://github.com/yunhyok/Messenger-Remote-Control/releases/download/v0.2.0-rc1/Messenger-Remote-Control-Slave-v0.2.0-win11-net48.zip), SHA256 `428897904F1BADFA243A466685C07A56A29105F4E194CAB552A08C3E22EB9FC7`
 - [Full ZIP](https://github.com/yunhyok/Messenger-Remote-Control/releases/download/v0.2.0-rc1/Messenger-Remote-Control-v0.2.0-win7-win11-net48.zip) and [SHA256SUMS.txt](https://github.com/yunhyok/Messenger-Remote-Control/releases/download/v0.2.0-rc1/SHA256SUMS.txt)
 
-Publish future candidates with a new rc tag through the same CI workflow; never overwrite this verified tag or its assets. Keep private evidence, configuration and company data out of releases.
+Publish future versions as stable `v<source-version>` Releases through the same CI workflow; never overwrite verified tags or assets. Keep private evidence, configuration and company data out of releases.
 See [INSTALL.md](INSTALL.md), [SLAVE-TEST.md](SLAVE-TEST.md) and [WIN7-TEST.md](WIN7-TEST.md).

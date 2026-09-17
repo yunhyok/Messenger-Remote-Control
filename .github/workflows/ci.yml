@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: 'New pre-release tag matching the source version, e.g. v0.2.1-rc1'
+        description: 'New stable release tag matching the source version, e.g. v0.2.1'
         required: true
         type: string
 
@@ -74,7 +74,7 @@ jobs:
         with:
           name: Messenger-Remote-Control-v${{ needs.build.outputs.version }}-windows
           path: dist
-      - name: Verify and publish immutable pre-release
+      - name: Verify and publish immutable stable release
         shell: powershell
         env:
           GH_TOKEN: ${{ github.token }}
@@ -83,11 +83,11 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $version = ([xml](Get-Content src\RemoteMonitorSlave\RemoteMonitorSlave.csproj -Raw)).Project.PropertyGroup.Version
           if ($env:GITHUB_REPOSITORY -cne 'yunhyok/Messenger-Remote-Control' -or $env:GITHUB_REF -cne 'refs/heads/main') {
-            throw 'Pre-releases may only be published from yunhyok/Messenger-Remote-Control main.'
+            throw 'Releases may only be published from yunhyok/Messenger-Remote-Control main.'
           }
           if ($version -cne '${{ needs.build.outputs.version }}' -or
-              $env:RELEASE_TAG -cnotmatch ('^v' + [regex]::Escape($version) + '-rc[1-9][0-9]*$')) {
-            throw 'release_tag must be a new v<source-version>-rcN tag.'
+              $env:RELEASE_TAG -cne "v$version") {
+            throw 'release_tag must be a new v<source-version> stable tag.'
           }
           $head = git rev-parse HEAD
           if ($LASTEXITCODE -ne 0 -or $head -cne $env:GITHUB_SHA) { throw 'Checkout does not match the workflow commit.' }
@@ -95,10 +95,10 @@ jobs:
 
           $existingTag = git ls-remote --tags origin "refs/tags/$env:RELEASE_TAG"
           if ($LASTEXITCODE -ne 0) { throw 'Unable to verify remote tags.' }
-          if ($existingTag) { throw 'Release tag already exists. Choose a new rc number; assets are never overwritten.' }
+          if ($existingTag) { throw 'Release tag already exists. Increment the source version; assets are never overwritten.' }
           try {
             $null = Invoke-RestMethod -Uri "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/releases/tags/$env:RELEASE_TAG" -Headers @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/vnd.github+json' }
-            throw 'Release already exists. Choose a new rc number; assets are never overwritten.'
+            throw 'Release already exists. Increment the source version; assets are never overwritten.'
           } catch {
             if ($null -eq $_.Exception.Response -or [int]$_.Exception.Response.StatusCode -ne 404) { throw }
           }
@@ -124,5 +124,5 @@ jobs:
             'CI on Windows Server 2025 passed both builds, actual EXE self-tests, and both installer install/repair/uninstall/configuration-preservation checks. Actual Win7 SP1 Master, Win11 Slave, a clean offline PC missing .NET 4.8 and the real messenger/PowerSI mobile path remain field-unverified. Existing HFSS and completed PowerSI tests were not restarted.'
           )
           $notes | Set-Content -LiteralPath release-notes.md -Encoding UTF8
-          gh release create $env:RELEASE_TAG --verify-tag --prerelease --target $env:GITHUB_SHA --title "Messenger Remote Control $env:RELEASE_TAG" --notes-file release-notes.md @files
+          gh release create $env:RELEASE_TAG --verify-tag --latest --target $env:GITHUB_SHA --title "Messenger Remote Control $env:RELEASE_TAG" --notes-file release-notes.md @files
           if ($LASTEXITCODE -ne 0) { throw 'gh release publish failed.' }
