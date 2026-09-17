@@ -9,7 +9,7 @@ namespace RemoteMonitorSlave
 {
     internal static class Program
     {
-        internal const string Title = "Messenger Remote Control Slave v" + LinkVersion.Value;
+        internal const string Title = "Messenger Remote Control Slave v" + LinkVersion.AppValue;
 
         [STAThread]
         private static void Main(string[] args)
@@ -56,7 +56,7 @@ namespace RemoteMonitorSlave
         {
             if (!System.Text.RegularExpressions.Regex.IsMatch(code, @"\A[A-Z0-9_]{1,64}\z")) code = "LINK_EVENT";
             lock (gate)
-                File.AppendAllText(Path, DateTime.UtcNow.ToString("O") + " version=" + LinkVersion.Value + " code=" + code +
+                File.AppendAllText(Path, DateTime.UtcNow.ToString("O") + " version=" + LinkVersion.AppValue + " code=" + code +
                     Environment.NewLine, new UTF8Encoding(false)); // Each event releases the stream immediately.
         }
 
@@ -68,7 +68,7 @@ namespace RemoteMonitorSlave
             if (detail == null || !System.Text.RegularExpressions.Regex.IsMatch(detail, @"\A[A-Za-z0-9_=| \-]{1,512}\z"))
                 detail = "detail=INVALID";
             lock (gate)
-                File.AppendAllText(Path, DateTime.UtcNow.ToString("O") + " version=" + LinkVersion.Value + " code=" + code +
+                File.AppendAllText(Path, DateTime.UtcNow.ToString("O") + " version=" + LinkVersion.AppValue + " code=" + code +
                     " " + detail + Environment.NewLine, new UTF8Encoding(false));
         }
 
@@ -76,7 +76,7 @@ namespace RemoteMonitorSlave
         {
             var wire = PowerSiObservation.Parse(observation.Serialize()).Serialize();
             var stage = observation.ProbeStage;
-            var prefix = DateTime.UtcNow.ToString("O") + " version=" + LinkVersion.Value;
+            var prefix = DateTime.UtcNow.ToString("O") + " version=" + LinkVersion.AppValue;
             var entry = new StringBuilder(prefix + " code=PWRSI_OBSERVATION data=" + wire + " stage=" + stage + Environment.NewLine);
             if (observation.LocalSampleId != null)
                 entry.Append(prefix).Append(" code=VISION_RUN").Append(ComparisonMetadata(observation)).Append(Environment.NewLine);
@@ -122,7 +122,7 @@ namespace RemoteMonitorSlave
         {
             var metadata = OutputBufferCapture.LogMetadata(result); // Raw buffer is never part of log metadata.
             lock (gate)
-                File.AppendAllText(Path, DateTime.UtcNow.ToString("O") + " version=" + LinkVersion.Value +
+                File.AppendAllText(Path, DateTime.UtcNow.ToString("O") + " version=" + LinkVersion.AppValue +
                     " code=OUTPUT_BUFFER" + metadata + Environment.NewLine, new UTF8Encoding(false));
         }
     }

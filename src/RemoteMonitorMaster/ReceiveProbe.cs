@@ -671,6 +671,14 @@ namespace RemoteMonitorMaster
             Need(Evaluate(baseline, uppercase) == null, "COMMAND_SELFTEST_NO_OWN_REPLY");
             var nonce = History(); AppendTestHistoryText(nonce, marker);
             Need(Evaluate(baseline, nonce) == null, "COMMAND_SELFTEST_MODE_ISOLATED");
+            foreach (var text in new[] { SupervisedSendTest.ReadyNotice, SupervisedSendTest.PowerSiBusyNotice, SupervisedSendTest.StatusBusyNotice })
+            {
+                var withNotice = History();
+                AppendTestHistoryText(withNotice, text);
+                Need(Evaluate(baseline, withNotice) == null, "COMMAND_SELFTEST_NOTICE_NOT_COMMAND");
+                var immediate = AppendTestHistoryText(withNotice, "pwrsi");
+                Need(Evaluate(baseline, withNotice) == immediate, "COMMAND_SELFTEST_IMMEDIATE_AFTER_READY");
+            }
             foreach (var fragments in new[] {
                 new[] { "PWRSI REPORT D234567 | PART 001/001", "pwrsi" },
                 new[] { "help", "HELP RESPONSE" },

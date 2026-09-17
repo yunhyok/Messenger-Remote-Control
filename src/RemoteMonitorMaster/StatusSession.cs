@@ -16,6 +16,7 @@ namespace RemoteMonitorMaster
         private readonly bool plainCommands;
         private readonly object sync = new object();
         private SupervisedSendTest.Consent active;
+        private SupervisedSendTest.Consent activeNotice;
         private int cancelled, claimed, completedRounds, attempts;
 
         internal StatusSession(string firstMarker, bool confirmed, SlaveEndpoint slave)
@@ -31,16 +32,18 @@ namespace RemoteMonitorMaster
 
         internal bool Cancelled { get { return Volatile.Read(ref cancelled) != 0; } }
         internal int CompletedRounds { get { return Volatile.Read(ref completedRounds); } }
-        private int Attempts { get { lock (sync) return attempts | Flags(active); } }
+        private int Attempts { get { lock (sync) return attempts | Flags(active) | Flags(activeNotice); } }
         internal bool CursorMoveAttempted { get { return (Attempts & 1) != 0; } }
         internal bool WriteAttempted { get { return (Attempts & 2) != 0; } }
         internal bool SendAttempted { get { return (Attempts & 4) != 0; } }
-        internal bool PendingWrite { get { lock (sync) return active != null && active.PendingWrite; } }
+        internal bool PendingWrite { get { lock (sync) return (active != null && active.PendingWrite) ||
+            (activeNotice != null && activeNotice.PendingWrite); } }
 
         internal void Cancel()
         {
             Interlocked.Exchange(ref cancelled, 1);
             Volatile.Read(ref active)?.Cancel();
+            Volatile.Read(ref activeNotice)?.Cancel();
         }
 
         private bool TryClaim() { return !Cancelled && Interlocked.CompareExchange(ref claimed, 1, 0) == 0; }
@@ -113,10 +116,40 @@ namespace RemoteMonitorMaster
                 var allocated = new HashSet<string>(StringComparer.Ordinal);
                 var marker = Allocate(store, allocated, firstMarker);
                 ReceiveProbe.Baseline original = null, baseline = null;
+                void SendReady(string requestMarker)
+                {
+                    Alive();
+                    var notice = SupervisedSendTest.Consent.ForNotice("D" + requestMarker.Substring(1), SupervisedSendTest.ReadyNotice);
+                    Volatile.Write(ref activeNotice, notice);
+                    Alive();
+                    progress(CompletedRounds, "NOTICE_READY", requestMarker);
+                    var result = SupervisedSendTest.RunBoundObserved(window, log, notice.NoticeText,
+                        new System.Windows.Point(), notice, Stopped, snapshot =>
+                        {
+                            Alive();
+                            Need(process.Equals(snapshot.Process), "STATUS_PROCESS_CHANGED");
+                            if (original == null)
+                            {
+                                // Baseline before Ready preserves a command arriving immediately after the notice.
+                                original = baseline = ReceiveProbe.CreateBaseline(snapshot, requestMarker, true);
+                            }
+                            else
+                            {
+                                ReceiveProbe.ValidateContinuity(original, snapshot);
+                                ReceiveProbe.ValidatePlainHistoryPrefix(baseline.Snapshot, snapshot, log);
+                            }
+                        });
+                    last = result.Message;
+                    Need(result.CleanCompletion, "STATUS_READY_NOTICE_UNCERTAIN");
+                    lock (sync) { attempts |= Flags(notice); Volatile.Write(ref activeNotice, null); }
+                    notice.Cancel();
+                    log.Write("INFO", "MASTER_NOTICE_SENT", AuditLog.Field("stage", "READY"), AuditLog.Field("delivery_verified", false));
+                }
                 log.Write("INFO", "STATUS_SESSION_BEGIN", AuditLog.Field("slave_status", slave != null),
                     AuditLog.Field("plain_commands", plainCommands),
                     AuditLog.Field("idle_timeout", "NONE"), AuditLog.Field("per_request_replies", plainCommands ? "BOUNDED_PREPARED_PARTS" : "ONE"),
                     AuditLog.Field("next_format", plainCommands ? "NONE" : "DIGITS_ONLY"), AuditLog.Field("compact_receive_log", true));
+                if (plainCommands) SendReady(marker);
                 while (true)
                 {
                     Alive();
@@ -155,6 +188,7 @@ namespace RemoteMonitorMaster
                     Alive();
                     baseline = nextBaseline;
                     marker = nextMarker;
+                    if (plainCommands) SendReady(marker);
                 }
             }
             catch (Exception ex)
@@ -208,6 +242,13 @@ namespace RemoteMonitorMaster
                 return snapshot;
             }
             var operation = new StatusSession("M234567", true, null);
+            var noticeSession = new StatusSession("M234567", true, null);
+            noticeSession.activeNotice = SupervisedSendTest.Consent.ForNotice("D234567", SupervisedSendTest.ReadyNotice);
+            Need(noticeSession.activeNotice.TryConsume(SupervisedSendTest.ReadyNotice) && noticeSession.activeNotice.TryCommitMove() &&
+                noticeSession.activeNotice.TryCommitWrite() && noticeSession.PendingWrite, "STATUS_SELFTEST_READY_PENDING");
+            noticeSession.Cancel();
+            Need(noticeSession.activeNotice.Cancelled && !noticeSession.activeNotice.TryCommit() && noticeSession.PendingWrite,
+                "STATUS_SELFTEST_READY_CANCEL");
             try
             {
                 var store = new TokenStore(path);

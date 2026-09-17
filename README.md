@@ -1,4 +1,4 @@
-# Messenger Remote Control v0.2.0
+# Messenger Remote Control v0.2.1
 
 모바일 KI-Messenger의 나와의 대화에 명령을 보내면 Desktop의 **Master**가 Workstation의 **Slave**에 상태를 요청하고, PowerSI별 결과를 같은 대화로 회신합니다.
 
@@ -14,10 +14,12 @@ flowchart LR
 
 [공개 Releases](https://github.com/yunhyok/Messenger-Remote-Control/releases)에서 역할에 맞는 설치 파일을 받으세요. 오프라인 Slave에는 Slave 설치 파일 또는 Slave ZIP만 옮기면 됩니다. 자세한 설치·업그레이드 방법은 [INSTALL.md](INSTALL.md)에 있습니다.
 
+v0.2.1은 Master 전송 확인과 운용 안내를 개선합니다. 기존 Slave v0.2.0은 그대로 사용할 수 있습니다. 통신 규격은 바뀌지 않았습니다.
+
 1. Workstation에서 Slave를 실행하고 통신 IP를 선택한 뒤 Start를 누릅니다. 화면 판독이 필요한 경우 같은 PC의 LM Studio 서버와 이미지 모델을 사용자가 미리 준비합니다.
 2. Slave의 연결파일을 내보내 Desktop Master로 전달합니다. 이 파일은 공개하거나 저장소에 넣지 마세요.
 3. Master에서 연결파일을 열고, KI-Messenger의 나와의 대화를 독립 창으로 연 뒤 연결합니다.
-4. 모바일에서 `pwrsi`를 보냅니다. 여러 부분으로 나뉜 회신은 같은 보고서 번호의 마지막 `N/N`까지 확인합니다.
+4. 메신저에서 `Master Ready`를 확인한 뒤 모바일에서 `pwrsi`를 보냅니다. 처리 중에는 `Don't send another order before the response` 안내가 도착합니다. 같은 보고서 번호의 마지막 `N/N`과 다음 `Master Ready`까지 기다린 뒤 다음 명령을 보냅니다.
 
 ## 명령
 

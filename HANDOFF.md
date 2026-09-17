@@ -1,4 +1,16 @@
-# Messenger Remote Control v0.2.0 handoff
+# Messenger Remote Control v0.2.1 handoff
+
+## Current update — 2026-09-17
+
+- User-requested production notifications: a bound, locally started plain-command session sends `Master Ready`, sends the fixed processing/wait notice before a `pwrsi` or `total status` query, sends the result parts, then sends `Master Ready` again. No notice is attempted before the self-chat/window is selected and validated. Help skips the slow-query notice.
+- The private Win7 SP1 v0.2.0 field log proves command recognition and a completed Slave query, followed by `SEND_WRITE_NOT_VERIFIED`: one SetValue returned, input classified OTHER, zero Send clicks. The log does not contain the draft, so the precise text difference is unproven. A separate earlier session rejected changed old history content; that guard remains intact.
+- Shared send readback now treats CRLF and LF as equivalent and preserves every other character, including whitespace and numbers. It waits up to six read-only samples for provider propagation, within the existing overall send deadline. No write/click retry, broad whitespace normalization or draft overwrite is added. Private logs record lengths, CR/LF counts and a keyed fingerprint, never draft text.
+- Ready and processing notices use fixed allowlisted text and one-use consent through the same guarded sender. Busy notices consume a fresh command proof and reserve its token before a Slave query. A failed notice prevents the query/rearm; cancellation and pending drafts include notice attempts. Revalidation shows WAIT, not READY. Startup baseline precedes Ready so an immediate new command is retained; notices do not count as commands.
+- App/installer version is 0.2.1; the unchanged wire contract remains 0.2.0. Existing offline Slave v0.2.0 works with the new Master. Updated Slave packages are optional for this Master-only behavior fix. `total status` labels the transmitted version as protocol version.
+- Both local Release builds and actual EXE self-tests passed on Windows 10; ZIP packaging passed. New checks cover CRLF/LF equivalence, changed digits/whitespace rejection, delayed readback, cancellation, exact one-use notices, pending notice drafts, and a command immediately after Ready. CI installer verification and public v0.2.1-rc1 delivery are recorded after completion.
+- Actual KI-Messenger send success for this update remains field-unverified. The original failed draft must be reviewed/cleared by the user before a new session; the app must not clear it automatically. Transport failure cannot safely send another error notice; the local Master shows the error and stops.
+
+## Previous release baseline — v0.2.0
 
 ## 1. Source and scope
 

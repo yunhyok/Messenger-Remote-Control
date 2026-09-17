@@ -2,7 +2,7 @@
 
 - Read [HANDOFF.md](HANDOFF.md) before changing this project. Update it and the relevant test guide when implementation or verification changes.
 - This independent repository starts from `yunhyok/Remote-Control-App` commit `1365e2c249d00b2a73634c77cd7bc82247f82405` (v0.1.58). Do not modify that checkout or its separate HFSS worktree. Do not restart completed PowerSI field tests.
-- The approved v0.2.0 scope includes on-demand multi-process PowerSI reports, Master/mobile integration, offline Master/Slave installers and public CI pre-release delivery to `yunhyok/Messenger-Remote-Control`.
+- The approved v0.2.x scope includes on-demand multi-process PowerSI reports, Master/mobile integration, fixed Ready/processing notices, offline Master/Slave installers and public CI pre-release delivery to `yunhyok/Messenger-Remote-Control`.
 - Preserve Windows 7 SP1 Master / Windows 11 Slave, .NET Framework 4.8, existing user settings and pairing paths. Show product name and version.
 - Pending targets return only full Process Name and PID with Pending. Stop further activation, capture, copy, inference and retries; suppress any already collected excerpt. Windows responsiveness is distinct from internal simulation waiting.
 - Keep full process names, report-scoped abbreviations, bounded excerpts and multipart replies. Do not infer completion or percentage from CPU, elapsed time or process existence.

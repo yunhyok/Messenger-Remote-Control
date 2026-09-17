@@ -125,7 +125,7 @@ namespace RemoteMonitorMaster
                 .Append("Slave 시각: ").Append(state.LocalTime.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture)).Append("\r\n")
                 .Append("가동: ").Append(state.UptimeMinutes.ToString(CultureInfo.InvariantCulture)).Append("분 | RAM ")
                 .Append(state.AvailableMiB.ToString(CultureInfo.InvariantCulture)).Append('/')
-                .Append(state.TotalMiB.ToString(CultureInfo.InvariantCulture)).Append(" MiB | v").Append(state.Version).Append("\r\n")
+                .Append(state.TotalMiB.ToString(CultureInfo.InvariantCulture)).Append(" MiB | protocol v").Append(state.Version).Append("\r\n")
                 .Append("프로세스 ").Append(shown.ToString(CultureInfo.InvariantCulture)).Append('/')
                 .Append(total.ToString(CultureInfo.InvariantCulture)).Append(" | 생략 ")
                 .Append((total - shown).ToString(CultureInfo.InvariantCulture)).Append(" | 읽기 실패 ")
@@ -406,7 +406,7 @@ namespace RemoteMonitorMaster
             foreach (var invalid in new[] { null, "Help", "help ", " total status", "total  status", "total\tstatus", "pwrsi.exe", "help unknown", "run calc", "help\n" })
                 Need(!IsCommand(invalid));
             var totalName = "PowerSI MixedCase 123 한글";
-            var state = new MachineStatus { Version = AppInfo.Version, LocalTime = new DateTime(2026, 9, 10, 12, 0, 0),
+            var state = new MachineStatus { Version = LinkVersion.Value, LocalTime = new DateTime(2026, 9, 10, 12, 0, 0),
                 UptimeMinutes = 1, AvailableMiB = 1024, TotalMiB = 2048,
                 Processes = new ProcessInventory { Items = new[] { new ProcessState {
                     Name = ProcessInventory.NormalizeName(totalName), FullName = totalName, Pid = 1 },

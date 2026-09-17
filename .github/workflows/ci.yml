@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: 'New pre-release tag matching the source version, e.g. v0.2.0-rc1'
+        description: 'New pre-release tag matching the source version, e.g. v0.2.1-rc1'
         required: true
         type: string
 
@@ -116,6 +116,8 @@ jobs:
             "PowerSI on-demand messenger reports and offline Master/Slave installers, built from commit $env:GITHUB_SHA.",
             '',
             'Commands: help, total status, pwrsi. Pending targets return only their name, PID and Pending. Full names, bounded Output excerpts, local LM Studio recovery and multipart replies are included.',
+            '',
+            'v0.2.1: Master Ready and processing/wait notices use the guarded sender. Multiline draft readback accepts CRLF/LF equivalence, waits briefly for provider updates, and preserves all other text. No uncertain send is retried. Existing Slave v0.2.0 remains compatible; updating only Master is sufficient.',
             '',
             "Download the installer for each role or the portable ZIP. The Master installer embeds Microsoft .NET Framework 4.8. See [installation and operation](https://github.com/$env:GITHUB_REPOSITORY/blob/$env:RELEASE_TAG/INSTALL.md) and SHA256SUMS.txt.",
             '',

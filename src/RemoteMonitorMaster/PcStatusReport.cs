@@ -182,7 +182,7 @@ namespace RemoteMonitorMaster
             var snapshot = new MachineStatus
             {
                 LocalTime = new DateTime(2026, 9, 10, 12, 34, 56), UptimeMinutes = 60,
-                AvailableMiB = 4096, TotalMiB = 8192, Version = AppInfo.Version,
+                AvailableMiB = 4096, TotalMiB = 8192, Version = LinkVersion.Value,
                 Processes = new ProcessInventory { Items = Enumerable.Range(1, 10).Select(i => new ProcessState
                 {
                     Pid = i, Name = ProcessInventory.NormalizeName(i == 1 ? "M345678" : "계산_solver" + i),

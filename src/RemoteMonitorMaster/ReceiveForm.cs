@@ -512,7 +512,19 @@ namespace RemoteMonitorMaster
             activeRound = round;
             var completed = CompletedRoundCount;
             var count = "완료 " + completed + "회 / 명령 " + (round + 1) + "회";
-            if (phase == "BASELINE")
+            if (phase == "NOTICE_READY" || phase == "NOTICE_BUSY")
+            {
+                code.Text = "WAIT";
+                SetStatus(phase == "NOTICE_READY" ? "메신저로 Master Ready 안내를 보내는 중입니다." :
+                    "메신저로 처리 중 안내를 보내는 중입니다. 새 명령을 보내지 마세요.", false);
+                SetInteractionNotice("메신저 안내 전송 중 — 마우스·키보드를 건드리지 마세요.");
+            }
+            else if (phase == "REVALIDATING")
+            {
+                code.Text = "WAIT";
+                SetStatus("같은 명령과 대화창을 재확인 중입니다. 새 명령을 보내지 마세요.", false);
+            }
+            else if (phase == "BASELINE")
             {
                 code.Text = "WAIT";
                 SetStatus(count + " 고정 명령어 수신 준비 중 — 아직 휴대폰에서 보내지 마세요.", false);
@@ -524,7 +536,7 @@ namespace RemoteMonitorMaster
                 SetStatus("READY — " + count + " / 휴대폰에서 소문자 명령어 하나 (pwrsi에는 공백 불필요)", true);
                 SetInteractionNotice("휴대폰에서 고정 명령어 한 번 / 종료하려면 Stop");
                 details.Text = "허용 고정 명령어: help / help help / help total status / help pwrsi / total status / pwrsi\r\n" +
-                    "한 명령의 답장을 확인한 뒤 다음 명령을 보냅니다. 앞뒤 일반 공백/NBSP는 자동 제거합니다. 다음 수신 기준은 답장 전 미리 준비됩니다.\r\n" +
+                    "메신저의 Master Ready를 확인한 뒤 명령 하나를 보냅니다. 처리 중 안내 이후에는 전체 답장과 다음 Master Ready를 기다립니다.\r\n" +
                     "total status는 Slave 프로그램 상태를 표시합니다. pwrsi는 모든 PowerSI 대상의 요청 시점 증거를 1,400자 이하 PART로 순서대로 보냅니다.\r\n" +
                     "Pending은 이름·PID·Pending만 표시하며 진행률·완료를 추측하지 않습니다. Stop 뒤 현재 호출이 끝나야 LOG READY가 표시됩니다.";
             }

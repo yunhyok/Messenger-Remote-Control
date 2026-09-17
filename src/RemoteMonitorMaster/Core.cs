@@ -15,7 +15,7 @@ namespace RemoteMonitorMaster
     internal static class AppInfo
     {
         public const string Name = "Messenger Remote Control Master";
-        public const string Version = RemoteMonitorLink.LinkVersion.Value;
+        public const string Version = RemoteMonitorLink.LinkVersion.AppValue;
         public const string Title = Name + " v" + Version;
         public const string InstanceMutexName = @"Local\RemoteMonitorMaster";
 

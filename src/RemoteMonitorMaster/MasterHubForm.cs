@@ -47,7 +47,7 @@ namespace RemoteMonitorMaster
             legacyMarker.AccessibleName = "기존 M코드 연속 운용 선택 (기본은 명령어 통합 확인)";
             localPhone.SetBounds(633, 182, 229, 36);
             result.SetBounds(18, 232, 844, 142);
-            result.Text = "v" + LinkVersion.Value + ": 메신저의 고정 읽기 전용 명령으로 Slave 상태와 PowerSI 증거를 요청합니다.\r\n" +
+            result.Text = "v" + LinkVersion.AppValue + ": 메신저의 고정 읽기 전용 명령으로 Slave 상태와 PowerSI 증거를 요청합니다.\r\n" +
                 "pwrsi 그대로 입력하세요. total status는 단어 사이 한 칸입니다. 앞뒤 공백은 자동 제거합니다. 기존 M코드는 체크 시에만 사용합니다.\r\n" +
                 "pwrsi는 요청 시점에 한 번 수집하고 모든 대상을 표시합니다. 각 답장은 1,400자 이하이며 PART 순서대로 전송합니다.\r\n" +
                 "Pending 대상은 이름·PID·Pending만 표시합니다. 그 밖의 대상은 출처·수집 시각·설명·최신 발췌를 표시합니다.\r\n" +

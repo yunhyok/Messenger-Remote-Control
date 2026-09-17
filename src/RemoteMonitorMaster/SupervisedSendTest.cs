@@ -13,6 +13,9 @@ namespace RemoteMonitorMaster
     internal static class SupervisedSendTest
     {
         internal const string MouseReleaseWarning = "Mouse-button release was NOT confirmed.";
+        internal const string ReadyNotice = "Master Ready. You may send help, total status, or pwrsi.";
+        internal const string PowerSiBusyNotice = "Processing pwrsi. Don't send another order before the response. Wait for Master Ready.";
+        internal const string StatusBusyNotice = "Processing total status. Don't send another order before the response. Wait for Master Ready.";
 
         internal sealed class Outcome
         {
@@ -35,6 +38,9 @@ namespace RemoteMonitorMaster
             private string preparedReply;
             private string[] preparedReplies;
             private Consent[] preparedParts;
+            private Consent progressNotice;
+            private bool isNotice;
+            internal string NoticeText { get { Need(isNotice, "SEND_NOTICE_REQUIRED"); return preparedReply; } }
             private int replyPartIndex = 1, replyPartCount = 1;
             // Low bits: 0=confirmed, 1=consumed, 2=move, 3=write, 4=click committed. Mask 8 preserves attempts on cancellation.
             private int state;
@@ -76,6 +82,21 @@ namespace RemoteMonitorMaster
                 replyPartIndex = index;
                 replyPartCount = count;
                 roundTripClaimed = 1;
+            }
+
+            internal static Consent ForNotice(string marker, string text)
+            {
+                Need(text == ReadyNotice || text == PowerSiBusyNotice || text == StatusBusyNotice, "SEND_NOTICE_INVALID");
+                return new Consent(marker, true) { isNotice = true, preparedReply = text };
+            }
+
+            internal Consent CreateProgressNotice(string text)
+            {
+                Need(IsPlainCommands && !Cancelled, "SEND_NOTICE_INVALID");
+                var notice = ForNotice(Marker, text);
+                Need(Interlocked.CompareExchange(ref progressNotice, notice, null) == null, "SEND_NOTICE_USED");
+                if (Cancelled) notice.Cancel();
+                return notice;
             }
 
             internal void BindCommand(string value)
@@ -140,7 +161,8 @@ namespace RemoteMonitorMaster
             internal bool IsAuthorizedReply(string text)
             {
                 return text != null && text == Volatile.Read(ref preparedReply) &&
-                    (IsPlainCommands ? ReadOnlyCommands.IsReplyPart(text, Volatile.Read(ref command), Marker, replyPartIndex, replyPartCount) :
+                    (isNotice ? text == ReadyNotice || text == PowerSiBusyNotice || text == StatusBusyNotice :
+                    IsPlainCommands ? ReadOnlyCommands.IsReplyPart(text, Volatile.Read(ref command), Marker, replyPartIndex, replyPartCount) :
                         IsSlaveStatus ? PcStatusReport.IsSlaveReply(text, Marker, nextMarker) :
                         IsPcStatus ? PcStatusReport.IsReply(text, Marker, nextMarker) : IsValidMarker(text));
             }
@@ -152,7 +174,8 @@ namespace RemoteMonitorMaster
             private bool AnyPart(Func<Consent, bool> predicate)
             {
                 var parts = Volatile.Read(ref preparedParts);
-                return parts != null && parts.Any(predicate);
+                var notice = Volatile.Read(ref progressNotice);
+                return (notice != null && predicate(notice)) || (parts != null && parts.Any(predicate));
             }
             public bool CursorMoveAttempted { get { return OwnCursorMoveAttempted || AnyPart(part => part.OwnCursorMoveAttempted); } }
             public bool WriteAttempted { get { return OwnWriteAttempted || AnyPart(part => part.OwnWriteAttempted); } }
@@ -174,6 +197,8 @@ namespace RemoteMonitorMaster
                 }
                 var parts = Volatile.Read(ref preparedParts);
                 if (parts != null) foreach (var part in parts) attempted |= part.Cancel();
+                var notice = Volatile.Read(ref progressNotice);
+                if (notice != null) attempted |= notice.Cancel();
                 return attempted;
             }
             internal bool TryConsume(string marker)
@@ -407,7 +432,15 @@ namespace RemoteMonitorMaster
                     var contents = Read("input_value", () => pattern.Current.Value);
                     CheckScope(input, selected);
                     Need(contents != null, "SEND_INPUT_VALUE_UNAVAILABLE");
-                    return ClassifyInput(contents, marker); // Raw input is never logged, returned or stored in a baseline.
+                    var state = ClassifyInput(contents, marker);
+                    if (writeCalls != 0 && !writeVerified)
+                        log.Write("INFO", "SEND_DRAFT_READBACK", AuditLog.Field("classification", state),
+                            AuditLog.Field("expected_length", marker.Length), AuditLog.Field("actual_length", contents.Length),
+                            AuditLog.Field("expected_cr", marker.Count(c => c == '\r')), AuditLog.Field("actual_cr", contents.Count(c => c == '\r')),
+                            AuditLog.Field("expected_lf", marker.Count(c => c == '\n')), AuditLog.Field("actual_lf", contents.Count(c => c == '\n')),
+                            AuditLog.Field("exact", contents == marker), AuditLog.Field("line_endings_equivalent", state == "UNCHANGED"),
+                            AuditLog.Field("actual_fingerprint", log.Fingerprint(contents)));
+                    return state; // No draft text or excerpt enters the log.
                 }
 
                 CheckRoot();
@@ -492,11 +525,11 @@ namespace RemoteMonitorMaster
                         writeReturned = true;
                         Alive();
                         CheckRoot();
-                        inputState = ReadInput(PrepareInput());
+                        inputState = WaitForWrittenInput(() => ReadInput(PrepareInput()), Alive);
                         Need(inputState == "UNCHANGED", "SEND_WRITE_NOT_VERIFIED");
                         writeVerified = true;
                         log.Write("INFO", "SUPERVISED_WRITE_VERIFIED", AuditLog.Field("setvalue_calls", writeCalls),
-                            AuditLog.Field("exact_readback", true));
+                            AuditLog.Field("content_verified", true), AuditLog.Field("normalization", "CRLF_LF_ONLY"));
                         PrepareSend();
                         var afterWrite = CheckPoint();
                         Need(afterWrite.Path.Count == observation.Path.Count && afterWrite.Path.Zip(observation.Path,
@@ -587,7 +620,23 @@ namespace RemoteMonitorMaster
 
         internal static string ClassifyInput(string value, string marker)
         {
-            return value == null ? "UNAVAILABLE" : value.Length == 0 ? "EMPTY" : value == marker ? "UNCHANGED" : "OTHER";
+            // Chromium/Windows providers may expose CRLF for an LF payload. Preserve every other character.
+            return value == null ? "UNAVAILABLE" : value.Length == 0 ? "EMPTY" :
+                marker != null && value.Replace("\r\n", "\n") == marker.Replace("\r\n", "\n") ? "UNCHANGED" : "OTHER";
+        }
+
+        internal static string WaitForWrittenInput(Func<string> read, Action alive)
+        {
+            string state = null;
+            for (var sample = 0; sample < 6; sample++)
+            {
+                alive();
+                state = read();
+                alive();
+                if (state == "UNCHANGED" || sample == 5) break;
+                Thread.Sleep(100); // Read-only propagation wait; SetValue and Send are never repeated.
+            }
+            return state;
         }
 
         internal static Point SendCenter(Rect bounds)
@@ -635,6 +684,21 @@ namespace RemoteMonitorMaster
 
         internal static void RunSelfTest()
         {
+            Need(ClassifyInput("한글 123\r\noutput\r\n", "한글 123\noutput\n") == "UNCHANGED" &&
+                ClassifyInput("한글 123\routput", "한글 123\noutput") == "OTHER" &&
+                ClassifyInput("한글 124\r\noutput", "한글 123\noutput") == "OTHER" &&
+                ClassifyInput("a b", "a\nb") == "OTHER" && ClassifyInput("a\n", "a") == "OTHER",
+                "SEND_SELF_TEST_MULTILINE_READBACK");
+            var reads = 0;
+            Need(WaitForWrittenInput(() => ++reads == 2 ? "UNCHANGED" : "OTHER", () => { }) == "UNCHANGED" && reads == 2,
+                "SEND_SELF_TEST_ASYNC_READBACK");
+            reads = 0;
+            Need(WaitForWrittenInput(() => { reads++; return "OTHER"; }, () => { }) == "OTHER" && reads == 6,
+                "SEND_SELF_TEST_NO_WRITE_RETRY");
+            var readyNotice = Consent.ForNotice("D234567", ReadyNotice);
+            Need(!readyNotice.TryConsume(PowerSiBusyNotice) && !readyNotice.TryConsume(ReadyNotice), "SEND_SELF_TEST_NOTICE_EXACT");
+            var onceNotice = Consent.ForNotice("D234567", ReadyNotice);
+            Need(onceNotice.TryConsume(ReadyNotice) && !onceNotice.TryConsume(ReadyNotice), "SEND_SELF_TEST_NOTICE_ONCE");
             const string marker = "D234567";
             var observedPointer = new NativeMethods.ScreenPoint { X = -10, Y = 20 };
             Need(PointerFailure(true, observedPointer, new Point(-10, 20)) == null &&
@@ -678,6 +742,21 @@ namespace RemoteMonitorMaster
                 Need(refused && !cancelledStatus.TryConsume(text) && !cancelledStatus.TryCommitMove(), "STATUS_SELF_TEST_CANCELLED");
             }
             var endpoint = new SlaveEndpoint(System.Net.IPAddress.Loopback, 1, new string('0', 64), Convert.ToBase64String(new byte[32]));
+            var pendingNotice = new Consent(marker, true, true, endpoint, null, true);
+            Need(pendingNotice.TryClaimRoundTrip(), "NOTICE_SELFTEST_CLAIM");
+            pendingNotice.BindCommand("pwrsi");
+            var busyNotice = pendingNotice.CreateProgressNotice(PowerSiBusyNotice);
+            Need(busyNotice.TryConsume(PowerSiBusyNotice) && busyNotice.TryCommitMove() && busyNotice.TryCommitWrite() &&
+                pendingNotice.PendingWrite && !pendingNotice.Attempted, "NOTICE_SELFTEST_PENDING_AGGREGATE");
+            pendingNotice.Cancel();
+            Need(busyNotice.Cancelled && !busyNotice.TryCommit() && pendingNotice.PendingWrite, "NOTICE_SELFTEST_CANCEL_BEFORE_CLICK");
+            reads = 0;
+            try
+            {
+                WaitForWrittenInput(() => { reads++; return "OTHER"; }, () => { throw new MonitorException("SEND_CANCELLED", "stopped"); });
+                throw new InvalidOperationException("Cancelled readback continued.");
+            }
+            catch (MonitorException) { Need(reads == 0, "NOTICE_SELFTEST_READBACK_CANCEL"); }
             var multipartPayloads = new[]
             {
                 "PWRSI REPORT " + marker + " | PART 001/002\r\nfirst",

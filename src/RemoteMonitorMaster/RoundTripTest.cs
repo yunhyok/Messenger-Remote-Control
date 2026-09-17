@@ -83,8 +83,45 @@ namespace RemoteMonitorMaster
                         AuditLog.Field("observed_name_length", received.Proof.Candidate.Identity.NameLength),
                         AuditLog.Field("body_authenticated", false));
                 }
+                SupervisedSendTest.Outcome SendPrepared(string payload, SupervisedSendTest.Consent partConsent, int partNumber, int partCount)
+                {
+                    Alive();
+                    var sendProof = consent.IsPlainCommands
+                        ? RefreshProof(received.Proof, owner, window, incomingMarker, Stopped, progress, log, inspectSnapshot)
+                        : received.Proof;
+                    sendStageEntered = true;
+                    var outcome = SupervisedSendTest.RunBoundObserved(window, log, payload, new Point(), partConsent, Stopped, snapshot =>
+                    {
+                        Alive();
+                        NativeMethods.WindowRectangle current;
+                        Need(NativeMethods.GetWindowRect(window, out current) && current.Equals(sendProof.Bounds), "ROUNDTRIP_WINDOW_MOVED");
+                        inspectSnapshot?.Invoke("HANDOFF", snapshot);
+                        Alive();
+                        AuthorizeHandoffCore(sendProof, owner, window, incomingMarker, snapshot, statePath, Stopped, !reserved, log);
+                        reserved = true;
+                        Alive();
+                        Need(NativeMethods.GetWindowRect(window, out current) && current.Equals(sendProof.Bounds), "ROUNDTRIP_WINDOW_MOVED");
+                        log.Write("INFO", "ROUNDTRIP_HANDOFF", AuditLog.Field("candidate_reobserved", true),
+                            AuditLog.Field("diagnostic_token_reserved", reserved), AuditLog.Field("reply_part", partNumber),
+                            AuditLog.Field("reply_parts", partCount), AuditLog.Field("progress_notice", partNumber == 0),
+                            AuditLog.Field("delivery_verified", false));
+                    });
+                    reserved |= sendProof.DiagnosticTokenReserved;
+                    return outcome;
+                }
                 var samplesPcStatus = consent.IsPcStatus && (!consent.IsPlainCommands ||
                     !observedCommand.StartsWith("help", StringComparison.Ordinal));
+                if (continuousWait && consent.IsPlainCommands && samplesPcStatus)
+                {
+                    phase = "NOTICE_BUSY";
+                    progress("NOTICE_BUSY");
+                    var notice = consent.CreateProgressNotice(observedCommand == "pwrsi" ?
+                        SupervisedSendTest.PowerSiBusyNotice : SupervisedSendTest.StatusBusyNotice);
+                    sent = SendPrepared(notice.NoticeText, notice, 0, 0);
+                    if (!sent.CleanCompletion)
+                        return new Outcome("Progress notice was not confirmed. No Slave query was started. " + sent.Message, sent, false);
+                    log.Write("INFO", "MASTER_NOTICE_SENT", AuditLog.Field("stage", "BUSY"), AuditLog.Field("delivery_verified", false));
+                }
                 phase = "PREPARE_REPLY";
                 Alive();
                 if (samplesPcStatus)
@@ -112,34 +149,10 @@ namespace RemoteMonitorMaster
                 {
                     Alive();
                     var partNumber = index + 1;
-                    var sendProof = consent.IsPlainCommands
-                        ? RefreshProof(received.Proof, owner, window, incomingMarker, Stopped, progress, log, inspectSnapshot)
-                        : received.Proof;
                     var partConsent = consent.IsPcStatus ? consent.GetPreparedPart(index) : consent;
                     progress("ROUNDTRIP_SENDING:" + partNumber + "/" + replies.Length);
                     Alive();
-                    sendStageEntered = true;
-                    sent = SupervisedSendTest.RunBoundObserved(window, log, replies[index], new Point(), partConsent, Stopped, snapshot =>
-                    {
-                        Alive();
-                        NativeMethods.WindowRectangle current;
-                        Need(NativeMethods.GetWindowRect(window, out current) && current.Equals(sendProof.Bounds),
-                            "ROUNDTRIP_WINDOW_MOVED");
-                        inspectSnapshot?.Invoke("HANDOFF", snapshot);
-                        Alive();
-                        AuthorizeHandoffCore(sendProof, owner, window, incomingMarker, snapshot, statePath, Stopped,
-                            partNumber == 1, log);
-                        if (partNumber == 1) reserved = true;
-                        Alive();
-                        Need(NativeMethods.GetWindowRect(window, out current) && current.Equals(sendProof.Bounds),
-                            "ROUNDTRIP_WINDOW_MOVED");
-                        log.Write("INFO", "ROUNDTRIP_HANDOFF", AuditLog.Field("candidate_reobserved", true),
-                            AuditLog.Field("diagnostic_token_reserved", reserved), AuditLog.Field("reply_part", partNumber),
-                            AuditLog.Field("reply_parts", replies.Length), AuditLog.Field("plain_body_verified", false),
-                            AuditLog.Field("conversation_identity_verified", false), AuditLog.Field("delivery_verified", false),
-                            AuditLog.Field("automatic_send_allowed", false));
-                    });
-                    reserved |= sendProof.DiagnosticTokenReserved; // Also true when cancellation followed the durable write.
+                    sent = SendPrepared(replies[index], partConsent, partNumber, replies.Length);
                     sendMessages.Add("PART " + partNumber + "/" + replies.Length + Environment.NewLine + sent.Message);
                     if (!sent.CleanCompletion)
                     {
@@ -233,7 +246,7 @@ namespace RemoteMonitorMaster
             IntPtr window, string marker, Func<bool> stop, Action<string> progress, AuditLog log,
             Action<string, ProbeSnapshot> inspectSnapshot)
         {
-            var observed = ReceiveProbe.Observe(window, log, marker, stop, progress, owner, false,
+            var observed = ReceiveProbe.Observe(window, log, marker, stop, ignored => progress("REVALIDATING"), owner, false,
                 inspectSnapshot, original.Baseline, false, true);
             Need(observed.Status == "CANDIDATE_OBSERVED" && observed.Reason == "NONE" && observed.Proof != null,
                 "ROUNDTRIP_REOBSERVATION_FAILED");

@@ -1181,7 +1181,7 @@ namespace RemoteMonitorSlave
             var buffer = sample == null ? lastBuffer : sample.Buffer;
             var content = new DiagnosticBundleContent
             {
-                Version = LinkVersion.Value,
+                Version = LinkVersion.AppValue,
                 CreatedUtc = DateTime.UtcNow,
                 TargetPid = sample?.Process.Pid,
                 TargetStartUtcTicks = sample?.Process.StartUtcTicks,
@@ -1232,7 +1232,7 @@ namespace RemoteMonitorSlave
         {
             if (outputSamples.Count == 0) return BuildBundleContent(runs);
             SaveSelectedSample();
-            var batch = new DiagnosticBundleContent { Version = LinkVersion.Value, CreatedUtc = DateTime.UtcNow,
+            var batch = new DiagnosticBundleContent { Version = LinkVersion.AppValue, CreatedUtc = DateTime.UtcNow,
                 LogFilePath = log.Path, Notes = "PID별 독립 수집. PENDING은 Windows 응답 없음이며 내부 시뮬레이션 상태 판정이 아닙니다." };
             foreach (var sample in outputSamples)
             {
@@ -1559,7 +1559,7 @@ namespace RemoteMonitorSlave
                 }
                 using (var form = new SlaveForm(directory))
                 {
-                    if (!form.Text.Contains(LinkVersion.Value) || form.server != null || form.identity != null ||
+                    if (!form.Text.Contains(LinkVersion.AppValue) || form.server != null || form.identity != null ||
                         form.stop.Enabled || form.export.Enabled || form.start.Enabled || !form.refresh.Enabled || !form.powerSiCheck.Enabled ||
                         form.powerSiCheck.Text != "PowerSI 확인" || !form.pairing.UseSystemPasswordChar ||
                         form.powerSi.Text.Length != 0 || !form.powerSi.ReadOnly || !form.state.Text.Contains("STOPPED") || !form.outputAll.Enabled || form.replayVision.Enabled)
@@ -1978,7 +1978,7 @@ namespace RemoteMonitorSlave
                         bundle.AutoCopyLastFailure != "AUTO_COPY_OCCLUDED OCCLUDER|SELF" ||
                         bundle.Notes.Contains("최근 자동 복사:") ||
                         !bundle.Runs[0].Metadata.StartsWith("VISION_RUN") || !bundle.Runs[0].Metadata.Contains("frame=600x420") ||
-                        !bundle.Runs[0].Metadata.Contains("body=B2|600|420") || bundle.Version != LinkVersion.Value)
+                        !bundle.Runs[0].Metadata.Contains("body=B2|600|420") || bundle.Version != LinkVersion.AppValue)
                         throw new InvalidOperationException("Diagnostic bundle content lost the run, comparison or metadata.");
                     using (var memory = new MemoryStream())
                     {

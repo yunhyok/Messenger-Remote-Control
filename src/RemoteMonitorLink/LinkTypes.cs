@@ -25,6 +25,8 @@ namespace RemoteMonitorLink
 
     internal static class LinkVersion
     {
+        internal const string AppValue = "0.2.1";
+        // Wire contract is unchanged: the Master update remains compatible with an offline v0.2.0 Slave.
         internal const string Value = "0.2.0";
     }
 
