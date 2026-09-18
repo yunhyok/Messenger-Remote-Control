@@ -12,6 +12,8 @@ work/
 *.suo
 seen-tokens.txt
 roundtrip-seen-tokens.txt
+powersi-output-history-v1.txt
+powersi-output-history-v1.txt.*.tmp
 *.rmpair
 identity.dat
 local-vision.json

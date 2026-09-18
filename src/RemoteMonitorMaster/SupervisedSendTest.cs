@@ -44,6 +44,8 @@ namespace RemoteMonitorMaster
             private string preparedReply;
             private string[] preparedReplies;
             private Consent[] preparedParts;
+            private PreparedPowerSiOutput preparedOutput;
+            private int confirmedReplyParts, outputCommitted;
             private Consent progressNotice;
             private bool isNotice;
             internal bool IsOperational { get { return IsPlainCommands || isNotice; } }
@@ -128,17 +130,18 @@ namespace RemoteMonitorMaster
                 if (!IsPcStatus) return new[] { Marker };
                 Need(Volatile.Read(ref state) == 0 && Volatile.Read(ref roundTripClaimed) == 1 &&
                     Volatile.Read(ref preparedReply) == null, "PC_STATUS_CONSENT_USED");
-                var replies = IsPlainCommands ? ReadOnlyCommands.CaptureReplies(Volatile.Read(ref command), Marker, slave, slaveCancellation.Token) :
+                PreparedPowerSiOutput output = null;
+                var replies = IsPlainCommands ? ReadOnlyCommands.CaptureReplies(Volatile.Read(ref command), Marker, slave, slaveCancellation.Token, out output) :
                     new[] { slave == null ? PcStatusReport.Capture(Marker) :
                         PcStatusReport.CaptureSlave(Marker, slave, slaveCancellation.Token) };
                 if (nextMarker != null) replies[0] = PcStatusReport.WithNext(replies[0], Marker, IsSlaveStatus, nextMarker);
-                BindPreparedReplies(replies);
+                BindPreparedReplies(replies, output);
                 return (string[])replies.Clone();
             }
 
-            internal void BindPreparedReplies(string[] replies)
+            internal void BindPreparedReplies(string[] replies, PreparedPowerSiOutput output = null)
             {
-                Need(replies != null && replies.Length > 0 && replies.Length <= 999 &&
+                Need(replies != null && replies.Length > 0 && replies.Length <= ReadOnlyCommands.MaxReportParts &&
                     Volatile.Read(ref state) == 0 && Volatile.Read(ref preparedReply) == null, "PC_STATUS_CONSENT_USED");
                 var bound = (string[])replies.Clone();
                 for (var i = 0; i < bound.Length; i++)
@@ -154,8 +157,26 @@ namespace RemoteMonitorMaster
                 for (var i = 1; i < bound.Length; i++) children[i - 1] = new Consent(this, bound[i], i + 1, bound.Length);
                 Volatile.Write(ref preparedParts, children);
                 Volatile.Write(ref preparedReplies, bound);
+                preparedOutput = output;
                 Need(Volatile.Read(ref state) == 0, "SEND_CANCELLED");
             }
+
+            internal void RecordPreparedPartOutcome(int index, Outcome outcome)
+            {
+                var part = GetPreparedPart(index);
+                Need(!Cancelled && index == confirmedReplyParts && outcome != null && outcome.CleanCompletion &&
+                    part.OwnAttempted && !part.Cancelled, "PC_STATUS_PART_NOT_CONFIRMED");
+                confirmedReplyParts++;
+            }
+
+            internal bool CommitPreparedOutput()
+            {
+                Need(!Cancelled && PreparedReplyCount > 0 && confirmedReplyParts == PreparedReplyCount &&
+                    Interlocked.CompareExchange(ref outputCommitted, 1, 0) == 0, "PC_STATUS_OUTPUT_NOT_CONFIRMED");
+                return preparedOutput == null || preparedOutput.Commit();
+            }
+
+            internal string OutputHistoryFailure { get { return preparedOutput?.FailureReason ?? "NONE"; } }
 
             internal int PreparedReplyCount { get { return Volatile.Read(ref preparedReplies)?.Length ?? (IsPcStatus ? 0 : 1); } }
 
@@ -783,6 +804,19 @@ namespace RemoteMonitorMaster
                 secondPart.TryConsume(multipartPayloads[1]) && secondPart.TryCommitMove() && secondPart.TryCommitWrite() && secondPart.TryCommit() &&
                 multipart.CursorMoveAttempted && multipart.WriteAttempted && multipart.Attempted && !multipart.PendingWrite,
                 "MULTIPART_SELF_TEST_SEQUENCE");
+            try { multipart.CommitPreparedOutput(); throw new InvalidOperationException("Unconfirmed output was committed."); }
+            catch (MonitorException) { }
+            var cleanPart = new Outcome("SENT", "NONE", "self-test", true);
+            multipart.RecordPreparedPartOutcome(0, cleanPart);
+            try { multipart.CommitPreparedOutput(); throw new InvalidOperationException("Partially confirmed output was committed."); }
+            catch (MonitorException) { }
+            try { multipart.RecordPreparedPartOutcome(1, new Outcome("UNKNOWN", "FAILED", "self-test", false));
+                throw new InvalidOperationException("Uncertain part was confirmed."); }
+            catch (MonitorException) { }
+            multipart.RecordPreparedPartOutcome(1, cleanPart);
+            Need(multipart.CommitPreparedOutput(), "MULTIPART_SELF_TEST_HISTORY_COMMIT");
+            try { multipart.CommitPreparedOutput(); throw new InvalidOperationException("Output was committed twice."); }
+            catch (MonitorException) { }
             multipart.Cancel();
 
             var partial = new Consent(marker, true, true, endpoint, null, true);
@@ -797,6 +831,8 @@ namespace RemoteMonitorMaster
             partial.Cancel();
             Need(partial.Cancelled && partial.Attempted && partial.PendingWrite && !secondPart.TryCommit(),
                 "MULTIPART_SELF_TEST_ABORT_REMAINING");
+            try { partial.CommitPreparedOutput(); throw new InvalidOperationException("Cancelled output was committed."); }
+            catch (MonitorException) { }
             foreach (var invalid in new[] { null, "", "D123456", "D23456", "D2345678", "d234567", "D23 567" })
             {
                 try { new Consent(invalid, true); }

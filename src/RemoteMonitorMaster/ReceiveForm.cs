@@ -170,7 +170,7 @@ namespace RemoteMonitorMaster
                 ? (plainCommands
                     ? "pwrsi 한 번은 Slave에서 요청 시점의 PowerSI 보고서를 한 번 수집하고, 1,400자 이하 PART 답장을 순서대로 전송합니다.\r\n" +
                         "help help, help total status도 인식하는 고정 읽기 전용 명령어입니다. 목록 밖의 명령은 승인하거나 실행하지 않으며, 메시지 본문 인증을 주장하지 않습니다.\r\n" +
-                        "모든 대상이 표시되며 Pending 대상은 이름·PID·Pending만 보냅니다. 나머지는 출처·수집 시각·설명·최신 발췌를 보내고 진행률·완료를 추측하지 않습니다.\r\n" +
+                        "모든 대상이 표시되며 Pending 대상은 이름·PID·Pending만 보냅니다. 나머지는 출처·수집 시각·설명·수집된 Output 전체 또는 이전 전송 이후 추가분를 보내고 진행률·완료를 추측하지 않습니다.\r\n" +
                         "보고서 수집은 최대100초, 전체 조회는 최대120초입니다. 한 PART라도 전송 결과가 불확실하면 남은 PART를 보내지 않습니다. Stop 뒤 현재 호출이 끝나야 LOG READY가 표시됩니다."
                     : "반복 통합 확인: 첫 휴대폰 M코드 수신 → " + (slave == null ? "이 PC" : "선택한 Slave PC") + " 읽기 전용 상태 조회 → " + ReportPrefix + " 답장 → 다음 NEXT 숫자 앞에 M을 붙여 반복합니다.\r\n" +
                         "첫 초록 READY의 M만 한 번 보내세요. 이후 답장을 본 뒤 답장 NEXT 숫자 앞에 M을 붙여 바로 휴대폰에서 보낼 수 있습니다.\r\n" +

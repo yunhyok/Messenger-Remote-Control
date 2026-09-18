@@ -50,7 +50,7 @@ namespace RemoteMonitorMaster
             result.Text = "v" + LinkVersion.AppValue + ": 메신저의 고정 읽기 전용 명령으로 Slave 상태와 PowerSI 증거를 요청합니다.\r\n" +
                 "pwrsi 그대로 입력하세요. total status는 단어 사이 한 칸입니다. 앞뒤 공백은 자동 제거합니다. 기존 M코드는 체크 시에만 사용합니다.\r\n" +
                 "pwrsi는 요청 시점에 한 번 수집하고 모든 대상을 표시합니다. 각 답장은 1,400자 이하이며 PART 순서대로 전송합니다.\r\n" +
-                "Pending 대상은 이름·PID·Pending만 표시합니다. 그 밖의 대상은 출처·수집 시각·설명·최신 발췌를 표시합니다.\r\n" +
+                "Pending 대상은 이름·PID·Pending만 표시합니다. 그 밖의 대상은 출처·수집 시각·설명·수집된 Output 전체 또는 이전 전송 이후 추가분를 표시합니다.\r\n" +
                 "보고서 수집은 최대100초, 전체 조회는 최대120초입니다. 진행률이나 완료율은 추측하지 않습니다.";
             var path = new TextBox { Text = log.FilePath, ReadOnly = true, Bounds = new Rectangle(18, 389, 666, 25) };
             var folder = new Button { Text = "Open Log Folder", Bounds = new Rectangle(694, 386, 168, 32) };

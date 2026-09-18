@@ -2,8 +2,10 @@ using System;
 using System.Diagnostics;
 using System.IO;
 using System.Net;
+using System.Net.Security;
 using System.Net.Sockets;
 using System.Security.Authentication;
+using System.Security.Cryptography.X509Certificates;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -48,6 +50,7 @@ namespace RemoteMonitorLink
                         throw new InvalidOperationException("Identity persistence failed.");
                     TestLoopback(identity);
                     TestReportLoopback(identity);
+                    TestLargeReportTls(identity);
                     TestActiveCancellation(identity);
                     TestDeadline(identity);
                 }
@@ -169,17 +172,16 @@ namespace RemoteMonitorLink
                     endpoint, CancellationToken.None, true).GetAwaiter().GetResult();
                 if (Volatile.Read(ref calls) != 1 || status.PowerSiReport == null || status.PowerSi != null ||
                     status.PowerSiReport.Targets.Length != status.Processes.Items.Length ||
-                    status.PowerSiReport.Serialize() != PowerSiReport.Parse(status.PowerSiReport.Serialize()).Serialize() ||
                     !ReferenceEquals(callbackInventory, observedInventory) ||
                     status.Processes.Items.Any(item => item.HasWindow || item.AgeSeconds.HasValue ||
                         item.WorkingSetMiB.HasValue || item.CpuPermille.HasValue))
-                    throw new InvalidOperationException("Authenticated PS3 callback did not round-trip.");
+                    throw new InvalidOperationException("Authenticated PS4 callback did not round-trip.");
             }
             finally
             {
                 server.Dispose();
                 if (!server.Completion.Wait(2000))
-                    throw new InvalidOperationException("PS3 status server did not stop promptly.");
+                    throw new InvalidOperationException("PS4 status server did not stop promptly.");
             }
         }
 
@@ -214,6 +216,63 @@ namespace RemoteMonitorLink
             {
                 if (accepted != null) accepted.Close();
                 stalled.Stop();
+            }
+        }
+
+        private static void TestLargeReportTls(SlaveIdentity identity)
+        {
+            DateTime captured = DateTime.UtcNow;
+            string output = string.Concat(Enumerable.Repeat("PowerSI 한글 😀\r\ncontrol:\0\u0001\tend\r\n", 40000));
+            string ocr = string.Concat(Enumerable.Repeat("OCR 보조 😀\n", 4000));
+            var report = new PowerSiReport
+            {
+                CapturedUtc = captured, SessionId = 17,
+                Targets = new[] { new PowerSiTargetReport
+                {
+                    Pid = 1701, StartUtcTicks = captured.AddHours(-1).Ticks, ProcessName = "PowerSI TLS 한글",
+                    CapturedUtc = captured, State = "READ", Source = "BUFFER", Code = "BUFFER_READ",
+                    BufferCode = "BUFFER_READ", VisionCode = "OUTPUT_READ", OutputText = output,
+                    OcrCapturedUtc = captured.AddSeconds(1), OcrText = ocr
+                } }
+            };
+            var listener = new TcpListener(IPAddress.Loopback, 0);
+            listener.Start();
+            Task server = Task.Run(async delegate
+            {
+                using (TcpClient accepted = await listener.AcceptTcpClientAsync().ConfigureAwait(false))
+                using (var secure = new SslStream(accepted.GetStream(), false))
+                {
+                    await secure.AuthenticateAsServerAsync(identity.Certificate, false, SslProtocols.Tls12, false)
+                        .ConfigureAwait(false);
+                    await report.WriteFramedAsync(secure, CancellationToken.None).ConfigureAwait(false);
+                }
+            });
+            try
+            {
+                using (var client = new TcpClient(AddressFamily.InterNetwork))
+                {
+                    client.Connect(IPAddress.Loopback, ((IPEndPoint)listener.LocalEndpoint).Port);
+                    RemoteCertificateValidationCallback validate = delegate(object sender, X509Certificate certificate,
+                        X509Chain chain, SslPolicyErrors errors)
+                    {
+                        return certificate != null && LinkProtocol.ComputePin(certificate.GetRawCertData()) == identity.Pin;
+                    };
+                    using (var secure = new SslStream(client.GetStream(), false, validate))
+                    {
+                        secure.AuthenticateAsClient("RemoteMonitorLink", null, SslProtocols.Tls12, false);
+                        PowerSiReport received = PowerSiReport.ReadFramedAsync(
+                            new LinkProtocol.LineReader(secure), CancellationToken.None).GetAwaiter().GetResult();
+                        if (received.Targets.Length != 1 || received.Targets[0].OutputText != output ||
+                            received.Targets[0].OcrText != ocr || received.Targets[0].ProcessName != "PowerSI TLS 한글")
+                            throw new InvalidOperationException("Large Unicode PS4 report did not round-trip over pinned TLS.");
+                    }
+                }
+                server.GetAwaiter().GetResult();
+            }
+            finally
+            {
+                listener.Stop();
+                if (!server.IsCompleted) server.Wait(2000);
             }
         }
 
@@ -314,9 +373,9 @@ namespace RemoteMonitorLink
             };
             string reportResponse = LinkProtocol.FormatStatus(sample, true);
             MachineStatus parsedReport = LinkProtocol.ParseStatus(reportResponse, true);
-            if (!parsedReport.PowerSiOnly || parsedReport.PowerSi != null || parsedReport.PowerSiReport == null ||
-                parsedReport.PowerSiReport.Serialize() != sample.PowerSiReport.Serialize())
-                throw new InvalidOperationException("PWRSI PS3 report did not round-trip.");
+            if (!parsedReport.PowerSiOnly || parsedReport.PowerSi != null || parsedReport.PowerSiReport != null ||
+                !LinkProtocol.IsFramedPowerSiStatus(reportResponse))
+                throw new InvalidOperationException("PWRSI PS4 report header did not round-trip.");
 
             long processStart = new DateTime(2026, 9, 9, 12, 0, 0, DateTimeKind.Utc).Ticks;
             var identityStatus = new MachineStatus
@@ -348,7 +407,8 @@ namespace RemoteMonitorLink
                 }
             };
             string identityResponse = LinkProtocol.FormatStatus(identityStatus, true);
-            if (LinkProtocol.ParseStatus(identityResponse, true).PowerSiReport.Targets[0].Pid != 71)
+            if (!LinkProtocol.IsFramedPowerSiStatus(identityResponse) ||
+                LinkProtocol.ParseStatus(identityResponse, true).Processes.Items[0].Pid != 71)
                 throw new InvalidOperationException("PWRSI target identity did not round-trip.");
             identityStatus.PowerSiReport.Targets[0].Pid = 72;
             ExpectParseFailure(() => LinkProtocol.FormatStatus(identityStatus, true));
@@ -363,7 +423,7 @@ namespace RemoteMonitorLink
             ExpectParseFailure(() => LinkProtocol.ParseStatus(powerSiResponse.Substring(0, powerSiResponse.LastIndexOf('|')), true));
             ExpectParseFailure(() => LinkProtocol.ParseStatus(powerSiResponse + "|extra", true));
             ExpectParseFailure(() => LinkProtocol.ParseStatus(powerSiResponse.Replace("PS1:OK", "PS1:EXECUTE"), true));
-            ExpectParseFailure(() => LinkProtocol.ParseStatus(reportResponse.Replace("PS3:", "PS4:"), true));
+            ExpectParseFailure(() => LinkProtocol.ParseStatus(reportResponse.Replace("|PS4", "|PS3:legacy"), true));
 
             var unrelated = new MachineStatus
             {

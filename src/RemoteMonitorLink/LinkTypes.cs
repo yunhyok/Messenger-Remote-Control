@@ -25,9 +25,8 @@ namespace RemoteMonitorLink
 
     internal static class LinkVersion
     {
-        internal const string AppValue = "0.2.2";
-        // Wire contract is unchanged: the Master update remains compatible with an offline v0.2.0 Slave.
-        internal const string Value = "0.2.0";
+        internal const string AppValue = "0.3.0";
+        internal const string Value = "0.3.0";
     }
 
     // Read-only metrics and bounded process names; never command lines, window titles or paths.
@@ -156,7 +155,7 @@ namespace RemoteMonitorLink
         internal const ulong MaxPhysicalMiB = ulong.MaxValue / BytesPerMiB;
         internal const int MaxPairingLength = 160;
         internal const int MaxRequestLength = 64;
-        internal const int MaxResponseLength = ProcessInventory.MaxWireLength + PowerSiReport.MaxWireLength + 129;
+        internal const int MaxResponseLength = ProcessInventory.MaxWireLength + 256;
         private const string StatusPrefix = "RMS1|STATUS|";
         private const string PowerSiPrefix = "RMS1|PWRSI|";
 
@@ -182,7 +181,7 @@ namespace RemoteMonitorLink
                 "{0}{1:yyyy-MM-ddTHH:mm:ss}|{2}|{3}|{4}|{5}|{6}", powerSiOnly ? PowerSiPrefix : StatusPrefix, status.LocalTime,
                 status.UptimeMinutes, status.AvailableMiB, status.TotalMiB, status.Version, status.Processes.Serialize());
             if (powerSiOnly) line += "|" + (status.PowerSiReport != null ?
-                status.PowerSiReport.Serialize() : status.PowerSi.Serialize());
+                PowerSiReport.WireVersion : status.PowerSi.Serialize());
             if (line.Length > MaxResponseLength) throw new InvalidDataException("Invalid machine status.");
             return line;
         }
@@ -211,8 +210,7 @@ namespace RemoteMonitorLink
             PowerSiObservation observation = null;
             if (powerSiOnly)
             {
-                if (parts[8].StartsWith("PS3:", StringComparison.Ordinal)) report = PowerSiReport.Parse(parts[8]);
-                else observation = PowerSiObservation.Parse(parts[8]);
+                if (parts[8] != PowerSiReport.WireVersion) observation = PowerSiObservation.Parse(parts[8]);
             }
 
             var status = new MachineStatus
@@ -393,18 +391,51 @@ namespace RemoteMonitorLink
 
         internal static async Task<string> ReadLineAsync(Stream stream, int maxLength, CancellationToken cancellation)
         {
-            if (stream == null) throw new ArgumentNullException("stream");
-            var bytes = new byte[maxLength];
-            var one = new byte[1];
-            int length = 0;
-            while (true)
+            return await new LineReader(stream).ReadLineAsync(maxLength, cancellation).ConfigureAwait(false);
+        }
+
+        internal static bool IsFramedPowerSiStatus(string line)
+        {
+            return line != null && line.EndsWith("|" + PowerSiReport.WireVersion, StringComparison.Ordinal);
+        }
+
+        // Keeps over-read bytes between bounded lines so large PS4 reports do not perform one async read per byte.
+        internal sealed class LineReader
+        {
+            private readonly Stream stream;
+            private readonly byte[] buffer = new byte[8192];
+            private int offset, count;
+
+            internal LineReader(Stream stream)
             {
-                int read = await stream.ReadAsync(one, 0, 1, cancellation).ConfigureAwait(false);
-                if (read == 0) throw new EndOfStreamException("Truncated protocol line.");
-                if (one[0] == (byte)'\n') return Encoding.ASCII.GetString(bytes, 0, length);
-                if (one[0] < 0x20 || one[0] > 0x7e) throw new InvalidDataException("Invalid protocol line.");
-                if (length == maxLength) throw new InvalidDataException("Protocol line is too long.");
-                bytes[length++] = one[0];
+                this.stream = stream ?? throw new ArgumentNullException("stream");
+            }
+
+            internal async Task<string> ReadLineAsync(int maxLength, CancellationToken cancellation)
+            {
+                if (maxLength < 1) throw new ArgumentOutOfRangeException("maxLength");
+                cancellation.ThrowIfCancellationRequested();
+                var line = new byte[maxLength];
+                int length = 0;
+                while (true)
+                {
+                    if (offset == count)
+                    {
+                        count = await stream.ReadAsync(buffer, 0, buffer.Length, cancellation).ConfigureAwait(false);
+                        offset = 0;
+                        if (count == 0) throw new EndOfStreamException("Truncated protocol line.");
+                    }
+                    int newline = Array.IndexOf(buffer, (byte)'\n', offset, count - offset);
+                    int end = newline < 0 ? count : newline;
+                    int available = end - offset;
+                    if (length + available > maxLength) throw new InvalidDataException("Protocol line is too long.");
+                    for (int i = offset; i < end; i++)
+                        if (buffer[i] < 0x20 || buffer[i] > 0x7e) throw new InvalidDataException("Invalid protocol line.");
+                    Buffer.BlockCopy(buffer, offset, line, length, available);
+                    length += available;
+                    offset = newline < 0 ? count : newline + 1;
+                    if (newline >= 0) return Encoding.ASCII.GetString(line, 0, length);
+                }
             }
         }
 
@@ -463,7 +494,7 @@ namespace RemoteMonitorLink
             return true;
         }
 
-        private static void ValidatePowerSiReportInventory(ProcessInventory inventory, PowerSiReport report)
+        internal static void ValidatePowerSiReportInventory(ProcessInventory inventory, PowerSiReport report)
         {
             report.Validate();
             if (report.SessionId != inventory.SessionId || report.Omitted != inventory.Omitted ||

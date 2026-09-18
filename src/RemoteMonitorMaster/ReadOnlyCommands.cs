@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -15,8 +16,10 @@ namespace RemoteMonitorMaster
     // ponytail: fixed, case-sensitive phrases for the supervised test; no natural-language or shell parser.
     internal static class ReadOnlyCommands
     {
+        private sealed class OutputTooLargeException : IOException { }
         private static readonly string[] Commands = { "help", "help help", "help total status", "help pwrsi", "total status", "pwrsi" };
         private static readonly string[] Hashes = Commands.Select(TokenStore.Hash).ToArray();
+        internal const int MaxReportParts = 9999999;
 
         internal static bool IsCommand(string command) { return Commands.Contains(command, StringComparer.Ordinal); }
 
@@ -70,7 +73,16 @@ namespace RemoteMonitorMaster
 
         internal static string[] CaptureReplies(string command, string nonce, SlaveEndpoint endpoint, CancellationToken cancellation)
         {
+            PreparedPowerSiOutput ignored;
+            return CaptureReplies(command, nonce, endpoint, cancellation, out ignored);
+        }
+
+        internal static string[] CaptureReplies(string command, string nonce, SlaveEndpoint endpoint, CancellationToken cancellation,
+            out PreparedPowerSiOutput preparedOutput)
+        {
+            preparedOutput = null;
             Need(IsCommand(command) && Protocol.IsDiagnosticMarker("DRAFT", nonce) && endpoint != null);
+            var clock = Stopwatch.StartNew();
             cancellation.ThrowIfCancellationRequested();
             if (command.StartsWith("help", StringComparison.Ordinal)) return new[] { Help(command, nonce) };
             MachineStatus state;
@@ -84,7 +96,26 @@ namespace RemoteMonitorMaster
             {
                 return FormatQueryFailure(command, nonce, ex);
             }
-            return command == "pwrsi" ? FormatPowerSi(nonce, state) : new[] { FormatStatus(command, nonce, state) };
+            if (command != "pwrsi") return new[] { FormatStatus(command, nonce, state) };
+            void CheckPreparation()
+            {
+                cancellation.ThrowIfCancellationRequested();
+                if (clock.Elapsed >= TimeSpan.FromSeconds(120)) throw new TimeoutException();
+            }
+            PreparedPowerSiOutput checkpoint;
+            string[] replies;
+            try
+            {
+                CheckPreparation();
+                checkpoint = PowerSiOutputHistory.Shared.Prepare(endpoint.Pin, state.PowerSiReport, CheckPreparation);
+                CheckPreparation();
+                replies = FormatPowerSi(nonce, state, checkpoint, CheckPreparation);
+                CheckPreparation();
+            }
+            catch (OutputTooLargeException ex) { return FormatQueryFailure(command, nonce, ex); }
+            catch (TimeoutException ex) { return FormatQueryFailure(command, nonce, ex); }
+            preparedOutput = checkpoint;
+            return replies;
         }
 
         private static bool IsExpectedQueryFailure(Exception exception)
@@ -101,7 +132,7 @@ namespace RemoteMonitorMaster
                 case "help": body = "허용 명령: help | help help | help total status | help pwrsi | total status | pwrsi"; break;
                 case "help help": body = "help는 허용 명령을 표시합니다. help 다음에 명령을 쓰면 해당 설명을 표시합니다."; break;
                 case "help total status": body = "total status는 Slave 시각, 가동 시간, RAM, 버전과 최대 8개 프로세스의 이름·PID·CPU·RAM·경과 시간을 표시합니다. CPU는 시뮬레이션 진행률이 아닙니다."; break;
-                case "help pwrsi": body = "pwrsi는 요청 시점에 모든 PowerSI 대상을 한 번 수집합니다. 버퍼·자동 복사·로컬 OCR 증거를 사용할 수 있고 전체 조회는 최대 120초입니다. 진행률·완료율은 추측하지 않습니다."; break;
+                case "help pwrsi": body = "pwrsi는 모든 PowerSI를 한 번 수집합니다. 처음에는 수집된 Output 전체, 이후에는 마지막 전송 이후 추가분을 보냅니다. 변동이 없으면 알립니다. 조회·답장 준비는 최대 120초이며, 긴 답장은 여러 메시지로 나뉩니다. 다음 Master Ready까지 기다리세요."; break;
                 default: throw new MonitorException("COMMAND_INVALID", "Unknown read-only command.");
             }
             return "HELP " + nonce + " | " + body + " | 명령은 표시된 소문자로 입력하세요. pwrsi에는 공백이 없고 total status의 단어 사이는 한 칸입니다. 바깥 공백은 허용하며 답장을 확인한 뒤 다음 명령을 보내세요.";
@@ -156,12 +187,13 @@ namespace RemoteMonitorMaster
         private sealed class ReportBlock
         {
             internal readonly string FirstHeader, RepeatHeader;
-            internal readonly List<string> Lines;
+            internal readonly IEnumerable<string> Lines;
             internal ReportBlock(string firstHeader, string repeatHeader, IEnumerable<string> lines)
-            { FirstHeader = firstHeader; RepeatHeader = repeatHeader; Lines = new List<string>(lines); }
+            { FirstHeader = firstHeader; RepeatHeader = repeatHeader; Lines = lines; }
         }
 
-        internal static string[] FormatPowerSi(string nonce, MachineStatus state)
+        internal static string[] FormatPowerSi(string nonce, MachineStatus state, PreparedPowerSiOutput prepared = null,
+            Action checkPreparation = null)
         {
             Need(Protocol.IsDiagnosticMarker("DRAFT", nonce) && state != null);
             state.Validate();
@@ -183,8 +215,9 @@ namespace RemoteMonitorMaster
                 blocks.Add(new ReportBlock(target.State == "PENDING" ? full + " — Pending" :
                     full + " — " + StateName(target.State), string.Empty, new string[0]));
             }
-            foreach (var target in report.Targets)
+            for (var index = 0; index < report.Targets.Length; index++)
             {
+                var target = report.Targets[index];
                 if (target.State == "PENDING") continue;
                 var repeat = Abbreviate(target.ProcessName) + " (PID " + target.Pid.ToString(CultureInfo.InvariantCulture) + ")";
 
@@ -194,31 +227,66 @@ namespace RemoteMonitorMaster
                     "대상 수집 UTC: " + (target.CapturedUtc.HasValue ? Utc(target.CapturedUtc.Value) : "확인 불가"),
                     "설명: " + StateExplanation(target.State, target.Source) + " [code " + target.Code + "]"
                 };
-                if (!string.IsNullOrEmpty(target.Summary))
+                IEnumerable<string> details = lines;
+                if (target.State == "READ" || target.State == "VISIBLE_EMPTY")
                 {
-                    var summaryLines = TextLines(target.Summary);
-                    for (var i = 0; i < summaryLines.Length; i++)
-                        lines.Add((i == 0 ? "세부: " : "세부 계속: ") + summaryLines[i]);
+                    details = details.Concat(OutputLines(prepared?.Primary[index], target.OutputText, target.Source == "OCR"));
+                    if (!string.IsNullOrEmpty(target.OcrText))
+                    {
+                        details = details.Concat(new[] { "별도 로컬 OCR | 수집 UTC: " + Utc(target.OcrCapturedUtc.Value) })
+                            .Concat(OutputLines(prepared?.Secondary[index], target.OcrText, true));
+                    }
                 }
-                var excerptLines = TextLines(target.Excerpt ?? string.Empty);
-                Need(excerptLines.Length <= 5 && (target.Excerpt ?? string.Empty).Length <= 600);
-                if (excerptLines.Length == 0 || (excerptLines.Length == 1 && excerptLines[0].Length == 0))
-                    lines.Add("최신 발췌: 없음");
+                else lines.Add(RecoveryAdvice(target.Code));
+                if (!string.IsNullOrEmpty(target.VisionCode) && target.VisionCode.StartsWith("VISION_", StringComparison.Ordinal))
+                    lines.Add("로컬 LLM: " + RecoveryAdvice(target.VisionCode) + " [code " + target.VisionCode + "]");
+                blocks.Add(new ReportBlock("증거: " + repeat, "증거 계속: " + repeat, details));
+            }
+            return PackReport(nonce, blocks, checkPreparation);
+        }
+
+        private static IEnumerable<string> OutputLines(PowerSiOutputDelta delta, string fullText, bool ocr)
+        {
+            if (ocr) yield return "LLM 전사본: 화면에 보인 내용이며 문자·숫자 정확도는 미검증입니다.";
+            var kind = delta?.Kind ?? "FIRST";
+            if (kind == "UNCHANGED")
+            {
+                yield return "추가된 Output이 없어 보고할 변동이 없습니다. 수집된 내용 기준이며 실제 계산 정지를 뜻하지 않습니다.";
+                yield break;
+            }
+            var text = delta?.Text ?? fullText ?? string.Empty;
+            yield return kind == "APPENDED" ? "이전 전송 이후 추가된 Output:" :
+                kind == "REPLACED" ? "Output이 교체·초기화되었거나 기존 내용이 변경되어 현재 수집 내용 전체를 보냅니다:" :
+                "수집된 Output 전체:";
+            if (text.Length == 0) { yield return "(Output 내용 없음)"; yield break; }
+            // Messenger text cannot carry control characters. Spell them out, preserving their exact code points.
+            // Enumerate bounded lines instead of allocating millions of strings for a large newline-only buffer.
+            var line = new StringBuilder(1024);
+            for (var i = 0; i < text.Length; i++)
+            {
+                var c = text[i];
+                if (c == '\r' || c == '\n')
+                {
+                    if (c == '\r' && i + 1 < text.Length && text[i + 1] == '\n') i++;
+                    yield return "  " + line; line.Clear();
+                    continue;
+                }
+                if (line.Length >= 1000) { yield return "  " + line; line.Clear(); }
+                if (char.IsControl(c) && c != '\t') line.Append("\\u").Append(((int)c).ToString("X4", CultureInfo.InvariantCulture));
                 else
                 {
-                    lines.Add("최신 발췌 (완료·진행률 판정 아님):");
-                    foreach (var line in excerptLines) lines.Add("  " + line);
+                    line.Append(c);
+                    if (char.IsHighSurrogate(c) && i + 1 < text.Length) line.Append(text[++i]);
                 }
-                if (target.Truncated) lines.Add("발췌가 전송 한도에 맞게 잘렸습니다.");
-                blocks.Add(new ReportBlock("증거: " + repeat, "증거 계속: " + repeat, lines));
             }
-            return PackReport(nonce, blocks);
+            yield return "  " + line;
         }
 
         internal static string[] FormatQueryFailure(string command, string nonce, Exception exception)
         {
             Need((command == "total status" || command == "pwrsi") && Protocol.IsDiagnosticMarker("DRAFT", nonce));
-            var reason = exception is LinkVersionMismatchException ? "Master/Slave 버전이 맞지 않습니다. 두 프로그램을 v" + AppInfo.Version + "으로 맞추세요." :
+            var reason = exception is OutputTooLargeException ? "전체 답장이 안전한 처리 한도(32 Mi 문자)를 넘었습니다. 내용을 잘라 보내거나 전송 이력을 갱신하지 않았습니다." :
+                exception is LinkVersionMismatchException ? "Master/Slave 버전이 맞지 않습니다. 두 프로그램을 v" + AppInfo.Version + "으로 맞추세요." :
                 exception is TimeoutException ? "Slave 응답 시간이 초과되었습니다. 자동 재시도하지 않습니다." :
                 exception is InvalidDataException ? "Slave 응답 형식 또는 Master/Slave 버전이 맞지 않습니다." :
                 exception is AuthenticationException ? "Slave 연결 인증을 확인하지 못했습니다." :
@@ -232,48 +300,67 @@ namespace RemoteMonitorMaster
             return new[] { text };
         }
 
-        private static string[] PackReport(string nonce, IEnumerable<ReportBlock> blocks)
+        private static string[] PackReport(string nonce, IEnumerable<ReportBlock> blocks, Action checkPreparation = null)
         {
-            const int maximumParts = 999;
+            const int maximumParts = MaxReportParts;
             var prefixLength = ReportPrefix(nonce, maximumParts, maximumParts).Length + 2;
             var capacity = PcStatusReport.MaxPhoneLength - prefixLength;
-            var chunks = new List<string>();
-            foreach (var block in blocks)
+            IEnumerable<string> Chunks()
             {
-                var current = block.FirstHeader;
-                foreach (var line in block.Lines)
+                foreach (var block in blocks)
                 {
-                    Need(line != null && line.Length + block.RepeatHeader.Length + 2 <= capacity);
-                    var combined = current.Length == 0 ? line : current + "\r\n" + line;
-                    if (combined.Length <= capacity) current = combined;
-                    else
+                    var current = block.FirstHeader;
+                    foreach (var line in block.Lines.SelectMany(value => WrapLine(value, capacity - block.RepeatHeader.Length - 2)))
                     {
-                        Need(current.Length > 0);
-                        chunks.Add(current);
-                        current = block.RepeatHeader.Length == 0 ? line : block.RepeatHeader + "\r\n" + line;
+                        Need(line != null && line.Length + block.RepeatHeader.Length + 2 <= capacity);
+                        var combined = current.Length == 0 ? line : current + "\r\n" + line;
+                        if (combined.Length <= capacity) current = combined;
+                        else
+                        {
+                            Need(current.Length > 0);
+                            yield return current;
+                            current = block.RepeatHeader.Length == 0 ? line : block.RepeatHeader + "\r\n" + line;
+                        }
                     }
+                    if (current.Length > 0) yield return current;
                 }
-                if (current.Length > 0) chunks.Add(current);
             }
-            Need(chunks.Count > 0);
             var bodies = new List<string>();
             var body = string.Empty;
-            foreach (var chunk in chunks)
+            long preparedCharacters = 0;
+            foreach (var chunk in Chunks())
             {
+                checkPreparation?.Invoke();
                 Need(chunk.Length <= capacity);
+                preparedCharacters += chunk.Length + prefixLength + 4;
+                if (preparedCharacters > 32 * 1024 * 1024) throw new OutputTooLargeException();
                 var combined = body.Length == 0 ? chunk : body + "\r\n\r\n" + chunk;
                 if (combined.Length <= capacity) body = combined;
                 else { bodies.Add(body); body = chunk; }
             }
             if (body.Length > 0) bodies.Add(body);
-            Need(bodies.Count <= maximumParts);
+            Need(bodies.Count > 0 && bodies.Count <= maximumParts);
             var result = new string[bodies.Count];
             for (var i = 0; i < result.Length; i++)
             {
+                checkPreparation?.Invoke();
                 result[i] = ReportPrefix(nonce, i + 1, result.Length) + "\r\n" + bodies[i];
                 Need(IsReportPart(result[i], nonce, i + 1, result.Length));
             }
             return result;
+        }
+
+        private static IEnumerable<string> WrapLine(string line, int capacity)
+        {
+            Need(line != null && capacity > 2);
+            if (line.Length == 0) { yield return string.Empty; yield break; }
+            for (var offset = 0; offset < line.Length;)
+            {
+                var count = Math.Min(capacity, line.Length - offset);
+                if (offset + count < line.Length && char.IsHighSurrogate(line[offset + count - 1])) count--;
+                yield return line.Substring(offset, count);
+                offset += count;
+            }
         }
 
         private static string ReportPrefix(string nonce, int index, int count)
@@ -285,12 +372,43 @@ namespace RemoteMonitorMaster
         {
             if (!Protocol.IsDiagnosticMarker("DRAFT", nonce) || !SafeReplyText(text) || text.Length > PcStatusReport.MaxPhoneLength) return false;
             var match = Regex.Match(text, @"\APWRSI REPORT " + Regex.Escape(nonce) +
-                @" \| PART (?<index>[0-9]{3})/(?<count>[0-9]{3})\r\n(?<body>[\s\S]+)\z", RegexOptions.CultureInvariant);
+                @" \| PART (?<index>[0-9]{3,7})/(?<count>[0-9]{3,7})\r\n(?<body>[\s\S]+)\z", RegexOptions.CultureInvariant);
             int index, count;
             return match.Success && int.TryParse(match.Groups["index"].Value, NumberStyles.None, CultureInfo.InvariantCulture, out index) &&
                 int.TryParse(match.Groups["count"].Value, NumberStyles.None, CultureInfo.InvariantCulture, out count) &&
-                index >= 1 && count >= 1 && index <= count && (expectedIndex == 0 || index == expectedIndex) &&
+                index >= 1 && count >= 1 && count <= MaxReportParts && index <= count &&
+                text.StartsWith(ReportPrefix(nonce, index, count) + "\r\n", StringComparison.Ordinal) && (expectedIndex == 0 || index == expectedIndex) &&
                 (expectedCount == 0 || count == expectedCount);
+        }
+
+        private static string RecoveryAdvice(string code)
+        {
+            switch (code)
+            {
+                case "VISION_NOT_CONFIGURED": return "LM Studio 설정을 켜고 로드된 이미지 모델을 선택하세요";
+                case "VISION_SERVER_UNAVAILABLE": return "Slave의 LM Studio 로컬 서버 실행과 포트를 확인하세요";
+                case "VISION_MODEL_UNAVAILABLE": return "Slave의 LM Studio에서 이미지 모델을 로드하세요";
+                case "VISION_MODEL_AMBIGUOUS": return "Slave 설정에서 사용할 로드 모델을 선택하세요";
+                case "VISION_AUTH_REQUIRED": return "Slave의 LM Studio 인증 설정을 확인하세요";
+                case "VISION_INVALID_RESPONSE": case "VISION_FAILED": return "LM Studio 모델 오류 또는 응답 형식 불일치; 로드된 이미지 모델과 서버 로그를 확인하세요";
+                case "VISION_TIMEOUT": case "TARGET_TIMEOUT": return "제한 시간 내 수집하지 못했습니다";
+                case "SC_MINIMIZED": return "PowerSI 최소화 상태; 창을 직접 준비하세요";
+                case "SC_DESKTOP_UNAVAILABLE": return "Slave 데스크톱 잠금 또는 연결 상태를 확인하세요";
+                case "SC_IDENTITY": case "SC_NOT_RUNNING": case "SC_WINDOW_CHANGED": return "대상 종료 또는 식별 변경; 새로 조회하세요";
+                case "AUTO_COPY_WINDOW_CHANGED": return "대상 종료 또는 창 상태 변경; 새로 조회하세요";
+                case "AUTO_COPY_CURSOR_MOVED": case "AUTO_COPY_INPUT_BUSY": case "AUTO_COPY_CLIPBOARD_FOREIGN":
+                    return "사용자 입력 또는 클립보드 변경이 감지되어 수집을 중단했습니다";
+                case "SC_FOREGROUND_WAIT_MISMATCH": case "SC_FOREGROUND_MISMATCH_PRECAPTURE": case "SC_FOREGROUND_MISMATCH_POSTCAPTURE":
+                case "AUTO_COPY_FOREGROUND_LOST": return "다른 창으로 전환되어 수집을 중단했습니다";
+                case "OUTPUT_EMPTY": return "직접 읽은 Output에 내용 없음";
+                case "BUFFER_TOO_LARGE": return "Output이 수집 한도(8 Mi 문자)를 넘었습니다. 일부만 잘라 보내지 않았습니다.";
+                case "OUTPUT_INVALID_TEXT": return "수집한 문자의 형식을 안전하게 전달할 수 없습니다. Slave의 로컬 수집 결과를 확인하세요.";
+                case "REPORT_TOO_LARGE": return "수집된 전체 자료가 보고서 처리 한도(32 Mi 문자)를 넘었습니다. 원문을 자르지 않았으며 전송 이력을 갱신하지 않습니다.";
+                case "NOT_ATTEMPTED": return "전체 수집 시간 제한으로 미확인";
+                case "BUSY": return "다른 수집이 진행 중입니다; 완료 후 다시 요청하세요";
+                case "OUTPUT_REGION_UNCONFIRMED": case "AUTO_COPY_REGION_UNCONFIRMED": return "Output 영역을 확인하지 못해 자동 입력을 생략했습니다";
+                default: return "수집 미확인; Slave의 대상 창과 로컬 설정을 확인하세요";
+            }
         }
 
         private static string BatchExplanation(string code, int targets)
@@ -298,6 +416,7 @@ namespace RemoteMonitorMaster
             if (code == "OK") return targets == 0 ? "현재 Slave 세션에서 PowerSI 대상을 찾지 못했습니다." : "요청 시점의 대상별 증거입니다.";
             if (code == "BUSY") return "Slave가 다른 PowerSI 보고서를 수집 중이어서 이번 수집을 시작하지 못했습니다.";
             if (code == "CAPTURE_FAILED") return "Slave가 PowerSI 보고서를 수집하지 못했습니다.";
+            if (code == "REPORT_TOO_LARGE") return "전체 자료가 보고서 처리 한도(32 Mi 문자)를 넘어 이름·상태와 크기 오류만 반환했습니다.";
             return "Slave가 보고서 오류를 반환했습니다.";
         }
 
@@ -356,17 +475,17 @@ namespace RemoteMonitorMaster
             return value.Substring(0, headEnd) + "…" + value.Substring(tailStart);
         }
 
-        private static string[] TextLines(string value)
-        {
-            Need(value != null && SafeReplyText(value));
-            return value.Replace("\r\n", "\n").Split(new[] { '\n' }, StringSplitOptions.None);
-        }
-
         private static bool SafeReplyText(string text)
         {
             if (text == null) return false;
             for (var i = 0; i < text.Length; i++)
             {
+                if (char.IsHighSurrogate(text[i]))
+                {
+                    if (i + 1 >= text.Length || !char.IsLowSurrogate(text[++i])) return false;
+                    continue;
+                }
+                if (char.IsLowSurrogate(text[i])) return false;
                 if (!char.IsControl(text[i])) continue;
                 if (text[i] == '\t') continue;
                 if (text[i] == '\r' && i + 1 < text.Length && text[++i] == '\n') continue;
@@ -394,7 +513,7 @@ namespace RemoteMonitorMaster
                 index == 1 && count == 1 && IsReply(text, command, nonce);
         }
 
-        internal static void RunSelfTest()
+        internal static void RunSelfTest(string directory)
         {
             const string nonce = "D234567";
             int Occurrences(string text, string value)
@@ -434,7 +553,7 @@ namespace RemoteMonitorMaster
                     (8 - shown).ToString(CultureInfo.InvariantCulture)));
             var captured = new DateTime(2026, 9, 16, 1, 2, 3, DateTimeKind.Utc);
             var longName = "PowerSI MixedCase 123 한글 e\u0301 😀 " + new string('界', 205);
-            var excerpt = string.Join("\n", Enumerable.Range(1, 5).Select(i =>
+            var excerpt = string.Join("\n", Enumerable.Range(1, 12).Select(i =>
                 "line" + i.ToString(CultureInfo.InvariantCulture) + " " + new string((char)('a' + i), 108)));
             state.Processes.Items = new ProcessState[0];
             state.PowerSiReport = new PowerSiReport
@@ -446,7 +565,7 @@ namespace RemoteMonitorMaster
                     {
                         Pid = 31, StartUtcTicks = captured.AddHours(-2).Ticks, ProcessName = longName,
                         CapturedUtc = captured, State = "READ", Source = "AUTO_COPY", Code = "AUTO_COPY_READ",
-                        Summary = new string('S', PowerSiReport.MaxSummaryLength), Excerpt = excerpt, Truncated = true
+                        OutputText = excerpt
                     },
                     new PowerSiTargetReport
                     {
@@ -467,8 +586,8 @@ namespace RemoteMonitorMaster
                 IsReportPart(part, nonce, index + 1, parts.Length)).All(valid => valid) && joined.Contains(longName + " (PID 31)") &&
                 StringInfo.ParseCombiningCharacters(abbreviated).Length == 25 &&
                 joined.Contains("PowerSI Pending MixedCase (PID 32) — Pending") && !joined.Contains("SC_PENDING") &&
-                joined.Contains("line5") && joined.Contains("로컬 OCR") && !joined.Contains("CPU") && !joined.Contains("RAM"));
-            var firstExcerpt = joined.IndexOf("최신 발췌", StringComparison.Ordinal);
+                joined.Contains("line1 ") && joined.Contains("line12 ") && joined.Contains("로컬 OCR") && !joined.Contains("CPU") && !joined.Contains("RAM"));
+            var firstExcerpt = joined.IndexOf("수집된 Output 전체", StringComparison.Ordinal);
             Need(firstExcerpt > 0 && Occurrences(joined, longName) == 1);
             foreach (var target in state.PowerSiReport.Targets)
             {
@@ -479,10 +598,59 @@ namespace RemoteMonitorMaster
             }
             var repeatedReport = string.Join("\n", FormatPowerSi(nonce, state));
             Need(Occurrences(repeatedReport, longName) == 1 && repeatedReport.Contains(longName + " (PID 31)"));
+            var history = new PowerSiOutputHistory(Path.Combine(directory, "command-output-history.txt"));
+            var pin = new string('0', 64);
+            var initial = history.Prepare(pin, state.PowerSiReport);
+            Need(string.Join("\n", FormatPowerSi(nonce, state, initial)).Contains("line1 ") && initial.Commit());
+            var unchanged = string.Join("\n", FormatPowerSi(nonce, state, history.Prepare(pin, state.PowerSiReport)));
+            Need(unchanged.Contains("추가된 Output이 없어") && !unchanged.Contains("line1 "));
+            state.PowerSiReport.Targets[0].OutputText += "\n새 결과 123😀";
+            var staged = history.Prepare(pin, state.PowerSiReport);
+            var addedReplies = FormatPowerSi(nonce, state, staged);
+            var added = string.Join("\n", addedReplies);
+            Need(added.Contains("새 결과 123😀") && !added.Contains("line1 ") && added.Contains("추가된 Output"));
+            var testEndpoint = new SlaveEndpoint(System.Net.IPAddress.Loopback, 1, pin, Convert.ToBase64String(new byte[32]));
+            var interrupted = new SupervisedSendTest.Consent(nonce, true, true, testEndpoint, null, true);
+            Need(interrupted.TryClaimRoundTrip()); interrupted.BindCommand("pwrsi");
+            interrupted.BindPreparedReplies(addedReplies, staged); interrupted.Cancel();
+            Need(history.Prepare(pin, state.PowerSiReport).Primary[0].Kind == PowerSiOutputDelta.Appended);
+            var delivered = new SupervisedSendTest.Consent(nonce, true, true, testEndpoint, null, true);
+            Need(delivered.TryClaimRoundTrip()); delivered.BindCommand("pwrsi");
+            delivered.BindPreparedReplies(addedReplies, history.Prepare(pin, state.PowerSiReport));
+            for (var i = 0; i < addedReplies.Length; i++)
+            {
+                var part = delivered.GetPreparedPart(i);
+                Need(part.TryConsume(addedReplies[i]) && part.TryCommitMove() && part.TryCommitWrite() && part.TryCommit());
+                delivered.RecordPreparedPartOutcome(i, new SupervisedSendTest.Outcome("SENT", "NONE", "self-test", true));
+            }
+            Need(delivered.CommitPreparedOutput() && history.Prepare(pin, state.PowerSiReport).Primary[0].Kind == PowerSiOutputDelta.Unchanged);
+            File.Delete(Path.Combine(directory, "command-output-history.txt"));
             var continuation = string.Join("\n", PackReport(nonce, new[] { new ReportBlock("대상: " + longName + " (PID 31)",
                 "대상 계속: " + abbreviated + " (PID 31)", Enumerable.Repeat(new string('x', 500), 4)) }));
             Need(continuation.Contains("대상 계속: " + abbreviated + " (PID 31)") &&
                 continuation.Contains(longName + " (PID 31)"));
+            var unbroken = string.Concat(Enumerable.Repeat("한글123😀e\u0301", 500));
+            Need(string.Concat(WrapLine(unbroken, 1137)) == unbroken && WrapLine(unbroken, 1137).All(SafeReplyText));
+            var large = PackReport(nonce, new[] { new ReportBlock(string.Empty, string.Empty,
+                new[] { new string('x', 1400000) }) });
+            Need(large.Length > 999 && large.Sum(p => p.Count(c => c == 'x')) == 1400000 &&
+                large.Select((p, i) => IsReportPart(p, nonce, i + 1, large.Length)).All(x => x));
+            try
+            {
+                PackReport(nonce, new[] { new ReportBlock("", "", Enumerable.Repeat(new string('y', 1300), 30000)) });
+                throw new InvalidOperationException("Oversized prepared output accepted.");
+            }
+            catch (OutputTooLargeException) { }
+            var preparationChecks = 0;
+            try
+            {
+                PackReport(nonce, new[] { new ReportBlock("", "", Enumerable.Repeat(new string('y', 1300), 100)) },
+                    () => { if (++preparationChecks == 3) throw new OperationCanceledException(); });
+                throw new InvalidOperationException("Canceled preparation continued.");
+            }
+            catch (OperationCanceledException) { Need(preparationChecks == 3); }
+            var literal = OutputLines(null, "first\n\nlast\u0001\n", false).ToList();
+            Need(literal.Contains("  first") && literal.Contains("  last\\u0001") && literal.Count(s => s == "  ") == 2);
             Need(StateExplanation("VISIBLE_EMPTY", "BUFFER").Contains("버퍼") &&
                 StateExplanation("VISIBLE_EMPTY", "AUTO_COPY").Contains("자동 복사") &&
                 StateExplanation("VISIBLE_EMPTY", "OCR").Contains("화면"));
@@ -495,7 +663,7 @@ namespace RemoteMonitorMaster
             };
             var pendingOnly = string.Join("\n", FormatPowerSi(nonce, state));
             Need(pendingOnly.Contains("PowerSI Pending MixedCase (PID 32) — Pending") &&
-                !pendingOnly.Contains("출처:") && !pendingOnly.Contains("설명:") && !pendingOnly.Contains("최신 발췌") &&
+                !pendingOnly.Contains("출처:") && !pendingOnly.Contains("설명:") && !pendingOnly.Contains("Output 전체") &&
                 !pendingOnly.Contains("SC_PENDING") && !pendingOnly.Contains("CPU") && !pendingOnly.Contains("RAM"));
 
             state.PowerSiReport = new PowerSiReport { CapturedUtc = captured, SessionId = 7, Partial = true, Code = "BUSY" };

@@ -157,8 +157,8 @@ namespace RemoteMonitorLink
                     deadline.Token).ConfigureAwait(false);
                 deadline.Token.ThrowIfCancellationRequested();
 
-                string request = await LinkProtocol.ReadLineAsync(
-                    secure, LinkProtocol.MaxRequestLength, deadline.Token).ConfigureAwait(false);
+                var reader = new LinkProtocol.LineReader(secure);
+                string request = await reader.ReadLineAsync(LinkProtocol.MaxRequestLength, deadline.Token).ConfigureAwait(false);
                 byte[] offeredToken;
                 bool powerSiOnly;
                 if (!LinkProtocol.TryParseRequest(request, out offeredToken, out powerSiOnly))
@@ -200,6 +200,7 @@ namespace RemoteMonitorLink
                         // The callback reserves its first 100 seconds for collection; the request token leaves response grace.
                         powerSiReport = await collectPowerSi(processes, deadline.Token).ConfigureAwait(false);
                         if (powerSiReport == null) throw new InvalidDataException("PowerSI report is missing.");
+                        powerSiReport = powerSiReport.ForTransportCapacity();
                         powerSiReport.Validate();
                     }
                     deadline.Token.ThrowIfCancellationRequested();
@@ -224,6 +225,8 @@ namespace RemoteMonitorLink
                 }
                 await LinkProtocol.WriteLineAsync(
                     secure, response, LinkProtocol.MaxResponseLength, deadline.Token).ConfigureAwait(false);
+                if (powerSiReport != null)
+                    await powerSiReport.WriteFramedAsync(secure, deadline.Token).ConfigureAwait(false);
             }
         }
 
@@ -326,10 +329,17 @@ namespace RemoteMonitorLink
                                 string request = LinkProtocol.CreateRequest(endpoint.Token, powerSiOnly);
                                 await LinkProtocol.WriteLineAsync(
                                     secure, request, LinkProtocol.MaxRequestLength, deadline.Token).ConfigureAwait(false);
-                                string response = await LinkProtocol.ReadLineAsync(
-                                    secure, LinkProtocol.MaxResponseLength, deadline.Token).ConfigureAwait(false);
+                                var reader = new LinkProtocol.LineReader(secure);
+                                string response = await reader.ReadLineAsync(
+                                    LinkProtocol.MaxResponseLength, deadline.Token).ConfigureAwait(false);
                                 deadline.Token.ThrowIfCancellationRequested();
                                 MachineStatus result = LinkProtocol.ParseStatus(response, powerSiOnly);
+                                if (powerSiOnly && LinkProtocol.IsFramedPowerSiStatus(response))
+                                {
+                                    result.PowerSiReport = await PowerSiReport.ReadFramedAsync(reader, deadline.Token).ConfigureAwait(false);
+                                    LinkProtocol.ValidatePowerSiReportInventory(result.Processes, result.PowerSiReport);
+                                    result.Validate();
+                                }
                                 deadline.Token.ThrowIfCancellationRequested();
                                 return result;
                             }

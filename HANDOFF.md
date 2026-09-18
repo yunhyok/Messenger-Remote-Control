@@ -1,3 +1,20 @@
+# Messenger Remote Control v0.3.0 handoff
+
+## Current update — 2026-09-18, v0.3.0
+
+- The user confirmed v0.2.2 functions correctly. The new private Win7 field log shows a recognized PWRSI command, processing notice, query result, clean guarded send and the next Ready. A later target-change stop happened after that completed round. Raw field logs remain private.
+- The user now authorizes full acquired Output text to the paired Master and messenger. This supersedes the original five-line/600-character excerpt policy below. Slave sends collection evidence and codes; Master formats and compares it. Images, rejected model payloads and diagnostic files stay on Slave and never enter Git/releases.
+- PS4/protocol v0.3.0 sends full direct/automatic-copy text and any separate successful local OCR transcription with capture metadata using bounded UTF-8/Base64 frames over pinned TLS. Both applications must be upgraded; existing pairing/settings locations stay unchanged. The existing per-source acquisition ceiling is 8 Mi characters; acquisition failure is explicit rather than silently clipping output.
+- Master stores only lengths and SHA256 fingerprints in `%LOCALAPPDATA%\RemoteMonitorMaster\state\powersi-output-history-v1.txt`. Identity includes Slave certificate, session, PID, process start time and source family. First observation sends the full acquired text; an exact old prefix yields only its appended suffix; unchanged text yields an explicit no-additional-Output notice. Changed/cleared text or a source change sends current content again. This is evidence comparison, never an inference that simulation stopped or completed.
+- History advances only after every frozen reply part has a clean guarded send result. Preparation, Pending/errors, cancellation and uncertain/partial sends do not advance it. The next user request can repeat already sent parts after an interrupted report to avoid losing unsent text. A failed cache write leaves history unchanged and is reported locally. Guarded UI send is not authenticated mobile delivery.
+- Full names and essential states precede Output; Pending still contains only name/PID/Pending. Messages remain at most 1,400 characters, including report ID and part count. Long lines split without breaking surrogate pairs; control code points are displayed as `\uXXXX`; line endings are normalized. Larger reports take longer to send; existing target/proof/input checks remain enforced and stop uncertain sends.
+- Ready/processing/ignore-until-next-Ready behavior is preserved. No automatic monitoring, simulation restart, LLM startup/loading, cloud inference or repeated completed field tests were added.
+- Each raw batch and prepared reply set has an explicit 32 Mi-character aggregate bound to protect the Win7 Master. Oversize batches retain target identities and Pending states but replace other data with REPORT_TOO_LARGE; no output history advances. Formatting enumerates bounded lines/chunks, supports cancellation/deadline checks, and never silently clips a normal report.
+- Independent reviews identified and fixed surrogate-boundary cases in frame counts and history-prefix hashing, and added aggregate/preparation bounds. A real .NET Framework history-only stress check reproduced intermittent checkpoint IOException (3/100, IO_80070000); checkpoint writes now retry at most twice after 10/20 ms, rereading and requiring the staged disk revision each time. Messenger sends are never retried. The subsequent targeted loop passed 100/100, and failure codes are logged without raw text.
+- Both Release builds and actual EXE self-tests have passed locally on Windows 10; the final package and installer/CI verification are in progress. Do not treat this entry as evidence of a completed v0.3.0 release. New real Win7/Win11 full-output/delta messenger behavior is field-unverified.
+
+## Historical releases and earlier scope
+
 # Messenger Remote Control v0.2.2 handoff
 
 ## Current update — 2026-09-18, v0.2.2

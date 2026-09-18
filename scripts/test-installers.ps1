@@ -124,6 +124,11 @@ try {
             (Join-Path $dataDirectory 'identity.dat') = $marker
             (Join-Path $dataDirectory 'local-vision.json') = "{`"installer_smoke`":`"$marker`"}"
         }
+        if ($roleSpec.Name -ceq 'Master') {
+            $historyDirectory = Join-Path $dataDirectory 'state'
+            New-Item -ItemType Directory -Path $historyDirectory -Force | Out-Null
+            $preserved[(Join-Path $historyDirectory 'powersi-output-history-v1.txt')] = "installer-preservation-$marker"
+        }
         foreach ($path in $preserved.Keys) { Set-Content -LiteralPath $path -Value $preserved[$path] -NoNewline -Encoding UTF8 }
 
         Invoke-Setup -Path $roleSpec.Installer -InstallDirectory $installDirectory

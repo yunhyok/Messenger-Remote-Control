@@ -544,7 +544,8 @@ namespace RemoteMonitorMaster
                 RoundTripSession.RunSelfTest(directory);
                 StatusSession.RunSelfTest(directory);
                 PcStatusReport.RunSelfTest();
-                ReadOnlyCommands.RunSelfTest();
+                ReadOnlyCommands.RunSelfTest(directory);
+                PowerSiOutputHistory.RunSelfTest();
                 Require(AutomationTarget.RootRejectionReason(false, null) == "UNSUPPORTED_UIA_ROOT_MISSING",
                     "missing root did not have a distinct failure");
                 Require(AutomationTarget.RootRejectionReason(true, System.Windows.Automation.ControlType.Window) == null,

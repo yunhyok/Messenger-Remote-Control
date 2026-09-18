@@ -136,11 +136,11 @@ namespace RemoteMonitorMaster
                 if (samplesPcStatus)
                     log.Write("INFO", "PC_STATUS_READY", AuditLog.Field("sampled_after_request", true),
                         AuditLog.Field("source", consent.IsSlaveStatus ? "SLAVE" : "MASTER"),
-                        AuditLog.Field("payload_characters", replies.Sum(value => value.Length)),
+                        AuditLog.Field("payload_characters", replies.Sum(value => (long)value.Length)),
                         AuditLog.Field("prepared_replies", replies.Length));
                 else if (consent.IsPlainCommands)
                     log.Write("INFO", "COMMAND_HELP_READY", AuditLog.Field("network_query", false),
-                        AuditLog.Field("payload_characters", replies.Sum(value => value.Length)),
+                        AuditLog.Field("payload_characters", replies.Sum(value => (long)value.Length)),
                         AuditLog.Field("prepared_replies", replies.Length));
                 phase = "SEND";
                 progress("ROUNDTRIP_SENDING");
@@ -161,10 +161,14 @@ namespace RemoteMonitorMaster
                         return new Outcome("ROUNDTRIP_SEND_STAGE_FINISHED - Reply sequence stopped after an uncertain part; delivery is NOT verified." +
                             Environment.NewLine + string.Join(Environment.NewLine, sendMessages), sent, false);
                     }
+                    if (consent.IsPcStatus) consent.RecordPreparedPartOutcome(index, sent);
                 }
+                var historySaved = !consent.IsPcStatus || consent.CommitPreparedOutput();
+                if (!historySaved) log.Write("WARN", "OUTPUT_HISTORY_NOT_SAVED", AuditLog.Field("reason", consent.OutputHistoryFailure));
                 // RunBound already supplies its action/result details. Never parse that text into a success or delivery claim.
                 Result(log, "SEND_STAGE_FINISHED", "SEE_SUPERVISED_SEND_RESULT", reserved, true, replies.Length);
                 return new Outcome("ROUNDTRIP_SEND_STAGE_FINISHED - The approved reply stage has ended; delivery is NOT verified." +
+                    (historySaved ? string.Empty : " Output history could not be saved; the next request may repeat content.") +
                     Environment.NewLine + string.Join(Environment.NewLine, sendMessages), sent, true);
             }
             catch (Exception ex)

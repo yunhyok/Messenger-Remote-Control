@@ -153,13 +153,13 @@ namespace RemoteMonitorSlave
             visionSetup.SetBounds(426, 517, 156, 32);
             visionPreview.SetBounds(594, 517, 228, 32); visionPreview.Enabled = false;
             powerSi.SetBounds(18, 554, 804, 114);
-            powerSi.AccessibleName = "PowerSI Output 최근 로그 전사본";
+            powerSi.AccessibleName = "PowerSI Output 수집 결과";
             var path = new TextBox { Text = log.Path, ReadOnly = true, Bounds = new Rectangle(18, 682, 650, 25) };
             var folder = new Button { Text = "Open Log Folder", Bounds = new Rectangle(680, 678, 142, 32) };
             anchorState.SetBounds(18, 764, 804, 40);
             anchorState.AccessibleName = "자동 Output 탐색·복사 및 Windows 응답 상태";
             Controls.AddRange(new Control[] { address, start, stop, export, powerSiCheck, outputAll, replayVision, refresh, state, pairing, snapshot, processes, outputTargets, powerSi, path, folder, visionSetup, visionPreview, anchorState });
-            Controls.Add(new Label { Text = "화면·전체 원문은 Slave에 보관하고 최근 Output 발췌만 사내 Master와 메신저로 전달합니다. 수집은 한 번씩, 최대100초이며 Stop으로 취소할 수 있습니다. 이미지 판독은 이 PC의 LM Studio만 사용합니다.",
+            Controls.Add(new Label { Text = "수집된 유효 Output 원문은 사내 Master로 전달되며 화면 이미지는 Slave에만 보관합니다. 수집은 한 번씩, 최대100초이며 Stop으로 취소할 수 있습니다. 이미지 판독은 이 PC의 LM Studio만 사용합니다.",
                 Bounds = new Rectangle(18, 720, 804, 42) });
             start.Click += async delegate { await StartServer(); };
             address.SelectedIndexChanged += delegate { UpdateButtons(); };
@@ -855,7 +855,8 @@ namespace RemoteMonitorSlave
                 Omitted = inventory?.Omitted ?? 0, Unreadable = inventory?.Unreadable ?? 0, Partial = true, Code = code,
                 Targets = (inventory?.Items ?? new ProcessState[0]).Select(process => new PowerSiTargetReport {
                     Pid = process.Pid, StartUtcTicks = process.StartUtcTicks, ProcessName = process.FullName ?? process.Name,
-                    State = "UNAVAILABLE", Source = "NONE", Code = code, Summary = RecoveryAdvice(code), Excerpt = ""
+                    State = "UNAVAILABLE", Source = "NONE", Code = code, BufferCode = code,
+                    OutputText = "", OcrText = ""
                 }).ToArray() };
         }
 
@@ -873,21 +874,37 @@ namespace RemoteMonitorSlave
         {
             var target = new PowerSiTargetReport { Pid = sample.Process.Pid, StartUtcTicks = sample.Process.StartUtcTicks,
                 ProcessName = sample.Process.FullName ?? sample.Process.Name, State = "UNAVAILABLE", Source = "NONE",
-                Code = sample.Buffer?.Code ?? "TARGET_FAILED", Summary = "", Excerpt = "" };
+                Code = sample.Buffer?.Code ?? "TARGET_FAILED", BufferCode = sample.Buffer?.Code,
+                VisionCode = sample.Vision?.Code, OutputText = "", OcrText = "" };
             if (IsPending(target.Code) || IsPending(sample.Vision?.LocalFailure))
             {
                 target.State = "PENDING"; target.Code = "SC_PENDING";
                 return target;
             }
             var text = sample.Buffer?.Text;
+            var ocr = TranscriptOf(sample.Vision);
+            bool invalidText = text != null && !PowerSiReport.ValidOutputText(text);
+            bool invalidOcr = ocr != null && !PowerSiReport.ValidOutputText(ocr);
+            if (invalidText) text = null;
+            if (invalidOcr) ocr = null;
             if (!string.IsNullOrWhiteSpace(text))
             {
                 target.State = "READ";
                 target.Source = sample.Buffer.Code == "AUTO_COPY_READ" ? "AUTO_COPY" : "BUFFER";
                 target.CapturedUtc = sample.ReceivedUtc;
-                target.Excerpt = PowerSiReport.LatestExcerpt(text, out target.Truncated);
-                target.Summary = DescribeEvidence(target.Excerpt);
-                if (sample.Vision?.Code == "VISION_NOT_CONFIGURED") target.Summary += " / LLM 설정 꺼짐";
+                target.OutputText = text;
+                if (!string.IsNullOrWhiteSpace(ocr))
+                {
+                    target.OcrText = ocr;
+                    target.OcrCapturedUtc = sample.Vision.CapturedUtc;
+                }
+                return target;
+            }
+            if (!string.IsNullOrWhiteSpace(ocr))
+            {
+                target.State = "READ"; target.Source = "OCR"; target.Code = "OUTPUT_READ";
+                target.CapturedUtc = sample.Vision.CapturedUtc;
+                target.OutputText = ocr;
                 return target;
             }
             if (text != null)
@@ -895,23 +912,12 @@ namespace RemoteMonitorSlave
                 target.State = "VISIBLE_EMPTY"; target.Code = "OUTPUT_EMPTY";
                 target.Source = sample.Buffer.Code == "AUTO_COPY_READ" ? "AUTO_COPY" : "BUFFER";
                 target.CapturedUtc = sample.ReceivedUtc;
-                target.Summary = "직접 읽은 Output에 내용 없음";
                 return target;
             }
             if (sample.Vision?.LocalVisibleEmpty == true)
             {
                 target.State = "VISIBLE_EMPTY"; target.Source = "OCR"; target.Code = "OUTPUT_VISIBLE_EMPTY";
                 target.CapturedUtc = sample.Vision.CapturedUtc;
-                target.Summary = "보이는 Output 내용 없음; 전체 버퍼는 미확인";
-                return target;
-            }
-            text = TranscriptOf(sample.Vision);
-            if (!string.IsNullOrWhiteSpace(text))
-            {
-                target.State = "READ"; target.Source = "OCR"; target.Code = "OUTPUT_READ";
-                target.CapturedUtc = sample.Vision.CapturedUtc;
-                target.Excerpt = PowerSiReport.LatestExcerpt(text, out target.Truncated);
-                target.Summary = "LLM 화면 전사본; 숫자 정확도 미검증";
                 return target;
             }
             if (target.Code == "NOT_ATTEMPTED") target.State = "NOT_ATTEMPTED";
@@ -922,47 +928,8 @@ namespace RemoteMonitorSlave
                 !target.Code.StartsWith("AUTO_COPY_", StringComparison.Ordinal))
                 target.Code = sample.Vision.Code;
             else if (sample.Buffer?.Text != null) target.Code = "OUTPUT_EMPTY";
-            target.Summary = RecoveryAdvice(target.Code);
+            if (invalidText || invalidOcr) target.Code = "OUTPUT_INVALID_TEXT";
             return target;
-        }
-
-        private static string DescribeEvidence(string text)
-        {
-            // Reuse only the field-checked PowerSI expressions; historical log events are not live completion claims.
-            var observed = PowerSiObservation.FromText(text, null);
-            var summary = "프로세스 실행 중; 계산 완료 여부 미확인";
-            if (observed.OutputEvent == "SUSPENDED") summary = "최근 로그에 일시정지 기록 관측";
-            else if (observed.OutputEvent == "RESUMED") summary = "최근 로그에 재개 기록 관측";
-            if (observed.OutputFrequency != "?") summary += "; 로그 주파수 " + observed.OutputFrequency.Replace('_', ' ');
-            if (observed.MemoryWarningSeen) summary += "; 메모리 경고 기록 있음";
-            return summary;
-        }
-
-        private static string RecoveryAdvice(string code)
-        {
-            switch (code)
-            {
-                case "VISION_NOT_CONFIGURED": return "LM Studio 설정을 켜고 로드된 이미지 모델을 선택하세요";
-                case "VISION_SERVER_UNAVAILABLE": return "Slave의 LM Studio 로컬 서버 실행과 포트를 확인하세요";
-                case "VISION_MODEL_UNAVAILABLE": return "Slave의 LM Studio에서 이미지 모델을 로드하세요";
-                case "VISION_MODEL_AMBIGUOUS": return "Slave 설정에서 사용할 로드 모델을 선택하세요";
-                case "VISION_AUTH_REQUIRED": return "Slave의 LM Studio 인증 설정을 확인하세요";
-                case "VISION_INVALID_RESPONSE": case "VISION_FAILED": return "LM Studio 모델 오류 또는 응답 형식 불일치; 로드된 이미지 모델과 서버 로그를 확인하세요";
-                case "VISION_TIMEOUT": case "TARGET_TIMEOUT": return "제한 시간 내 수집하지 못했습니다";
-                case "SC_MINIMIZED": return "PowerSI 최소화 상태; 창을 직접 준비하세요";
-                case "SC_DESKTOP_UNAVAILABLE": return "Slave 데스크톱 잠금 또는 연결 상태를 확인하세요";
-                case "SC_IDENTITY": case "SC_NOT_RUNNING": case "SC_WINDOW_CHANGED": return "대상 종료 또는 식별 변경; 새로 조회하세요";
-                case "AUTO_COPY_WINDOW_CHANGED": return "대상 종료 또는 창 상태 변경; 새로 조회하세요";
-                case "AUTO_COPY_CURSOR_MOVED": case "AUTO_COPY_INPUT_BUSY": case "AUTO_COPY_CLIPBOARD_FOREIGN":
-                    return "사용자 입력 또는 클립보드 변경이 감지되어 수집을 중단했습니다";
-                case "SC_FOREGROUND_WAIT_MISMATCH": case "SC_FOREGROUND_MISMATCH_PRECAPTURE": case "SC_FOREGROUND_MISMATCH_POSTCAPTURE":
-                case "AUTO_COPY_FOREGROUND_LOST": return "다른 창으로 전환되어 수집을 중단했습니다";
-                case "OUTPUT_EMPTY": return "직접 읽은 Output에 내용 없음";
-                case "NOT_ATTEMPTED": return "전체 수집 시간 제한으로 미확인";
-                case "BUSY": return "다른 수집이 진행 중입니다; 완료 후 다시 요청하세요";
-                case "OUTPUT_REGION_UNCONFIRMED": case "AUTO_COPY_REGION_UNCONFIRMED": return "Output 영역을 확인하지 못해 자동 입력을 생략했습니다";
-                default: return "수집 미확인; Slave의 대상 창과 로컬 설정을 확인하세요";
-            }
         }
 
         private void RenderOutputBuffer(OutputBufferResult result, PowerSiObservation vision = null, DateTime? receivedUtc = null)
@@ -1468,32 +1435,45 @@ namespace RemoteMonitorSlave
                     Text = "Simulation is suspended.\nold1\nold2\nold3\nold4\nAFS Current Frequency ( MHz ) = 38.000" } };
             var read = ProjectReportTarget(sample);
             read.Validate();
-            Need(read.ProcessName == sample.Process.FullName && read.Source == "AUTO_COPY" && read.Truncated &&
-                read.Excerpt.EndsWith("38.000", StringComparison.Ordinal) && !read.Summary.Contains("일시정지"));
+            Need(read.ProcessName == sample.Process.FullName && read.Source == "AUTO_COPY" &&
+                read.OutputText == sample.Buffer.Text && read.OutputText.StartsWith("Simulation is suspended.", StringComparison.Ordinal) &&
+                read.BufferCode == "AUTO_COPY_READ");
             RecordTargetFailure(sample, "TARGET_TIMEOUT");
             Need(ProjectReportTarget(sample).State == "READ"); // Exact copy survives an independent OCR timeout.
             RecordTargetFailure(sample, "SC_FOREGROUND_WAIT_PENDING");
             var pending = ProjectReportTarget(sample);
             pending.Validate();
-            Need(pending.State == "PENDING" && pending.CapturedUtc == null && pending.Summary == "" &&
-                pending.Excerpt == "" && pending.Source == "NONE" && !pending.Truncated && sample.Buffer.Text == null);
+            Need(pending.State == "PENDING" && pending.CapturedUtc == null &&
+                pending.OutputText == "" && pending.OcrText == "" && pending.Source == "NONE" && sample.Buffer.Text == null);
             sample.Buffer = new OutputBufferResult { Code = "BUFFER_NOT_EXPOSED" };
             sample.Vision = PowerSiObservation.VisionUnavailable("VISION_INVALID_RESPONSE");
             sample.Vision.LocalFailure = "CONTENT_TEXT_CONTROL";
             sample.Vision.LocalEvidence = "private-rejected-response";
             var failed = ProjectReportTarget(sample);
             failed.Validate();
-            Need(failed.State == "UNAVAILABLE" && failed.Code == "VISION_INVALID_RESPONSE" && failed.Excerpt == "");
+            Need(failed.State == "UNAVAILABLE" && failed.Code == "VISION_INVALID_RESPONSE" && failed.OutputText == "" &&
+                failed.VisionCode == "VISION_INVALID_RESPONSE");
             sample.Vision = PowerSiObservation.VisionLogExcerpt("Line 001\nLine 002", now);
             sample.Vision.LocalEvidence = "Line 001\nLine 002";
             var ocr = ProjectReportTarget(sample);
             ocr.Validate();
-            Need(ocr.State == "READ" && ocr.Source == "OCR" && ocr.Excerpt.Contains("002"));
+            Need(ocr.State == "READ" && ocr.Source == "OCR" && ocr.OutputText.Contains("002") && ocr.OcrText == "");
+            sample.Buffer = new OutputBufferResult { Code = "BUFFER_READ", Text = " \r\n " };
+            var emptyWithOcr = ProjectReportTarget(sample);
+            emptyWithOcr.Validate();
+            Need(emptyWithOcr.State == "READ" && emptyWithOcr.Source == "OCR" && emptyWithOcr.OutputText.Contains("002") &&
+                emptyWithOcr.BufferCode == "BUFFER_READ");
+            sample.Buffer = new OutputBufferResult { Code = "BUFFER_READ", Text = "FULL BUFFER\0CONTROL" };
+            var primaryAndOcr = ProjectReportTarget(sample);
+            primaryAndOcr.Validate();
+            Need(primaryAndOcr.Source == "BUFFER" && primaryAndOcr.OutputText == sample.Buffer.Text &&
+                primaryAndOcr.OcrText.Contains("002") && primaryAndOcr.OcrCapturedUtc == now);
             sample.Vision = PowerSiObservation.VisionLogExcerpt(null, now);
             sample.Vision.LocalVisibleEmpty = true;
+            sample.Buffer = new OutputBufferResult { Code = "BUFFER_NOT_EXPOSED" };
             var empty = ProjectReportTarget(sample);
             empty.Validate();
-            Need(empty.State == "VISIBLE_EMPTY" && empty.Excerpt == "" && empty.CapturedUtc == now);
+            Need(empty.State == "VISIBLE_EMPTY" && empty.OutputText == "" && empty.CapturedUtc == now);
             sample.Buffer = new OutputBufferResult { Code = "BUFFER_READ", Text = " \r\n " };
             sample.Vision = PowerSiObservation.VisionUnavailable("VISION_NOT_CONFIGURED");
             var directEmpty = ProjectReportTarget(sample);
@@ -1501,7 +1481,12 @@ namespace RemoteMonitorSlave
             Need(directEmpty.State == "VISIBLE_EMPTY" && directEmpty.Source == "BUFFER" && directEmpty.CapturedUtc == now);
             sample.Buffer = new OutputBufferResult { Code = "AUTO_COPY_INPUT_BUSY" };
             Need(ProjectReportTarget(sample).Code == "AUTO_COPY_INPUT_BUSY" &&
-                ProjectReportTarget(sample).Summary.Contains("사용자 입력"));
+                ProjectReportTarget(sample).BufferCode == "AUTO_COPY_INPUT_BUSY");
+            sample.Buffer = new OutputBufferResult { Code = "BUFFER_READ", Text = "bad\ud800text" };
+            sample.Vision = PowerSiObservation.VisionUnavailable("VISION_NOT_CONFIGURED");
+            var invalidText = ProjectReportTarget(sample);
+            invalidText.Validate();
+            Need(invalidText.State == "UNAVAILABLE" && invalidText.Code == "OUTPUT_INVALID_TEXT" && invalidText.OutputText == "");
             Need(IsExpectedCollectionFailure(new InvalidDataException()) && !IsExpectedCollectionFailure(new NullReferenceException()));
             Need(TargetAllowance(0, 2) == 50000 && TargetAllowance(50000, 2) == 25000 &&
                 TargetAllowance(100000, 1) == 0 && TargetAllowance(110000, 1) == 0 && TargetAllowance(0, 0) == 0);
@@ -1532,7 +1517,7 @@ namespace RemoteMonitorSlave
                 throw new InvalidOperationException("Pending result was accepted.");
             }
             catch (InvalidDataException error) { Need(error.Message == "SC_PENDING" && pendingProbes == 1); }
-            Need(PowerSiReport.Parse(report.Serialize()).Targets[0].ProcessName == sample.Process.FullName);
+            Need(report.Targets[0].ProcessName == sample.Process.FullName);
             Console.WriteLine("PASS: Pending stops collection; evidence projection, full names, partial deadlines and report failures");
         }
 
