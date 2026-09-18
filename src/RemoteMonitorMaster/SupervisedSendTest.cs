@@ -358,12 +358,19 @@ namespace RemoteMonitorMaster
                 UiaPointProbe.PathNode CheckScope(AutomationElement element, ProbeNode expected = null, int depth = 0)
                 {
                     Need(element != null, "SEND_ELEMENT_UNAVAILABLE");
-                    var pid = Read("element_pid", () => element.GetCurrentPropertyValue(AutomationElement.ProcessIdProperty, true));
-                    Need(pid is int && (int)pid == process.ProcessId, "SEND_FOREIGN_PROCESS");
-                    var password = Read("element_password", () => element.GetCurrentPropertyValue(AutomationElement.IsPasswordProperty, true));
-                    Need(password is bool && !(bool)password, "SEND_PROTECTED_OR_UNAVAILABLE");
-                    var handle = Read("element_hwnd", () => element.GetCurrentPropertyValue(AutomationElement.NativeWindowHandleProperty, false));
-                    Need(handle is int && (expected == null || (int)handle == expected.NativeHwnd), "SEND_NATIVE_WINDOW_CHANGED");
+                    // Security-only batches keep repeated ancestry checks bounded without caching message content or patterns.
+                    var request = new CacheRequest { TreeScope = TreeScope.Element, TreeFilter = Condition.TrueCondition,
+                        AutomationElementMode = AutomationElementMode.Full };
+                    foreach (var cachedProperty in new[] { AutomationElement.ProcessIdProperty, AutomationElement.IsPasswordProperty,
+                        AutomationElement.NativeWindowHandleProperty, AutomationElement.RuntimeIdProperty }) request.Add(cachedProperty);
+                    var cached = Read("element_security_cache", () => element.GetUpdatedCache(request));
+                    Need(cached != null, "SEND_ELEMENT_UNAVAILABLE");
+                    var pid = cached.GetCachedPropertyValue(AutomationElement.ProcessIdProperty, true);
+                    Need(IsCachedProcessId(pid, process.ProcessId), "SEND_FOREIGN_PROCESS");
+                    var password = cached.GetCachedPropertyValue(AutomationElement.IsPasswordProperty, true);
+                    Need(IsCachedPassword(password), "SEND_PROTECTED_OR_UNAVAILABLE");
+                    var handle = cached.GetCachedPropertyValue(AutomationElement.NativeWindowHandleProperty, false);
+                    Need(IsCachedNativeHwnd(handle) && (expected == null || (int)handle == expected.NativeHwnd), "SEND_NATIVE_WINDOW_CHANGED");
                     var native = new IntPtr((int)handle);
                     if (native != IntPtr.Zero)
                     {
@@ -372,7 +379,9 @@ namespace RemoteMonitorMaster
                             NativeMethods.GetWindowThreadProcessId(native, out nativePid) != 0 && nativePid == process.ProcessId,
                             "SEND_NATIVE_WINDOW_OUTSIDE_TARGET");
                     }
-                    var runtime = UiaPointProbe.Format(Read("element_runtime_id", element.GetRuntimeId));
+                    var runtimeId = cached.GetCachedPropertyValue(AutomationElement.RuntimeIdProperty, true);
+                    Need(IsCachedRuntimeId(runtimeId), "POINT_RUNTIME_ID_INVALID");
+                    var runtime = UiaPointProbe.Format((int[])runtimeId);
                     Need(expected == null || runtime == expected.Identity.RuntimeId,
                         "SEND_ELEMENT_CHANGED");
                     Alive();
@@ -654,6 +663,15 @@ namespace RemoteMonitorMaster
                 marker != null && value.Replace("\r\n", "\n") == marker.Replace("\r\n", "\n") ? "UNCHANGED" : "OTHER";
         }
 
+        private static bool IsCachedProcessId(object value, int processId) { return value is int && (int)value == processId; }
+        private static bool IsCachedPassword(object value) { return value is bool && !(bool)value; }
+        private static bool IsCachedNativeHwnd(object value) { return value is int; }
+        private static bool IsCachedRuntimeId(object value)
+        {
+            var runtime = value as int[];
+            return runtime != null && runtime.Length > 0 && runtime.Length <= 64;
+        }
+
         internal static string WaitForWrittenInput(Func<string> read, Action alive)
         {
             string state = null;
@@ -718,6 +736,11 @@ namespace RemoteMonitorMaster
                 ClassifyInput("한글 124\r\noutput", "한글 123\noutput") == "OTHER" &&
                 ClassifyInput("a b", "a\nb") == "OTHER" && ClassifyInput("a\n", "a") == "OTHER",
                 "SEND_SELF_TEST_MULTILINE_READBACK");
+            Need(IsCachedProcessId(17, 17) && !IsCachedProcessId(null, 17) && !IsCachedProcessId("17", 17) &&
+                IsCachedPassword(false) && !IsCachedPassword(null) && !IsCachedPassword(true) &&
+                IsCachedNativeHwnd(0) && !IsCachedNativeHwnd(null) && !IsCachedNativeHwnd("0") &&
+                IsCachedRuntimeId(new[] { 1 }) && !IsCachedRuntimeId(null) && !IsCachedRuntimeId(new int[0]) &&
+                !IsCachedRuntimeId(new object()) && !IsCachedRuntimeId(new int[65]), "SEND_SELF_TEST_CACHED_SECURITY_METADATA");
             var reads = 0;
             Need(WaitForWrittenInput(() => ++reads == 2 ? "UNCHANGED" : "OTHER", () => { }) == "UNCHANGED" && reads == 2,
                 "SEND_SELF_TEST_ASYNC_READBACK");

@@ -1,4 +1,4 @@
-# Messenger Remote Control v0.3.1
+# Messenger Remote Control v0.3.2
 
 모바일 KI-Messenger의 나와의 대화에 명령을 보내면 Desktop의 **Master**가 Workstation의 **Slave**에 상태를 요청하고, PowerSI별 결과를 같은 대화로 회신합니다.
 
@@ -14,7 +14,7 @@ flowchart LR
 
 [공개 Releases](https://github.com/yunhyok/Messenger-Remote-Control/releases)에서 역할에 맞는 설치 파일을 받으세요. 오프라인 Slave에는 Slave 설치 파일 또는 Slave ZIP만 옮기면 됩니다. 자세한 설치·업그레이드 방법은 [INSTALL.md](INSTALL.md)에 있습니다.
 
-v0.3.1은 긴 답장으로 이미 접수한 명령이 화면 밖으로 밀려났을 때 분할 전송이 중단되는 경로를 수정합니다. **Master만 v0.3.1로 업그레이드하면 기존 Slave v0.3.0과 함께 사용할 수 있습니다.** 프로토콜은 0.3.0이며 연결파일·설정·송부 이력은 유지됩니다. 수집된 전체 Output을 첫 조회에 보내고 이후에는 추가분만 보냅니다. Ready 뒤의 첫 명령만 처리하고 처리 중 추가 메시지는 다음 Ready까지 무시합니다.
+v0.3.2는 화면 정보 조회를 묶고, 분할 메시지당 전체 화면 조회를 세 번에서 두 번으로 줄여 전송 준비 시간을 단축합니다. 각 메시지의 대화·명령·입력창·전송 버튼 확인과 한 번만 발송하는 규칙은 유지합니다. **Master만 v0.3.2로 업그레이드하면 기존 Slave v0.3.0/0.3.1과 함께 사용할 수 있습니다.** 프로토콜은 0.3.0이며 연결파일·설정·송부 이력은 유지됩니다. 수집된 전체 Output을 첫 조회에 보내고 이후에는 추가분만 보냅니다. Ready 뒤의 첫 명령만 처리하고 처리 중 추가 메시지는 다음 Ready까지 무시합니다.
 
 1. Workstation에서 Slave를 실행하고 통신 IP를 선택한 뒤 Start를 누릅니다. 화면 판독이 필요한 경우 같은 PC의 LM Studio 서버와 이미지 모델을 사용자가 미리 준비합니다.
 2. Slave의 연결파일을 내보내 Desktop Master로 전달합니다. 이 파일은 공개하거나 저장소에 넣지 마세요.

@@ -186,6 +186,10 @@ namespace RemoteMonitorMaster
                     return; // Do not traverse an untrusted/password subtree either.
                 }
 
+                ProbeElementCache cached;
+                if (!Read(node, "metadata_cache", () => ProbeElementCache.Capture(element, process.ProcessId, pointer.HasValue), out cached))
+                    return; // No per-property fallback after an unknown batch result.
+
                 var fields = compactLog ? null : new List<AuditLog.LogField>();
                 void Detail(string key, object value)
                 {
@@ -193,24 +197,24 @@ namespace RemoteMonitorMaster
                 }
                 Detail("stage", stage); Detail("node", node); Detail("parent_node", parent);
                 Detail("depth", depth); Detail("process_id", pid);
-                ControlType type;
-                var typeRead = Read(node, "control_type", () => element.Current.ControlType, out type);
+                var type = cached.ControlType;
+                var typeRead = true;
                 if (type == ControlType.Document) document = node;
                 Detail("document_node", document);
                 Detail("control_type", typeRead && type != null ? type.ProgrammaticName : "<unavailable>");
-                int nativeHandle;
-                Detail("native_hwnd", Read(node, "native_hwnd", () => element.Current.NativeWindowHandle, out nativeHandle)
-                    ? "0x" + unchecked((uint)nativeHandle).ToString("X", CultureInfo.InvariantCulture) : "<unavailable>");
-                bool enabled;
-                Detail("enabled", Read(node, "enabled", () => element.Current.IsEnabled, out enabled) ? (object)enabled : "<unavailable>");
-                bool offscreen;
-                Detail("offscreen", Read(node, "offscreen", () => element.Current.IsOffscreen, out offscreen) ? (object)offscreen : "<unavailable>");
-                bool focused;
-                Detail("focused", Read(node, "focused", () => element.Current.HasKeyboardFocus, out focused) ? (object)focused : "<unavailable>");
+                var nativeHandle = cached.NativeWindowHandle;
+                Detail("native_hwnd", "0x" + unchecked((uint)nativeHandle).ToString("X", CultureInfo.InvariantCulture));
+                var enabled = cached.IsEnabled;
+                Detail("enabled", enabled);
+                var offscreen = cached.IsOffscreen;
+                Detail("offscreen", offscreen);
+                Detail("focused", cached.HasKeyboardFocus);
 
-                ElementIdentity identity;
-                if (Read(node, "identity", () => { CheckContentAllowed(element); return ElementIdentity.Capture(element); }, out identity))
+                ElementIdentity identity = null;
+                string identityName;
+                if (Read(node, "identity_name", () => { CheckContentAllowed(element); return element.Current.Name; }, out identityName))
                 {
+                    identity = cached.CreateIdentity(identityName);
                     if (identity.ProcessId != process.ProcessId)
                     {
                         skipped++;
@@ -219,10 +223,6 @@ namespace RemoteMonitorMaster
                             AuditLog.Field("reason", "PROCESS_CHANGED_DURING_IDENTITY_READ"));
                         return;
                     }
-                    // Even the existing safe Send-label exception is redacted in this read-only diagnostic.
-                    identity = new ElementIdentity(identity.RuntimeId, identity.ProcessId, identity.AutomationId, identity.ControlType,
-                        identity.ClassName, identity.FrameworkId, identity.Patterns, identity.NameLength, identity.NameHash,
-                        "<redacted>");
                     if (!compactLog) identity.Log(log, "probe_node_" + node.ToString(CultureInfo.InvariantCulture));
                     Detail("runtime_id", identity.RuntimeId);
                 }
@@ -239,11 +239,8 @@ namespace RemoteMonitorMaster
                 else Detail("send_label_match", "<unavailable>");
 
                 object textPattern;
-                var textRead = Read(node, "text_pattern", () =>
-                {
-                    object pattern;
-                    return element.TryGetCurrentPattern(TextPattern.Pattern, out pattern) ? pattern : null;
-                }, out textPattern);
+                cached.TryGetPattern(TextPattern.Pattern, out textPattern);
+                var textRead = true;
                 Detail("text_pattern", textRead ? (object)(textPattern != null) : "<unavailable>");
                 if (textPattern != null && stage != "SEND_METADATA")
                     MatchSource(node, element, 1, "TextPattern", () => ((TextPattern)textPattern).DocumentRange.GetText(513));
@@ -251,11 +248,8 @@ namespace RemoteMonitorMaster
                 object valuePattern;
                 var valueWritable = false;
                 var draftExact = false;
-                var valueRead = Read(node, "value_pattern", () =>
-                {
-                    object pattern;
-                    return element.TryGetCurrentPattern(ValuePattern.Pattern, out pattern) ? pattern : null;
-                }, out valuePattern);
+                cached.TryGetPattern(ValuePattern.Pattern, out valuePattern);
+                var valueRead = true;
                 Detail("value_pattern", valueRead ? (object)(valuePattern != null) : "<unavailable>");
                 if (valuePattern != null)
                 {
@@ -267,12 +261,9 @@ namespace RemoteMonitorMaster
                         draftExact = MatchSource(node, element, 2, "ValuePattern", () => ((ValuePattern)valuePattern).Current.Value);
                 }
 
-                bool invoke;
-                var invokeRead = Read(node, "invoke_pattern", () =>
-                {
-                    object ignored;
-                    return element.TryGetCurrentPattern(InvokePattern.Pattern, out ignored);
-                }, out invoke);
+                object invokePattern;
+                var invoke = cached.TryGetPattern(InvokePattern.Pattern, out invokePattern);
+                var invokeRead = true;
                 if (type == ControlType.Edit) edits++;
                 if (invokeRead && invoke) invokes++;
                 Detail("edit_candidate", typeRead ? (object)(type == ControlType.Edit) : "<unavailable>");
@@ -282,9 +273,9 @@ namespace RemoteMonitorMaster
                 var pointerInside = false;
                 if (pointer.HasValue)
                 {
-                    System.Windows.Rect bounds;
-                    var boundsRead = Read(node, "bounding_rectangle", () => element.Current.BoundingRectangle, out bounds);
-                    var hit = boundsRead && ContainsPoint(bounds, pointer.Value);
+                    var bounds = cached.BoundingRectangle;
+                    var boundsRead = true;
+                    var hit = ContainsPoint(bounds, pointer.Value);
                     pointerInside = hit;
                     if (hit) pointerHits++;
                     if (hit && invokeRead && invoke) pointerInvokes++;

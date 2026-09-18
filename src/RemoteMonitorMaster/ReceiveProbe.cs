@@ -44,7 +44,7 @@ namespace RemoteMonitorMaster
             internal readonly Baseline Baseline;
             internal readonly ProbeSnapshot Previous, Final;
             internal readonly ProbeNode PreviousCandidate, Candidate;
-            internal readonly Stopwatch Age = Stopwatch.StartNew();
+            internal readonly Stopwatch Age;
             internal readonly TimeSpan AgeOffset;
             internal TimeSpan Elapsed { get { return Age.Elapsed + AgeOffset; } }
             internal bool DiagnosticTokenReserved;
@@ -52,10 +52,36 @@ namespace RemoteMonitorMaster
 
             internal ObservationProof(object owner, IntPtr window, NativeMethods.WindowRectangle bounds, Baseline baseline,
                 ProbeSnapshot previous, ProbeNode previousCandidate, ProbeSnapshot final, ProbeNode candidate,
-                TimeSpan? ageOffset = null)
+                TimeSpan? ageOffset = null, Stopwatch ageClock = null)
             {
                 Owner = owner; Window = window; Bounds = bounds; Baseline = baseline;
                 Previous = previous; PreviousCandidate = previousCandidate; Final = final; Candidate = candidate;
+                Age = ageClock ?? Stopwatch.StartNew();
+                AgeOffset = ageOffset ?? TimeSpan.Zero;
+            }
+            internal bool TryConsume() { return Interlocked.CompareExchange(ref used, 1, 0) == 0; }
+        }
+
+        // One fresh accepted-request observation, not permission to send. The sender supplies the second snapshot.
+        internal sealed class SingleObservation
+        {
+            internal readonly ObservationProof Accepted;
+            internal readonly object Owner;
+            internal readonly IntPtr Window;
+            internal readonly NativeMethods.WindowRectangle Bounds;
+            internal readonly ProbeSnapshot Snapshot;
+            internal readonly ProbeNode Candidate;
+            internal readonly Stopwatch Age;
+            internal readonly TimeSpan AgeOffset;
+            internal TimeSpan Elapsed { get { return Age.Elapsed + AgeOffset; } }
+            private int used;
+
+            internal SingleObservation(ObservationProof accepted, object owner, IntPtr window,
+                NativeMethods.WindowRectangle bounds, ProbeSnapshot snapshot, ProbeNode candidate,
+                Stopwatch age, TimeSpan? ageOffset = null)
+            {
+                Accepted = accepted; Owner = owner; Window = window; Bounds = bounds;
+                Snapshot = snapshot; Candidate = candidate; Age = age;
                 AgeOffset = ageOffset ?? TimeSpan.Zero;
             }
             internal bool TryConsume() { return Interlocked.CompareExchange(ref used, 1, 0) == 0; }
@@ -65,8 +91,10 @@ namespace RemoteMonitorMaster
         {
             internal readonly string Status, Reason, Message;
             internal readonly ObservationProof Proof;
-            internal ObservationResult(string status, string reason, string message, ObservationProof proof = null)
-            { Status = status; Reason = reason; Message = message; Proof = proof; }
+            internal readonly SingleObservation Single;
+            internal ObservationResult(string status, string reason, string message, ObservationProof proof = null,
+                SingleObservation single = null)
+            { Status = status; Reason = reason; Message = message; Proof = proof; Single = single; }
         }
 
         internal static HistorySelection SelectHistory(ProbeSnapshot snapshot)
@@ -424,7 +452,7 @@ namespace RemoteMonitorMaster
         internal static ObservationResult Observe(IntPtr window, AuditLog log, string marker, Func<bool> stop,
             Action<string> progress, object owner, bool collectMetadata, Action<string, ProbeSnapshot> inspectSnapshot = null,
             Baseline suppliedBaseline = null, bool continuousWait = false, bool plainCommands = false,
-            ObservationProof acceptedProof = null)
+            ObservationProof acceptedProof = null, bool singleRefresh = false)
         {
             var overall = Stopwatch.StartNew();
             var phaseClock = Stopwatch.StartNew();
@@ -443,6 +471,7 @@ namespace RemoteMonitorMaster
                     Need(plainCommands && !continuousWait && suppliedBaseline != null &&
                         ReferenceEquals(acceptedProof.Owner, owner) && acceptedProof.Window == window &&
                         ReferenceEquals(acceptedProof.Baseline, suppliedBaseline), "RECEIVE_ACCEPTED_PROOF_MISMATCH");
+                Need(!singleRefresh || (acceptedProof != null && !collectMetadata), "RECEIVE_SINGLE_OBSERVATION_INVALID");
                 bool Stopped()
                 {
                     if (guardFailure != null) return true;
@@ -577,8 +606,10 @@ namespace RemoteMonitorMaster
                 Need(string.Equals(process.ProcessName, "KI-Messenger", StringComparison.OrdinalIgnoreCase), "PROBE_NOT_KI_MESSENGER");
                 NativeMethods.WindowRectangle initial;
                 Need(NativeMethods.GetWindowRect(window, out initial), "RECEIVE_WINDOW_BOUNDS_UNAVAILABLE");
+                if (singleRefresh) Need(initial.Equals(acceptedProof.Bounds), "RECEIVE_WINDOW_MOVED");
                 bounds = initial;
                 SetPhase("BASELINE");
+                var firstCaptureAge = singleRefresh ? Stopwatch.StartNew() : null;
                 var firstSnapshot = Capture();
                 var baseline = suppliedBaseline == null ? CreateBaseline(firstSnapshot, marker, plainCommands) :
                     AcceptSuppliedBaseline(suppliedBaseline, firstSnapshot, marker, window, plainCommands);
@@ -605,6 +636,17 @@ namespace RemoteMonitorMaster
                 if (collectMetadata) Metadata(firstSnapshot, null, "BASELINE");
                 else CheckRoot(firstSnapshot);
                 ReleaseLive(firstSnapshot);
+                if (singleRefresh)
+                {
+                    Need(firstCandidate != null, "RECEIVE_ACCEPTED_CANDIDATE_CHANGED");
+                    ValidatePlainHistoryPrefix(acceptedProof.Final, firstSnapshot, log, baseline);
+                    Alive();
+                    Result(log, "CANDIDATE_REOBSERVED_ONCE", "NONE", polls);
+                    return new ObservationResult("CANDIDATE_REOBSERVED_ONCE", "NONE",
+                        "One fresh accepted-request observation is ready; the sender must independently observe it again before any action.",
+                        single: new SingleObservation(acceptedProof, owner, window, initial, firstSnapshot,
+                            firstCandidate, firstCaptureAge));
+                }
                 SetPhase("READY_TO_RECEIVE");
                 receiving = Stopwatch.StartNew();
                 ProbeSnapshot previous = suppliedBaseline == null && !plainCommands ? null : firstSnapshot;

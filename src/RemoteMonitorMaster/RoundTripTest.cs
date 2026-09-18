@@ -90,10 +90,11 @@ namespace RemoteMonitorMaster
                 SupervisedSendTest.Outcome SendPrepared(string payload, SupervisedSendTest.Consent partConsent, int partNumber, int partCount)
                 {
                     Alive();
-                    var sendProof = consent.IsPlainCommands &&
+                    var single = consent.IsPlainCommands &&
                         !(partNumber == 0 && received.Proof.Elapsed < TimeSpan.FromSeconds(5))
-                        ? RefreshProof(received.Proof, owner, window, incomingMarker, Stopped, progress, log, inspectSnapshot)
-                        : received.Proof;
+                        ? RefreshObservation(received.Proof, owner, window, incomingMarker, Stopped, progress, log, inspectSnapshot)
+                        : null;
+                    var sendProof = received.Proof;
                     sendStageEntered = true;
                     var outcome = SupervisedSendTest.RunBoundObserved(window, log, payload, new Point(), partConsent, Stopped, snapshot =>
                     {
@@ -102,6 +103,8 @@ namespace RemoteMonitorMaster
                         Need(NativeMethods.GetWindowRect(window, out current) && current.Equals(sendProof.Bounds), "ROUNDTRIP_WINDOW_MOVED");
                         inspectSnapshot?.Invoke("HANDOFF", snapshot);
                         Alive();
+                        if (single != null)
+                            sendProof = CompleteRefreshedProof(received.Proof, single, snapshot, owner, window, current, Stopped, log);
                         AuthorizeHandoffCore(sendProof, owner, window, incomingMarker, snapshot, statePath, Stopped, !reserved, log);
                         reserved = true;
                         Alive();
@@ -109,6 +112,7 @@ namespace RemoteMonitorMaster
                         log.Write("INFO", "ROUNDTRIP_HANDOFF", AuditLog.Field("candidate_reobserved", true),
                             AuditLog.Field("diagnostic_token_reserved", reserved), AuditLog.Field("reply_part", partNumber),
                             AuditLog.Field("reply_parts", partCount), AuditLog.Field("progress_notice", partNumber == 0),
+                            AuditLog.Field("handoff_is_repeat_observation", single != null),
                             AuditLog.Field("delivery_verified", false));
                     });
                     reserved |= sendProof.DiagnosticTokenReserved;
@@ -262,15 +266,43 @@ namespace RemoteMonitorMaster
             Need(proof.Elapsed < TimeSpan.FromSeconds(15), "ROUNDTRIP_PROOF_EXPIRED_OR_WINDOW_CHANGED");
         }
 
-        private static ReceiveProbe.ObservationProof RefreshProof(ReceiveProbe.ObservationProof original, object owner,
+        private static ReceiveProbe.SingleObservation RefreshObservation(ReceiveProbe.ObservationProof original, object owner,
             IntPtr window, string marker, Func<bool> stop, Action<string> progress, AuditLog log,
             Action<string, ProbeSnapshot> inspectSnapshot)
         {
             var observed = ReceiveProbe.Observe(window, log, marker, stop, ignored => progress("REVALIDATING"), owner, false,
-                inspectSnapshot, original.Baseline, false, true, original);
-            Need(observed.Status == "CANDIDATE_OBSERVED" && observed.Reason == "NONE" && observed.Proof != null,
+                inspectSnapshot, original.Baseline, false, true, original, singleRefresh: true);
+            Need(observed.Status == "CANDIDATE_REOBSERVED_ONCE" && observed.Reason == "NONE" &&
+                observed.Proof == null && observed.Single != null,
                 "ROUNDTRIP_REOBSERVATION_FAILED");
-            return SelectRefreshedProof(original, observed.Proof, owner, window);
+            return observed.Single;
+        }
+
+        internal static ReceiveProbe.ObservationProof CompleteRefreshedProof(ReceiveProbe.ObservationProof original,
+            ReceiveProbe.SingleObservation single, ProbeSnapshot fresh, object owner, IntPtr window,
+            NativeMethods.WindowRectangle bounds, Func<bool> stop, AuditLog log = null)
+        {
+            Need(stop != null && !stop(), "ROUNDTRIP_CANCELLED");
+            Need(original != null && single != null && owner != null && ReferenceEquals(single.Accepted, original) &&
+                ReferenceEquals(original.Owner, owner) && ReferenceEquals(single.Owner, owner), "ROUNDTRIP_PROOF_OWNER_MISMATCH");
+            Need(single.TryConsume(), "ROUNDTRIP_SINGLE_OBSERVATION_USED");
+            Need(window != IntPtr.Zero && original.Window == window && single.Window == window &&
+                original.Bounds.Equals(single.Bounds) && single.Bounds.Equals(bounds) && single.Age != null && single.Age.IsRunning &&
+                single.Elapsed < TimeSpan.FromSeconds(15), "ROUNDTRIP_PROOF_EXPIRED_OR_WINDOW_CHANGED");
+            Need(original.Baseline != null && original.Baseline.PlainCommands && single.Snapshot != null && fresh != null &&
+                !ReferenceEquals(single.Snapshot, fresh) && !ReferenceEquals(single.Snapshot, original.Previous) &&
+                !ReferenceEquals(single.Snapshot, original.Final) && !ReferenceEquals(fresh, original.Previous) &&
+                !ReferenceEquals(fresh, original.Final), "ROUNDTRIP_FRESH_OBSERVATIONS_REQUIRED");
+            var previous = ReceiveProbe.ReobserveCandidate(original, single.Snapshot, log);
+            Need(ReferenceEquals(previous, single.Candidate), "ROUNDTRIP_REOBSERVATION_CHANGED");
+            var final = ReceiveProbe.ReobserveCandidate(original, fresh, log);
+            // Both snapshots are current; the accepted proof supplies identity only. Share the first capture's clock.
+            var refreshed = new ReceiveProbe.ObservationProof(owner, window, bounds, original.Baseline,
+                single.Snapshot, previous, fresh, final, single.AgeOffset, single.Age);
+            SelectRefreshedProof(original, refreshed, owner, window);
+            Need(!stop(), "ROUNDTRIP_CANCELLED");
+            Need(refreshed.Elapsed < TimeSpan.FromSeconds(15), "ROUNDTRIP_PROOF_EXPIRED_OR_WINDOW_CHANGED");
+            return refreshed;
         }
 
         internal static ReceiveProbe.ObservationProof SelectRefreshedProof(ReceiveProbe.ObservationProof original,
@@ -420,6 +452,17 @@ namespace RemoteMonitorMaster
                     final, candidateVisible ? ReceiveProbe.Evaluate(baseline, final) :
                         ReceiveProbe.ReobserveCandidate(accepted, final), age);
             }
+            ReceiveProbe.SingleObservation Single(ReceiveProbe.ObservationProof accepted, int extras, TimeSpan? age = null)
+            {
+                var first = History(extras, candidateVisible: false);
+                return new ReceiveProbe.SingleObservation(accepted, owner, window, accepted.Bounds, first,
+                    ReceiveProbe.ReobserveCandidate(accepted, first), System.Diagnostics.Stopwatch.StartNew(), age);
+            }
+            ReceiveProbe.ObservationProof Complete(ReceiveProbe.ObservationProof accepted, ReceiveProbe.SingleObservation single,
+                ProbeSnapshot second, Func<bool> stop = null)
+            {
+                return CompleteRefreshedProof(accepted, single, second, owner, window, accepted.Bounds, stop ?? (() => false));
+            }
             void Reject(Action action)
             {
                 try { action(); } catch (MonitorException) { return; }
@@ -430,6 +473,44 @@ namespace RemoteMonitorMaster
                 Reject(() => AuthorizeHandoffCore(Proof(0), owner, window, marker, History(1), path, () => false, false));
                 Reject(() => AuthorizeHandoffCore(Proof(0, TimeSpan.FromSeconds(16)), owner, window, marker,
                     History(1), path, () => false, true));
+                var accepted = Accepted();
+                Reject(() => Complete(accepted, Single(accepted, 1, TimeSpan.FromSeconds(16)), History(2, false)));
+                var same = Single(accepted, 1);
+                Reject(() => Complete(accepted, same, same.Snapshot));
+                Reject(() => Complete(accepted, new ReceiveProbe.SingleObservation(accepted, owner, window, accepted.Bounds,
+                    accepted.Final, accepted.Candidate, System.Diagnostics.Stopwatch.StartNew()), History(2, false)));
+                Reject(() => Complete(accepted, Single(accepted, 1), accepted.Final));
+                Reject(() => Complete(accepted, Single(accepted, 1), History(2, false), () => true));
+                var stopChecks = 0;
+                Reject(() => Complete(accepted, Single(accepted, 1), History(2, false), () => ++stopChecks >= 2));
+                Reject(() => CompleteRefreshedProof(accepted, Single(accepted, 1), History(2, false), new object(),
+                    window, accepted.Bounds, () => false));
+                Reject(() => CompleteRefreshedProof(accepted, Single(accepted, 1), History(2, false), owner,
+                    new IntPtr(window.ToInt64() + 1), accepted.Bounds, () => false));
+                Reject(() => CompleteRefreshedProof(accepted, Single(accepted, 1), History(2, false), owner,
+                    window, new NativeMethods.WindowRectangle { Left = 1 }, () => false));
+                Reject(() => Complete(Accepted(), Single(accepted, 1), History(2, false)));
+                foreach (var mutate in new Action<ProbeSnapshot>[] {
+                    s => s.Complete = false, s => s.RootNameFingerprint = "changed", s => s.Process = null,
+                    s => s.Nodes.Single(n => n.Node == 2).NativeHwnd++,
+                    s => s.Nodes.Single(n => n.PlainCommand == "pwrsi").Enabled = false,
+                    s => ReceiveProbe.SetTestName(s.Nodes.Single(n => n.PlainCommand == "pwrsi"), "help"),
+                    s => ReceiveProbe.SetTestName(s.Nodes.Single(n => n.PlainCommand == "pwrsi"), "pwrsi", "replaced-runtime"),
+                    s => s.Nodes.Remove(s.Nodes.Single(n => n.PlainCommand == "pwrsi")),
+                    s => ReceiveProbe.SetTestName(s.Nodes.Single(n => n.ReadyNoticeHash ==
+                        TokenStore.Hash(SupervisedSendTest.ReadyText("D345678"))), "changed Ready") })
+                {
+                    var first = Single(accepted, 1);
+                    mutate(first.Snapshot);
+                    Reject(() => Complete(accepted, first, History(2, false)));
+                    var second = History(2, false);
+                    mutate(second);
+                    Reject(() => Complete(accepted, Single(accepted, 1), second));
+                }
+                var agedFirst = Single(accepted, 1, TimeSpan.FromSeconds(12));
+                var agedProof = Complete(accepted, agedFirst, History(2, false));
+                Need(ReferenceEquals(agedProof.Age, agedFirst.Age) && agedProof.Elapsed >= TimeSpan.FromSeconds(12),
+                    "OPERATING_REFRESH_PRESERVES_FIRST_CAPTURE_AGE");
                 Need(!File.Exists(path), "OPERATING_EXPIRED_NOTICE_NO_RESERVATION");
                 var busyProof = Proof(0);
                 AuthorizeHandoffCore(busyProof, owner, window, marker, History(2), path, () => false, true);
@@ -437,9 +518,14 @@ namespace RemoteMonitorMaster
                 Reject(() => AuthorizeHandoffCore(busyProof, owner, window, marker, History(2), path, () => false, true));
                 for (var part = 1; part <= 9; part++)
                 {
-                    var refreshed = SelectRefreshedProof(busyProof, Proof(part + 2, candidateVisible: false), owner, window);
-                    AuthorizeHandoffCore(refreshed, owner, window, marker,
-                        History(part + 3, candidateVisible: false), path, () => false, false);
+                    var first = Single(busyProof, part + 2);
+                    var second = History(part + 3, candidateVisible: false);
+                    var refreshed = Complete(busyProof, first, second);
+                    Need(ReferenceEquals(refreshed.Previous, first.Snapshot) && ReferenceEquals(refreshed.Final, second) &&
+                        !ReferenceEquals(refreshed.Previous, refreshed.Final), "OPERATING_TWO_DISTINCT_FRESH_OBSERVATIONS");
+                    Reject(() => Complete(busyProof, first, History(part + 3, false)));
+                    AuthorizeHandoffCore(refreshed, owner, window, marker, second, path, () => false, false);
+                    Reject(() => AuthorizeHandoffCore(refreshed, owner, window, marker, second, path, () => false, false));
                 }
                 Need(File.ReadAllLines(path).Length == 1, "OPERATING_NINE_OFFSCREEN_PARTS_REUSE_RESERVATION");
                 Reject(() => AuthorizeHandoffCore(Proof(3, candidateEnabled: false), owner, window, marker,

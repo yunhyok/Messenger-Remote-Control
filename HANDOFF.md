@@ -1,4 +1,17 @@
-# Messenger Remote Control v0.3.1 handoff
+# Messenger Remote Control v0.3.2 handoff
+
+## Current update — 2026-09-18, v0.3.2
+
+- The user reports v0.3.1 works functionally, including the previously interrupted full-output reply path, but multipart transmission is slow. This is functional field feedback, not a timed benchmark or clean-install verification.
+- The earlier private Win7 log records approximately 16.7 seconds for one part, including three full UIA snapshots taking 4.103, 4.458 and 4.054 seconds (12.615 seconds combined). The usual inter-snapshot wait is only 200 ms; readback waits stop as soon as the expected state appears. The dominant work is repeated cross-process property and pattern discovery.
+- v0.3.2 batches fresh, element-only UIA metadata/pattern and send-scope reads. A fresh accepted-command snapshot and the sender's own fresh snapshot form the two current observations, reducing the per-reply full traversal count from three to two. The first observation's age is retained; original accepted proof content serves only as an identity anchor. Accepted-command/offscreen checks, action-boundary validation, 1,400-character parts, ordering, one-use send consent, uncertain-send abort and commit-after-all-parts history remain. No cached UI state is reused across reply parts.
+- Owned, separate-process fixtures compared five elements over 20 iterations, five timing samples with alternating identity-read order. Full identity/pattern equality passed. On the WPF provider, median legacy identity capture was 372.64 ms per 100 elements versus 188.50 ms for the new metadata-plus-identity batch; security-scope reads were 32.42 versus 30.15 ms. The native WinForms proxy showed no benefit (43.82 versus 48.72 ms, security scope 0.29 versus 0.59 ms). These component timings demonstrate provider-dependent behavior, not real KI-Messenger throughput or a guaranteed Win7 speedup. Private harness/results remain in `work/ProbeCacheBenchmark.cs` and `work/v032-benchmark*.log`.
+- Actual .NET Framework self-testing found that the own WinForms root can omit `IsPassword`: the original probe's `Current.IsPassword` uses UIA's documented false default. Probe caching preserves that same default, with live pre-content checks intact; send-scope checks retain their pre-existing strict unsupported-value rejection. The focused Master EXE test passed after this compatibility correction.
+- Regression checks cover actual .NET Framework UIA cache/identity/pattern compatibility, malformed security metadata, two distinct current observations, shared first-capture age and expiry, cancellation, changed owner/window/bounds/message/Ready/ancestry, and nine offscreen reply parts with one-use proofs and one durable reservation. Independent review found no release-blocking correctness or security issue.
+- Local Windows 10 Release builds completed with zero warnings/errors; both actual EXE self-tests, ZIP packages, both Inno Setup installer builds and release asset checks passed. Master installer install/same-version repair/uninstall/metadata/shortcut/settings/history-preservation checks passed; private evidence is in `work/installer-smoke-1a5d5187d01a4b8b84a3ba81af028f0d/`. Public-release verification is pending.
+- App/installers are v0.3.2; protocol remains 0.3.0. Only Master needs to upgrade; existing Slave v0.3.0/0.3.1 and pairing/settings/history remain compatible. Actual Win7 messenger speed, target-OS installation and a clean offline installation without an existing runtime remain unverified for this update. Do not restart PowerSI/HFSS field tests.
+
+## Previous release — v0.3.1
 
 ## Current update — 2026-09-18, v0.3.1
 

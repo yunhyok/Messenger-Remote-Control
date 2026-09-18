@@ -531,6 +531,7 @@ namespace RemoteMonitorMaster
                 Require(!AutomationTarget.IsMessageEligible(2, true, true), "baseline accepted an ambiguous envelope");
                 Require(!AutomationTarget.IsMessageEligible(2, true, false), "poll accepted a hidden second body");
                 TestElementIdentity();
+                ProbeElementCache.RunSelfTest();
                 TestReadOnlyGuards();
                 TestPointerAndShapeHints();
                 ReadOnlyPair.RunSelfTest();
