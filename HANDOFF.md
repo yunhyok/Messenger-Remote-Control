@@ -1,4 +1,13 @@
-# Messenger Remote Control v0.2.1 handoff
+# Messenger Remote Control v0.2.2 handoff
+
+## Current update — 2026-09-18, v0.2.2
+
+- The private Win7 SP1 v0.2.1 field log confirms Ready was sent and the first receive baseline then rejected `RECEIVE_HISTORY_CONTENT_CHANGED` before command recognition. The old row 19 primary Name changed while row/path/native identities matched; history grew from 22 to 25 rows. The log proves a stopped session, not an application crash, and does not reveal the changed private text.
+- Each locally sent Ready now carries the round marker. The first receive capture binds an exact, newly appended whole Ready row, keeps a cursor immediately after it, and preserves an already-arrived command. Only this explicit boundary permits older display-body refreshes; old rows never become commands. Missing Ready waits read-only within the existing 15-second phase limit; ambiguous/wrong boundaries remain rejected.
+- Operational sessions take the first complete allowed command after Ready. Additional messages/commands are ignored without queuing until the next Ready; they cannot replace the accepted command or trigger another query. Ready-through-command bodies and all structural row/target checks remain strict. Later copies of Ready and changed bodies in ignored traffic do not stop an established request. One processing notice explains the ignore policy.
+- Faster acknowledgement: the first processing notice uses the just-observed proof when younger than five seconds, with the existing 15-second pre-write validity checks still enforced. No retry on expiry/uncertain sends. Results after queries and every multipart reply still revalidate. Operational polling pauses 200 ms between full snapshots and uses compact logs for receive, refresh and send. Actual field latency has not been measured for v0.2.2.
+- Adjacent clock-shaped siblings are recognized and kept separate from command bodies. Displayed minute-resolution times cannot distinguish same-minute requests and are not the ordering key; the unique Ready boundary, message order and exact candidate checks are used.
+- App/installers are v0.2.2; protocol remains v0.2.0 and existing Slave v0.2.0 is compatible. This is a Master-only behavior fix. Both local Release builds and actual EXE self-tests passed on Windows 10; the final Master build/self-test was repeated after the Ready outer-space/source-hash guard. New checks cover the 22-to-25-row field shape, immediate and pre-Ready commands, ignored extra traffic and Ready quotations, no queue across rounds, invalid/missing Ready, raw candidate/target changes, one-time Busy reservation and refreshed final handoff. Independent review found no remaining release blocker. CI installer verification and stable publication are pending. Do not restart long PowerSI/HFSS tests.
 
 ## Stable release policy — 2026-09-18
 

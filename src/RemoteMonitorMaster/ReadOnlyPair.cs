@@ -15,6 +15,7 @@ namespace RemoteMonitorMaster
         public ElementIdentity Identity;
         public string NameShape;
         public string PlainCommand, CommandNameFormat, PlainCommandSourceHash;
+        public string ReadyNoticeHash, ReadyNoticeSourceHash;
         public bool Enabled, Visible, ValueWritable, Invoke, PointerInside, DraftExact;
     }
 

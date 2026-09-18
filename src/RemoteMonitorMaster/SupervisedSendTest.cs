@@ -14,8 +14,14 @@ namespace RemoteMonitorMaster
     {
         internal const string MouseReleaseWarning = "Mouse-button release was NOT confirmed.";
         internal const string ReadyNotice = "Master Ready. You may send help, total status, or pwrsi.";
-        internal const string PowerSiBusyNotice = "Processing pwrsi. Don't send another order before the response. Wait for Master Ready.";
-        internal const string StatusBusyNotice = "Processing total status. Don't send another order before the response. Wait for Master Ready.";
+        internal const string PowerSiBusyNotice = "Processing pwrsi. Wait for the response and Master Ready. Messages sent meanwhile are ignored.";
+        internal const string StatusBusyNotice = "Processing total status. Wait for the response and Master Ready. Messages sent meanwhile are ignored.";
+
+        internal static string ReadyText(string marker)
+        {
+            Need(IsValidMarker(marker), "SEND_MARKER_INVALID");
+            return ReadyNotice + " [" + marker + "]";
+        }
 
         internal sealed class Outcome
         {
@@ -40,6 +46,7 @@ namespace RemoteMonitorMaster
             private Consent[] preparedParts;
             private Consent progressNotice;
             private bool isNotice;
+            internal bool IsOperational { get { return IsPlainCommands || isNotice; } }
             internal string NoticeText { get { Need(isNotice, "SEND_NOTICE_REQUIRED"); return preparedReply; } }
             private int replyPartIndex = 1, replyPartCount = 1;
             // Low bits: 0=confirmed, 1=consumed, 2=move, 3=write, 4=click committed. Mask 8 preserves attempts on cancellation.
@@ -87,7 +94,8 @@ namespace RemoteMonitorMaster
             internal static Consent ForNotice(string marker, string text)
             {
                 Need(text == ReadyNotice || text == PowerSiBusyNotice || text == StatusBusyNotice, "SEND_NOTICE_INVALID");
-                return new Consent(marker, true) { isNotice = true, preparedReply = text };
+                return new Consent(marker, true) { isNotice = true,
+                    preparedReply = text == ReadyNotice ? ReadyText(marker) : text };
             }
 
             internal Consent CreateProgressNotice(string text)
@@ -161,7 +169,7 @@ namespace RemoteMonitorMaster
             internal bool IsAuthorizedReply(string text)
             {
                 return text != null && text == Volatile.Read(ref preparedReply) &&
-                    (isNotice ? text == ReadyNotice || text == PowerSiBusyNotice || text == StatusBusyNotice :
+                    (isNotice ? text == ReadyText(Marker) || text == PowerSiBusyNotice || text == StatusBusyNotice :
                     IsPlainCommands ? ReadOnlyCommands.IsReplyPart(text, Volatile.Read(ref command), Marker, replyPartIndex, replyPartCount) :
                         IsSlaveStatus ? PcStatusReport.IsSlaveReply(text, Marker, nextMarker) :
                         IsPcStatus ? PcStatusReport.IsReply(text, Marker, nextMarker) : IsValidMarker(text));
@@ -308,7 +316,7 @@ namespace RemoteMonitorMaster
                 Need(NativeMethods.GetWindowRect(window, out initialBounds), "SEND_WINDOW_BOUNDS_UNAVAILABLE");
                 windowBounds = initialBounds;
                 var snapshot = ReadOnlyProbe.CaptureSnapshot(window, log, "SEND_METADATA", null, GuardedStop,
-                    retainSelectedInput: true, automaticSendSelection: true);
+                    retainSelectedInput: true, automaticSendSelection: true, compactLog: consent.IsOperational);
                 Alive();
                 var selected = ReadOnlyPair.SelectAutomaticInput(snapshot);
                 var selectedSend = ReadOnlyPair.SelectAutomaticSend(snapshot);
@@ -698,7 +706,7 @@ namespace RemoteMonitorMaster
             var readyNotice = Consent.ForNotice("D234567", ReadyNotice);
             Need(!readyNotice.TryConsume(PowerSiBusyNotice) && !readyNotice.TryConsume(ReadyNotice), "SEND_SELF_TEST_NOTICE_EXACT");
             var onceNotice = Consent.ForNotice("D234567", ReadyNotice);
-            Need(onceNotice.TryConsume(ReadyNotice) && !onceNotice.TryConsume(ReadyNotice), "SEND_SELF_TEST_NOTICE_ONCE");
+            Need(onceNotice.TryConsume(onceNotice.NoticeText) && !onceNotice.TryConsume(onceNotice.NoticeText), "SEND_SELF_TEST_NOTICE_ONCE");
             const string marker = "D234567";
             var observedPointer = new NativeMethods.ScreenPoint { X = -10, Y = 20 };
             Need(PointerFailure(true, observedPointer, new Point(-10, 20)) == null &&

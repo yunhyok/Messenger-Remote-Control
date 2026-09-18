@@ -536,7 +536,7 @@ namespace RemoteMonitorMaster
                 SetStatus("READY — " + count + " / 휴대폰에서 소문자 명령어 하나 (pwrsi에는 공백 불필요)", true);
                 SetInteractionNotice("휴대폰에서 고정 명령어 한 번 / 종료하려면 Stop");
                 details.Text = "허용 고정 명령어: help / help help / help total status / help pwrsi / total status / pwrsi\r\n" +
-                    "메신저의 Master Ready를 확인한 뒤 명령 하나를 보냅니다. 처리 중 안내 이후에는 전체 답장과 다음 Master Ready를 기다립니다.\r\n" +
+                    "메신저의 Master Ready 이후 첫 명령 하나를 처리합니다. 처리 중 추가 메시지는 대기열에 넣지 않고 무시하므로 다음 Master Ready 뒤에 새 명령을 보내세요.\r\n" +
                     "total status는 Slave 프로그램 상태를 표시합니다. pwrsi는 모든 PowerSI 대상의 요청 시점 증거를 1,400자 이하 PART로 순서대로 보냅니다.\r\n" +
                     "Pending은 이름·PID·Pending만 표시하며 진행률·완료를 추측하지 않습니다. Stop 뒤 현재 호출이 끝나야 LOG READY가 표시됩니다.";
             }

@@ -24,11 +24,14 @@ namespace RemoteMonitorMaster
             internal readonly string Marker;
             internal readonly string MarkerHash;
             internal readonly bool PlainCommands;
+            internal readonly int ReadyRow;
 
-            internal Baseline(ProbeSnapshot snapshot, HistorySelection selection, string marker, string markerHash, bool plainCommands = false)
+            internal Baseline(ProbeSnapshot snapshot, HistorySelection selection, string marker, string markerHash,
+                bool plainCommands = false, int readyRow = -1)
             {
                 Snapshot = snapshot; Selection = selection; Marker = marker; MarkerHash = markerHash;
                 PlainCommands = plainCommands;
+                ReadyRow = readyRow;
             }
         }
 
@@ -111,14 +114,73 @@ namespace RemoteMonitorMaster
             return result;
         }
 
-        internal static Baseline CreateBaseline(ProbeSnapshot snapshot, string marker, bool plainCommands = false)
+        internal static Baseline CreateBaseline(ProbeSnapshot snapshot, string marker, bool plainCommands = false, int readyRow = -1)
         {
             Need(Protocol.IsDiagnosticMarker("MESSAGE", marker), "RECEIVE_MARKER_INVALID");
             var selection = SelectHistory(snapshot);
             var hash = TokenStore.Hash(marker);
             Need(snapshot.Nodes.All(n => !string.IsNullOrEmpty(n.Identity.NameHash)), "RECEIVE_NAME_METADATA_UNAVAILABLE");
             if (!plainCommands) Need(!snapshot.Nodes.Any(n => n.Identity.NameHash == hash), "RECEIVE_MARKER_ALREADY_PRESENT");
-            return new Baseline(snapshot, selection, marker, hash, plainCommands);
+            if (readyRow >= 0)
+                Need(plainCommands && IsReadyRow(selection, marker, readyRow), "RECEIVE_READY_BOUNDARY_CHANGED");
+            return new Baseline(snapshot, selection, marker, hash, plainCommands, readyRow);
+        }
+
+        private static int ReadyRow(HistorySelection selection, string marker)
+        {
+            var hash = TokenStore.Hash(SupervisedSendTest.ReadyText("D" + marker.Substring(1)));
+            var matches = HistoryRows(selection).Select((row, index) => new { Row = row, Index = index })
+                .Where(row => row.Row.Any(n => MatchesReady(n, hash)))
+                .Where(row => { var content = RowContent(row.Row); return content.Length == 1 && MatchesReady(content[0], hash); })
+                .Take(2).ToArray();
+            Need(matches.Length <= 1, "RECEIVE_READY_BOUNDARY_AMBIGUOUS");
+            return matches.Length == 0 ? -1 : matches[0].Index;
+        }
+
+        private static bool IsReadyRow(HistorySelection selection, string marker, int index)
+        {
+            var rows = HistoryRows(selection);
+            if (index < 0 || index >= rows.Count) return false;
+            var content = RowContent(rows[index]);
+            return content.Length == 1 && MatchesReady(content[0],
+                TokenStore.Hash(SupervisedSendTest.ReadyText("D" + marker.Substring(1))));
+        }
+
+        private static bool MatchesReady(ProbeNode node, string hash)
+        {
+            return node.ReadyNoticeHash == hash && node.ReadyNoticeSourceHash == node.Identity.NameHash;
+        }
+
+        internal static void RequireReadyAbsent(ProbeSnapshot snapshot, string marker)
+        {
+            var hash = TokenStore.Hash(SupervisedSendTest.ReadyText("D" + marker.Substring(1)));
+            Need(snapshot.Nodes.All(n => !MatchesReady(n, hash)), "RECEIVE_READY_ALREADY_PRESENT");
+        }
+
+        internal static Baseline BindReadyBoundary(Baseline before, ProbeSnapshot current, AuditLog log = null)
+        {
+            Need(before != null && before.PlainCommands && before.ReadyRow < 0, "RECEIVE_READY_BASELINE_REQUIRED");
+            RequireReadyAbsent(before.Snapshot, before.Marker);
+            var selected = ValidateContinuity(before, current);
+            // A completed local Ready send starts a new admission interval. Old bodies are never requests.
+            RequireHistoryPrefix(before.Selection, selected, log, int.MaxValue);
+            var ready = ReadyRow(selected, before.Marker);
+            if (ready < 0) return null; // The caller waits read-only within the existing 15-second phase budget.
+            Need(ready >= HistoryRows(before.Selection).Count, "RECEIVE_READY_NOT_APPENDED");
+            log?.Write("INFO", "RECEIVE_READY_BOUNDARY", AuditLog.Field("ready_row", ready),
+                AuditLog.Field("earlier_rows_ignored", ready), AuditLog.Field("clock_is_order_key", false));
+            return CreateBaseline(current, before.Marker, true, ready);
+        }
+
+        private static int FirstCommandRow(List<ProbeNode[]> rows, int start)
+        {
+            for (var i = start; i < rows.Count; i++)
+            {
+                var content = RowContent(rows[i]);
+                string command;
+                if (content.Length == 1 && ReadOnlyCommands.TryMatchNode(content[0], out command)) return i;
+            }
+            return rows.Count;
         }
 
         internal static ProbeNode Evaluate(Baseline baseline, ProbeSnapshot current, AuditLog log = null)
@@ -126,25 +188,27 @@ namespace RemoteMonitorMaster
             var selected = ValidateContinuity(baseline, current);
             if (baseline.PlainCommands)
             {
-                RequireHistoryPrefix(baseline.Selection, selected, log);
+                ValidatePlainHistoryPrefix(baseline.Snapshot, current, log, baseline);
                 // A request is one complete new message row. After removing one validated clock sibling,
                 // split reply/LLM Text nodes and command fragments can never become a request.
                 var rows = HistoryRows(selected);
-                var oldCount = HistoryRows(baseline.Selection).Count;
-                var appendedRows = rows.Skip(oldCount).ToArray();
+                var oldCount = baseline.ReadyRow >= 0 ? baseline.ReadyRow + 1 : HistoryRows(baseline.Selection).Count;
+                var firstCommandRow = baseline.ReadyRow >= 0 ? FirstCommandRow(rows, oldCount) : rows.Count;
+                var appendedRows = rows.Skip(oldCount).Take(firstCommandRow - oldCount + 1).ToArray();
                 var appended = appendedRows.Select(row =>
                 {
                     var content = RowContent(row);
                     string command;
                     return content.Length == 1 && ReadOnlyCommands.TryMatchNode(content[0], out command)
                         ? content[0] : null;
-                }).Where(node => node != null).Take(2).ToArray();
+                }).Where(node => node != null).Take(baseline.ReadyRow >= 0 ? 1 : 2).ToArray();
                 if (log != null)
                 {
                     var newContent = appendedRows.SelectMany(RowContent).ToArray();
                     log.Write("INFO", "COMMAND_HISTORY_SCAN", AuditLog.Field("baseline_rows", oldCount),
                         AuditLog.Field("current_rows", rows.Count), AuditLog.Field("appended_matches_capped", appended.Length),
                         AuditLog.Field("whole_row_required", true),
+                        AuditLog.Field("first_request_only", baseline.ReadyRow >= 0),
                         AuditLog.Field("new_texts", newContent.Length),
                         AuditLog.Field("new_name_lengths", string.Join(",", newContent.Take(8).Select(n => n.Identity.NameLength))),
                         AuditLog.Field("new_name_formats", string.Join(",", newContent.Take(8).Select(n => n.CommandNameFormat ?? "UNAVAILABLE"))),
@@ -158,9 +222,20 @@ namespace RemoteMonitorMaster
             return matches.SingleOrDefault();
         }
 
-        internal static void ValidatePlainHistoryPrefix(ProbeSnapshot previous, ProbeSnapshot current, AuditLog log = null)
+        internal static void ValidatePlainHistoryPrefix(ProbeSnapshot previous, ProbeSnapshot current, AuditLog log = null,
+            Baseline baseline = null)
         {
-            RequireHistoryPrefix(SelectHistory(previous), SelectHistory(current), log);
+            var before = SelectHistory(previous);
+            var after = SelectHistory(current);
+            if (baseline != null && baseline.ReadyRow >= 0)
+            {
+                Need(IsReadyRow(before, baseline.Marker, baseline.ReadyRow) &&
+                    IsReadyRow(after, baseline.Marker, baseline.ReadyRow), "RECEIVE_READY_BOUNDARY_CHANGED");
+                // Keep Ready and the first request exact; later traffic is ignored until the next Ready.
+                RequireHistoryPrefix(before, after, log, baseline.ReadyRow,
+                    FirstCommandRow(HistoryRows(before), baseline.ReadyRow + 1));
+            }
+            else RequireHistoryPrefix(before, after, log);
         }
 
         private static ProbeNode RowRoot(HistorySelection selection, ProbeNode text)
@@ -184,11 +259,13 @@ namespace RemoteMonitorMaster
             return row.Where((node, index) => index == 0 || node.Parent != row[0].Parent || node.NameShape != "TIME_LIKE").ToArray();
         }
 
-        private static void RequireHistoryPrefix(HistorySelection previous, HistorySelection current, AuditLog log = null)
+        private static void RequireHistoryPrefix(HistorySelection previous, HistorySelection current, AuditLog log = null,
+            int? protectedStart = null, int protectedEnd = int.MaxValue)
         {
             var before = HistoryRows(previous);
             var after = HistoryRows(current);
-            var protectedTailStart = Math.Max(0, before.Count - 3);
+            var protectedTailStart = protectedStart ?? Math.Max(0, before.Count - 3);
+            var protectedCount = Math.Max(0, Math.Min(before.Count - 1, protectedEnd) - protectedTailStart + 1);
             var rowIndex = -1;
             var textIndex = -1;
             var ignoredBefore = 0;
@@ -224,9 +301,9 @@ namespace RemoteMonitorMaster
             }
             try
             {
-                for (rowIndex = protectedTailStart; rowIndex < before.Count; rowIndex++)
+                for (rowIndex = protectedTailStart; rowIndex < before.Count && rowIndex <= protectedEnd; rowIndex++)
                     ignoredBefore += before[rowIndex].Length - Content(before[rowIndex], true).Length;
-                for (rowIndex = protectedTailStart; rowIndex < after.Count; rowIndex++)
+                for (rowIndex = protectedTailStart; rowIndex < after.Count && rowIndex <= protectedEnd; rowIndex++)
                     ignoredAfter += after[rowIndex].Length - Content(after[rowIndex], false).Length;
                 clockCountsComplete = true;
                 rowIndex = -1; textIndex = -1; comparison = "COUNTS";
@@ -242,7 +319,7 @@ namespace RemoteMonitorMaster
                         PathKey(previous, oldRoot) == PathKey(current, newRoot), "RECEIVE_HISTORY_ROW_CHANGED");
                     // ponytail: older bodies are display state, not requests. Keep every row identity/order,
                     // the last three complete bodies, and exact new-candidate checks; never rebase or replay old rows.
-                    if (rowIndex < protectedTailStart) continue;
+                    if (rowIndex < protectedTailStart || rowIndex > protectedEnd) continue;
                     var oldContent = RowContent(before[rowIndex]);
                     var newContent = RowContent(after[rowIndex]);
                     comparison = "CONTENT";
@@ -261,8 +338,8 @@ namespace RemoteMonitorMaster
                         AuditLog.Field("after_texts", current.Texts.Count), AuditLog.Field("before_clock_siblings", ignoredBefore),
                         AuditLog.Field("after_clock_siblings", ignoredAfter), AuditLog.Field("row_prefix_preserved", true),
                         AuditLog.Field("clock_count_scope", "PROTECTED_TAIL_AND_APPENDED"),
-                        AuditLog.Field("protected_tail_rows", before.Count - protectedTailStart),
-                        AuditLog.Field("older_content_excluded", protectedTailStart));
+                        AuditLog.Field("protected_tail_rows", protectedCount),
+                        AuditLog.Field("older_content_excluded", Math.Min(before.Count, protectedTailStart)));
             }
             catch (MonitorException ex)
             {
@@ -275,7 +352,7 @@ namespace RemoteMonitorMaster
                     AuditLog.Field("identity_equal", identityEqual?.ToString() ?? "NOT_COMPARED"),
                     AuditLog.Field("native_equal", nativeEqual?.ToString() ?? "NOT_COMPARED"),
                     AuditLog.Field("before_rows", before.Count), AuditLog.Field("after_rows", after.Count),
-                    AuditLog.Field("protected_tail_rows", before.Count - protectedTailStart),
+                    AuditLog.Field("protected_tail_rows", protectedCount),
                     AuditLog.Field("before_texts", previous.Texts.Count), AuditLog.Field("after_texts", current.Texts.Count),
                     AuditLog.Field("clock_count_scope", "PROTECTED_TAIL_AND_APPENDED"),
                     AuditLog.Field("before_clock_siblings", ignoredBefore), AuditLog.Field("after_clock_siblings", ignoredAfter),
@@ -377,7 +454,7 @@ namespace RemoteMonitorMaster
                 {
                     var snapshot = ReadOnlyProbe.CaptureSnapshot(window, log, "SEND_METADATA", null, Stopped,
                         retainSelectedInput: true, automaticSendSelection: true, retainReceiveElements: collectMetadata,
-                        compactLog: continuousWait);
+                        compactLog: continuousWait || (suppliedBaseline != null && suppliedBaseline.ReadyRow >= 0));
                     Alive();
                     Need(process.Equals(snapshot.Process), "RECEIVE_PROCESS_CHANGED");
                     return snapshot;
@@ -482,6 +559,18 @@ namespace RemoteMonitorMaster
                 var firstSnapshot = Capture();
                 var baseline = suppliedBaseline == null ? CreateBaseline(firstSnapshot, marker, plainCommands) :
                     AcceptSuppliedBaseline(suppliedBaseline, firstSnapshot, marker, window, plainCommands);
+                if (continuousWait && plainCommands)
+                {
+                    Baseline ready;
+                    while ((ready = BindReadyBoundary(baseline, firstSnapshot, log)) == null)
+                    {
+                        Alive();
+                        ReleaseLive(firstSnapshot);
+                        Thread.Sleep(100);
+                        firstSnapshot = Capture();
+                    }
+                    baseline = ready;
+                }
                 var firstCandidate = suppliedBaseline == null ? null : Evaluate(baseline, firstSnapshot, log);
                 inspectSnapshot?.Invoke("BASELINE", firstSnapshot);
                 Alive();
@@ -495,11 +584,11 @@ namespace RemoteMonitorMaster
                 while (true)
                 {
                     phaseClock.Restart(); // The inter-snapshot wait is not charged to the preceding snapshot's 15-second cap.
-                    for (var i = 0; i < 10; i++) { Alive(); Thread.Sleep(100); }
+                    for (var i = 0; i < (baseline.ReadyRow >= 0 ? 2 : 10); i++) { Alive(); Thread.Sleep(100); }
                     SetPhase("POLLING");
                     var current = Capture();
                     polls++;
-                    if (plainCommands && previous != null) ValidatePlainHistoryPrefix(previous, current, log);
+                    if (plainCommands && previous != null) ValidatePlainHistoryPrefix(previous, current, log, baseline);
                     var candidate = Evaluate(baseline, current, log);
                     inspectSnapshot?.Invoke("POLL", current);
                     Alive();
@@ -524,7 +613,8 @@ namespace RemoteMonitorMaster
                     previous = current;
                     previousCandidate = candidate;
                     if (candidate != null) progress("WAITING_FOR_REPEAT");
-                    else if (plainCommands && HistoryRows(SelectHistory(current)).Skip(HistoryRows(baseline.Selection).Count)
+                    else if (plainCommands && HistoryRows(SelectHistory(current)).Skip(baseline.ReadyRow >= 0 ?
+                        baseline.ReadyRow + 1 : HistoryRows(baseline.Selection).Count)
                         .SelectMany(RowContent).Any(n => Usable(n) && n.Identity.NameLength <= 64 && n.PlainCommand == null))
                         progress("COMMAND_NOT_MATCHED");
                 }
@@ -774,6 +864,95 @@ namespace RemoteMonitorMaster
             Reject(() => AcceptSuppliedBaseline(baseline, first, marker, window));
             RunClockSiblingSelfTest();
             RunLongHistorySelfTest();
+            RunReadyBoundarySelfTest();
+        }
+
+        private static void RunReadyBoundarySelfTest()
+        {
+            const string marker = "M234567";
+            var readyText = SupervisedSendTest.ReadyText("D234567");
+            void Reject(Action action)
+            {
+                try { action(); } catch (MonitorException) { return; }
+                throw new InvalidOperationException("Unsafe Ready boundary accepted.");
+            }
+            ProbeSnapshot History()
+            {
+                var snapshot = CreateTestSnapshot();
+                while (HistoryRows(SelectHistory(snapshot)).Count < 22) AppendTestHistoryText(snapshot, "old message");
+                return snapshot;
+            }
+            ProbeNode Body(ProbeSnapshot snapshot, int row) { return HistoryRows(SelectHistory(snapshot))[row][0]; }
+            var before = CreateBaseline(History(), marker, true);
+            Need(BindReadyBoundary(before, History()) == null, "READY_BOUNDARY_DELAYED");
+            var immediate = History();
+            SetTestName(Body(immediate, 19), "old display refreshed"); // The real field shape: 22 -> 25 rows.
+            AppendTestHistoryText(immediate, "pwrsi"); // Arrived before Ready: never a request.
+            var ready = AppendTestHistoryText(immediate, readyText);
+            var command = AppendTestHistoryText(immediate, "pwrsi");
+            AppendTestHistorySiblingText(immediate, command, "오후 3:44");
+            Reject(() => Evaluate(before, immediate)); // No general old-body exception.
+            var bound = BindReadyBoundary(before, immediate);
+            Need(bound != null && bound.ReadyRow == 23 && Evaluate(bound, immediate) == command,
+                "READY_BOUNDARY_IMMEDIATE_COMMAND");
+            var next = History();
+            AppendTestHistoryText(next, "pwrsi");
+            AppendTestHistoryText(next, readyText);
+            var repeated = AppendTestHistoryText(next, "pwrsi");
+            AppendTestHistorySiblingText(next, repeated, "오후 3:44");
+            var ignored = AppendTestHistoryText(next, "help");
+            AppendTestHistorySiblingText(next, ignored, "15:44");
+            AppendTestHistorySiblingText(next, ignored, "15:45"); // Ignored traffic cannot fail clock parsing.
+            ValidatePlainHistoryPrefix(immediate, next, baseline: bound);
+            Need(Evaluate(bound, next) == repeated && SameCandidate(immediate, command, next, repeated),
+                "READY_BOUNDARY_BUSY_TRAFFIC_IGNORED");
+            SetTestName(ignored, "different ignored message");
+            AppendTestHistoryText(next, readyText); // A later quotation cannot replace the bound Ready row.
+            Need(Evaluate(bound, next) == repeated, "READY_BOUNDARY_IGNORED_BODY_REFRESH");
+            SetTestName(repeated, "help");
+            Reject(() => Evaluate(bound, next));
+            SetTestName(repeated, "pwrsi");
+            var beforeNextReady = new ProbeSnapshot { Complete = next.Complete, Process = next.Process,
+                RootNameFingerprint = next.RootNameFingerprint, LayoutRejection = next.LayoutRejection,
+                Nodes = new List<ProbeNode>(next.Nodes) };
+            var readyAgain = CreateBaseline(beforeNextReady, "M345678", true);
+            AppendTestHistoryText(next, SupervisedSendTest.ReadyText("D345678"));
+            var newBound = BindReadyBoundary(readyAgain, next);
+            Need(newBound != null && Evaluate(newBound, next) == null, "READY_BOUNDARY_NO_QUEUE");
+            Need(Evaluate(newBound, next) == null, "READY_BOUNDARY_OLD_COMMANDS_IGNORED");
+            var later = new ProbeSnapshot { Complete = next.Complete, Process = next.Process,
+                RootNameFingerprint = next.RootNameFingerprint, LayoutRejection = next.LayoutRejection,
+                Nodes = new List<ProbeNode>(next.Nodes) };
+            var newCommand = AppendTestHistoryText(later, "total status");
+            Need(Evaluate(newBound, later) == newCommand, "READY_BOUNDARY_NEXT_REQUEST");
+
+            var paddedReady = History(); var padded = AppendTestHistoryText(paddedReady, "\u00a0" + readyText + " ");
+            var paddedBound = BindReadyBoundary(before, paddedReady);
+            Need(paddedBound != null, "READY_BOUNDARY_OUTER_SPACES");
+            padded.ReadyNoticeSourceHash = "unmatched name read";
+            Need(BindReadyBoundary(before, paddedReady) == null, "READY_BOUNDARY_NAME_READ_MISMATCH");
+
+            foreach (var text in new[] { SupervisedSendTest.ReadyNotice, SupervisedSendTest.ReadyText("D345678") })
+            {
+                var wrong = History(); AppendTestHistoryText(wrong, text); AppendTestHistoryText(wrong, "pwrsi");
+                Need(BindReadyBoundary(before, wrong) == null, "READY_BOUNDARY_WRONG_TOKEN");
+            }
+            var split = History(); var fragment = AppendTestHistoryText(split, readyText);
+            AppendTestHistorySiblingText(split, fragment, "other text");
+            Need(BindReadyBoundary(before, split) == null, "READY_BOUNDARY_WHOLE_ROW");
+            var duplicate = History(); AppendTestHistoryText(duplicate, readyText); AppendTestHistoryText(duplicate, readyText);
+            Reject(() => BindReadyBoundary(before, duplicate));
+            Reject(() => BindReadyBoundary(CreateBaseline(immediate, marker, true), immediate));
+            foreach (var mutate in new Action<ProbeSnapshot>[] {
+                s => SetTestName(Body(s, 23), "Ready changed"),
+                s => SetTestName(RowRoot(SelectHistory(s), Body(s, 0)), "", "recycled-row"),
+                s => s.RootNameFingerprint = "other chat",
+                s => s.Complete = false })
+            {
+                var invalid = History(); AppendTestHistoryText(invalid, "pwrsi");
+                AppendTestHistoryText(invalid, readyText); AppendTestHistoryText(invalid, "pwrsi");
+                mutate(invalid); Reject(() => Evaluate(bound, invalid));
+            }
         }
 
         private static void RunLongHistorySelfTest()

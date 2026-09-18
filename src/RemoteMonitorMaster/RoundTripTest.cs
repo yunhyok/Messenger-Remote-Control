@@ -86,7 +86,8 @@ namespace RemoteMonitorMaster
                 SupervisedSendTest.Outcome SendPrepared(string payload, SupervisedSendTest.Consent partConsent, int partNumber, int partCount)
                 {
                     Alive();
-                    var sendProof = consent.IsPlainCommands
+                    var sendProof = consent.IsPlainCommands &&
+                        !(partNumber == 0 && received.Proof.Elapsed < TimeSpan.FromSeconds(5))
                         ? RefreshProof(received.Proof, owner, window, incomingMarker, Stopped, progress, log, inspectSnapshot)
                         : received.Proof;
                     sendStageEntered = true;
@@ -205,14 +206,15 @@ namespace RemoteMonitorMaster
                 "ROUNDTRIP_PROOF_EXPIRED_OR_WINDOW_CHANGED");
             Need(proof.Baseline != null && proof.Previous != null && proof.Final != null &&
                 proof.Baseline.Snapshot.Process.WindowHandle == window.ToInt64(), "ROUNDTRIP_PROOF_INCOMPLETE");
-            var baseline = ReceiveProbe.CreateBaseline(proof.Baseline.Snapshot, marker, proof.Baseline.PlainCommands);
+            var baseline = ReceiveProbe.CreateBaseline(proof.Baseline.Snapshot, marker,
+                proof.Baseline.PlainCommands, proof.Baseline.ReadyRow);
             Need(baseline.MarkerHash == proof.Baseline.MarkerHash, "ROUNDTRIP_MARKER_MISMATCH");
             var previous = ReceiveProbe.Evaluate(baseline, proof.Previous, log);
             var final = ReceiveProbe.Evaluate(baseline, proof.Final, log);
             if (baseline.PlainCommands)
             {
-                ReceiveProbe.ValidatePlainHistoryPrefix(proof.Previous, proof.Final, log);
-                ReceiveProbe.ValidatePlainHistoryPrefix(proof.Final, fresh, log);
+                ReceiveProbe.ValidatePlainHistoryPrefix(proof.Previous, proof.Final, log, baseline);
+                ReceiveProbe.ValidatePlainHistoryPrefix(proof.Final, fresh, log, baseline);
             }
             Need(ReferenceEquals(previous, proof.PreviousCandidate) && ReferenceEquals(final, proof.Candidate) &&
                 ReceiveProbe.SameCandidate(proof.Previous, previous, proof.Final, final), "ROUNDTRIP_REPEAT_NOT_PRESENT");
@@ -262,8 +264,8 @@ namespace RemoteMonitorMaster
                 refreshed.Elapsed < TimeSpan.FromSeconds(15), "ROUNDTRIP_PROOF_EXPIRED_OR_WINDOW_CHANGED");
             Need(original.Baseline != null && original.Baseline.PlainCommands &&
                 ReferenceEquals(original.Baseline, refreshed.Baseline), "ROUNDTRIP_PROOF_INCOMPLETE");
-            ReceiveProbe.ValidatePlainHistoryPrefix(original.Final, refreshed.Previous);
-            ReceiveProbe.ValidatePlainHistoryPrefix(refreshed.Previous, refreshed.Final);
+            ReceiveProbe.ValidatePlainHistoryPrefix(original.Final, refreshed.Previous, baseline: original.Baseline);
+            ReceiveProbe.ValidatePlainHistoryPrefix(refreshed.Previous, refreshed.Final, baseline: original.Baseline);
             Need(ReceiveProbe.SameCandidate(original.Final, original.Candidate, refreshed.Previous, refreshed.PreviousCandidate) &&
                 ReceiveProbe.SameCandidate(original.Final, original.Candidate, refreshed.Final, refreshed.Candidate),
                 "ROUNDTRIP_REOBSERVATION_CHANGED");
@@ -351,6 +353,7 @@ namespace RemoteMonitorMaster
                 consent.Cancel();
                 Need(!consent.TryCommitMove() && !consent.TryClaimRoundTrip(), "ROUNDTRIP_SELF_TEST_CANCEL");
                 RunPlainHandoffSelfTest(directory);
+                RunOperationalHandoffSelfTest(directory);
             }
             finally
             {
@@ -358,6 +361,57 @@ namespace RemoteMonitorMaster
                 try { if (File.Exists(cancelPath)) File.Delete(cancelPath); } catch { }
                 try { if (Directory.Exists(blockedPath)) Directory.Delete(blockedPath); } catch { }
             }
+        }
+
+        private static void RunOperationalHandoffSelfTest(string directory)
+        {
+            const string marker = "M345678";
+            var path = Path.Combine(directory, "roundtrip-operational-tokens.txt");
+            var owner = new object();
+            var initial = ReceiveProbe.CreateBaseline(ReceiveProbe.CreateTestSnapshot(), marker, true);
+            var window = new IntPtr(initial.Snapshot.Process.WindowHandle);
+            ProbeSnapshot History(int extras)
+            {
+                var snapshot = ReceiveProbe.CreateTestSnapshot();
+                ReceiveProbe.AppendTestHistoryText(snapshot, SupervisedSendTest.ReadyText("D345678"));
+                ReceiveProbe.AppendTestHistoryText(snapshot, "pwrsi");
+                for (var i = 0; i < extras; i++) ReceiveProbe.AppendTestHistoryText(snapshot, i % 2 == 0 ? "help" : "general message");
+                return snapshot;
+            }
+            var baseline = ReceiveProbe.BindReadyBoundary(initial, History(0));
+            ReceiveProbe.ObservationProof Proof(int extras, TimeSpan? age = null)
+            {
+                var previous = History(extras); var final = History(extras);
+                return new ReceiveProbe.ObservationProof(owner, window, new NativeMethods.WindowRectangle(), baseline,
+                    previous, ReceiveProbe.Evaluate(baseline, previous), final, ReceiveProbe.Evaluate(baseline, final), age);
+            }
+            void Reject(Action action)
+            {
+                try { action(); } catch (MonitorException) { return; }
+                throw new InvalidOperationException("Unsafe operating handoff accepted.");
+            }
+            try
+            {
+                Reject(() => AuthorizeHandoffCore(Proof(0), owner, window, marker, History(1), path, () => false, false));
+                Reject(() => AuthorizeHandoffCore(Proof(0, TimeSpan.FromSeconds(16)), owner, window, marker,
+                    History(1), path, () => false, true));
+                Need(!File.Exists(path), "OPERATING_EXPIRED_NOTICE_NO_RESERVATION");
+                var busyProof = Proof(0);
+                AuthorizeHandoffCore(busyProof, owner, window, marker, History(2), path, () => false, true);
+                Need(busyProof.DiagnosticTokenReserved, "OPERATING_BUSY_RESERVED_ONCE");
+                Reject(() => AuthorizeHandoffCore(busyProof, owner, window, marker, History(2), path, () => false, true));
+                var refreshed = SelectRefreshedProof(busyProof, Proof(3), owner, window);
+                AuthorizeHandoffCore(refreshed, owner, window, marker, History(4), path, () => false, false);
+                Need(File.ReadAllLines(path).Length == 1, "OPERATING_REPLY_REUSES_RESERVATION");
+                var changed = Proof(3);
+                ReceiveProbe.SetTestName(changed.Candidate, "help");
+                Reject(() => SelectRefreshedProof(busyProof, changed, owner, window));
+                var otherBoundary = ReceiveProbe.CreateBaseline(baseline.Snapshot, marker, true);
+                var other = Proof(0);
+                Reject(() => SelectRefreshedProof(busyProof, new ReceiveProbe.ObservationProof(owner, window,
+                    other.Bounds, otherBoundary, other.Previous, other.PreviousCandidate, other.Final, other.Candidate), owner, window));
+            }
+            finally { if (File.Exists(path)) File.Delete(path); }
         }
 
         private static void RunPlainHandoffSelfTest(string directory)

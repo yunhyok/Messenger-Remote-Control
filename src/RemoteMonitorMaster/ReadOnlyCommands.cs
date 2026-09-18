@@ -31,10 +31,17 @@ namespace RemoteMonitorMaster
         {
             node.PlainCommand = null;
             node.PlainCommandSourceHash = null;
+            node.ReadyNoticeHash = node.ReadyNoticeSourceHash = null;
             node.CommandNameFormat = "UNAVAILABLE";
             if (name == null || node.Identity == null || name.Length != node.Identity.NameLength ||
                 TokenStore.Hash(name) != node.Identity.NameHash) return;
             node.CommandNameFormat = "UNSUPPORTED";
+            // Use the same bounded outer-space allowance for our Ready echo; raw identity stays strict afterward.
+            if (name.Length <= 128)
+            {
+                node.ReadyNoticeHash = TokenStore.Hash(name.Trim(' ', '\u00a0'));
+                node.ReadyNoticeSourceHash = node.Identity.NameHash;
+            }
             if (name.Length > 64) { node.CommandNameFormat = "LONG_NAME"; return; }
             // ponytail: only outer space/NBSP is optional. Keep case, internal spacing, and raw identity strict.
             var trimmed = name.Trim(' ', '\u00a0');

@@ -9,10 +9,10 @@
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <AssemblyName>RemoteMonitorMaster</AssemblyName>
     <RootNamespace>RemoteMonitorMaster</RootNamespace>
-    <Version>0.2.1</Version>
-    <AssemblyVersion>0.2.1.0</AssemblyVersion>
-    <FileVersion>0.2.1.0</FileVersion>
-    <InformationalVersion>0.2.1</InformationalVersion>
+    <Version>0.2.2</Version>
+    <AssemblyVersion>0.2.2.0</AssemblyVersion>
+    <FileVersion>0.2.2.0</FileVersion>
+    <InformationalVersion>0.2.2</InformationalVersion>
     <Company>Messenger Remote Control</Company>
     <Product>Messenger Remote Control Master</Product>
     <AssemblyTitle>Messenger Remote Control Master</AssemblyTitle>

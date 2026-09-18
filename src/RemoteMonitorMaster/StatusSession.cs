@@ -130,14 +130,15 @@ namespace RemoteMonitorMaster
                             Need(process.Equals(snapshot.Process), "STATUS_PROCESS_CHANGED");
                             if (original == null)
                             {
-                                // Baseline before Ready preserves a command arriving immediately after the notice.
-                                original = baseline = ReceiveProbe.CreateBaseline(snapshot, requestMarker, true);
+                                original = ReceiveProbe.CreateBaseline(snapshot, requestMarker, true);
                             }
                             else
                             {
                                 ReceiveProbe.ValidateContinuity(original, snapshot);
-                                ReceiveProbe.ValidatePlainHistoryPrefix(baseline.Snapshot, snapshot, log);
                             }
+                            // The next receive binds to this exact Ready, without swallowing a fast following command.
+                            ReceiveProbe.RequireReadyAbsent(snapshot, requestMarker);
+                            baseline = ReceiveProbe.CreateBaseline(snapshot, requestMarker, true);
                         });
                     last = result.Message;
                     Need(result.CleanCompletion, "STATUS_READY_NOTICE_UNCERTAIN");
@@ -244,7 +245,7 @@ namespace RemoteMonitorMaster
             var operation = new StatusSession("M234567", true, null);
             var noticeSession = new StatusSession("M234567", true, null);
             noticeSession.activeNotice = SupervisedSendTest.Consent.ForNotice("D234567", SupervisedSendTest.ReadyNotice);
-            Need(noticeSession.activeNotice.TryConsume(SupervisedSendTest.ReadyNotice) && noticeSession.activeNotice.TryCommitMove() &&
+            Need(noticeSession.activeNotice.TryConsume(noticeSession.activeNotice.NoticeText) && noticeSession.activeNotice.TryCommitMove() &&
                 noticeSession.activeNotice.TryCommitWrite() && noticeSession.PendingWrite, "STATUS_SELFTEST_READY_PENDING");
             noticeSession.Cancel();
             Need(noticeSession.activeNotice.Cancelled && !noticeSession.activeNotice.TryCommit() && noticeSession.PendingWrite,
