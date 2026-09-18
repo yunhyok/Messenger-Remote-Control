@@ -2,7 +2,13 @@
 
 ## Stable release policy — 2026-09-18
 
-The user requested regular Releases rather than pre-releases. CI now accepts the exact `v<source-version>` tag and publishes a stable Release marked Latest. The v0.2.1 application behavior and compatibility are unchanged; this update changes delivery only. Existing RC tags/assets remain historical and are not overwritten. Publish v0.2.1 through CI, then verify public release flags, latest selection, source/tag, asset contents and hashes before recording delivery below.
+The user requested regular Releases rather than pre-releases. CI now accepts the exact `v<source-version>` tag and publishes a stable Release marked Latest. The v0.2.1 application behavior and compatibility are unchanged; this update changes delivery only. Existing RC tags/assets remain historical and are not overwritten.
+
+Published [v0.2.1 stable Release](https://github.com/yunhyok/Messenger-Remote-Control/releases/tag/v0.2.1) through [CI run 35288794647](https://github.com/yunhyok/Messenger-Remote-Control/actions/runs/35288794647), source/tag `b422307386a071d8a01606d6103f4badf6fddcdc`. Both builds, actual EXE self-tests and both installer install/same-version repair/uninstall/configuration-preservation checks passed on Windows Server 2025. The public API confirms `prerelease=false`, `draft=false` and Latest points to v0.2.1. All five assets were downloaded anonymously; GitHub digests, sizes, SHA256SUMS, exact ZIP entries, product/file versions, embedded source commit and identical Slave binaries across ZIPs passed. Real Win7/Win11 and messenger field limitations below remain unchanged. Later verification-record changes are documentation only.
+
+- [Master installer](https://github.com/yunhyok/Messenger-Remote-Control/releases/download/v0.2.1/Messenger-Remote-Control-Master-Setup-0.2.1.exe), SHA256 `A463BE21596CA4F25362B4E82B76F653345AC6F45DA31A5A4ED9009DF40A6813`.
+- [Slave installer](https://github.com/yunhyok/Messenger-Remote-Control/releases/download/v0.2.1/Messenger-Remote-Control-Slave-Setup-0.2.1.exe) / [Slave ZIP](https://github.com/yunhyok/Messenger-Remote-Control/releases/download/v0.2.1/Messenger-Remote-Control-Slave-v0.2.1-win11-net48.zip), ZIP SHA256 `D12EC20A7B78DB89AA5F8B8A49650E6C87CB448DA6AB9787B0CCC69A45AC5658`.
+- [Full ZIP](https://github.com/yunhyok/Messenger-Remote-Control/releases/download/v0.2.1/Messenger-Remote-Control-v0.2.1-win7-win11-net48.zip) / [SHA256SUMS.txt](https://github.com/yunhyok/Messenger-Remote-Control/releases/download/v0.2.1/SHA256SUMS.txt).
 
 ## Current update — 2026-09-17
 
