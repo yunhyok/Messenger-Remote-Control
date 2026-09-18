@@ -185,6 +185,11 @@ namespace RemoteMonitorMaster
 
         internal static ProbeNode Evaluate(Baseline baseline, ProbeSnapshot current, AuditLog log = null)
         {
+            return EvaluateCore(baseline, current, log, true);
+        }
+
+        private static ProbeNode EvaluateCore(Baseline baseline, ProbeSnapshot current, AuditLog log, bool requireVisible)
+        {
             var selected = ValidateContinuity(baseline, current);
             if (baseline.PlainCommands)
             {
@@ -212,14 +217,27 @@ namespace RemoteMonitorMaster
                         AuditLog.Field("new_texts", newContent.Length),
                         AuditLog.Field("new_name_lengths", string.Join(",", newContent.Take(8).Select(n => n.Identity.NameLength))),
                         AuditLog.Field("new_name_formats", string.Join(",", newContent.Take(8).Select(n => n.CommandNameFormat ?? "UNAVAILABLE"))),
+                        AuditLog.Field("candidate_visible", appended.Length == 1 ? (object)appended[0].Visible : "NOT_UNIQUE"),
+                        AuditLog.Field("candidate_enabled", appended.Length == 1 ? (object)appended[0].Enabled : "NOT_UNIQUE"),
+                        AuditLog.Field("observation_mode", requireVisible ? "FRESH_ADMISSION" : "ACCEPTED_REOBSERVATION"),
                         AuditLog.Field("details_truncated", newContent.Length > 8));
                 }
                 Need(appended.Length <= 1, "RECEIVE_COMMAND_NOT_UNIQUE");
-                return appended.Length == 1 && Usable(appended[0]) ? appended[0] : null;
+                return appended.Length == 1 && appended[0].Enabled && (!requireVisible || appended[0].Visible) ? appended[0] : null;
             }
             var matches = selected.Texts.Where(n => Usable(n) && n.Identity.NameHash == baseline.MarkerHash).Take(2).ToArray();
             Need(matches.Length <= 1, "RECEIVE_CANDIDATE_NOT_UNIQUE");
             return matches.SingleOrDefault();
+        }
+
+        internal static ProbeNode ReobserveCandidate(ObservationProof accepted, ProbeSnapshot current, AuditLog log = null)
+        {
+            Need(accepted != null && accepted.Baseline != null && accepted.Baseline.PlainCommands &&
+                accepted.Final != null && accepted.Candidate != null, "RECEIVE_ACCEPTED_PROOF_REQUIRED");
+            var candidate = EvaluateCore(accepted.Baseline, current, log, false);
+            Need(SameCandidate(accepted.Final, accepted.Candidate, current, candidate),
+                "RECEIVE_ACCEPTED_CANDIDATE_CHANGED");
+            return candidate;
         }
 
         internal static void ValidatePlainHistoryPrefix(ProbeSnapshot previous, ProbeSnapshot current, AuditLog log = null,
@@ -405,7 +423,8 @@ namespace RemoteMonitorMaster
 
         internal static ObservationResult Observe(IntPtr window, AuditLog log, string marker, Func<bool> stop,
             Action<string> progress, object owner, bool collectMetadata, Action<string, ProbeSnapshot> inspectSnapshot = null,
-            Baseline suppliedBaseline = null, bool continuousWait = false, bool plainCommands = false)
+            Baseline suppliedBaseline = null, bool continuousWait = false, bool plainCommands = false,
+            ObservationProof acceptedProof = null)
         {
             var overall = Stopwatch.StartNew();
             var phaseClock = Stopwatch.StartNew();
@@ -420,6 +439,10 @@ namespace RemoteMonitorMaster
                 Need(Thread.CurrentThread.GetApartmentState() == ApartmentState.MTA, "PROBE_REQUIRES_MTA");
                 Need(log != null && stop != null && progress != null && owner != null &&
                     Protocol.IsDiagnosticMarker("MESSAGE", marker), "RECEIVE_REQUEST_INVALID");
+                if (acceptedProof != null)
+                    Need(plainCommands && !continuousWait && suppliedBaseline != null &&
+                        ReferenceEquals(acceptedProof.Owner, owner) && acceptedProof.Window == window &&
+                        ReferenceEquals(acceptedProof.Baseline, suppliedBaseline), "RECEIVE_ACCEPTED_PROOF_MISMATCH");
                 bool Stopped()
                 {
                     if (guardFailure != null) return true;
@@ -571,7 +594,12 @@ namespace RemoteMonitorMaster
                     }
                     baseline = ready;
                 }
-                var firstCandidate = suppliedBaseline == null ? null : Evaluate(baseline, firstSnapshot, log);
+                ProbeNode Candidate(ProbeSnapshot snapshot)
+                {
+                    return acceptedProof == null ? Evaluate(baseline, snapshot, log) :
+                        ReobserveCandidate(acceptedProof, snapshot, log);
+                }
+                var firstCandidate = suppliedBaseline == null ? null : Candidate(firstSnapshot);
                 inspectSnapshot?.Invoke("BASELINE", firstSnapshot);
                 Alive();
                 if (collectMetadata) Metadata(firstSnapshot, null, "BASELINE");
@@ -589,7 +617,7 @@ namespace RemoteMonitorMaster
                     var current = Capture();
                     polls++;
                     if (plainCommands && previous != null) ValidatePlainHistoryPrefix(previous, current, log, baseline);
-                    var candidate = Evaluate(baseline, current, log);
+                    var candidate = Candidate(current);
                     inspectSnapshot?.Invoke("POLL", current);
                     Alive();
                     log.Write("INFO", "RECEIVE_OBSERVATION", AuditLog.Field("poll", polls), AuditLog.Field("nodes", current.Nodes.Count),
@@ -790,6 +818,34 @@ namespace RemoteMonitorMaster
             var candidate = Evaluate(baseline, first);
             Need(candidate != null && SameCandidate(first, candidate, second, Evaluate(baseline, second)),
                 "COMMAND_SELFTEST_APPEND_AND_REPEAT");
+            var accepted = new ObservationProof(new object(), new IntPtr(first.Process.WindowHandle),
+                new NativeMethods.WindowRectangle(), baseline, first, candidate, second, Evaluate(baseline, second));
+            ProbeSnapshot Reobservation(bool visible = false, bool enabled = true, string text = "help",
+                string runtime = null)
+            {
+                var snapshot = History();
+                var node = AppendTestHistoryText(snapshot, text);
+                node.Visible = visible;
+                node.Enabled = enabled;
+                if (runtime != null) SetTestName(node, text, runtime);
+                return snapshot;
+            }
+            var offscreen = Reobservation();
+            Need(Evaluate(baseline, offscreen) == null &&
+                ReobserveCandidate(accepted, offscreen) == SelectHistory(offscreen).Texts.Last(),
+                "COMMAND_SELFTEST_ACCEPTED_OFFSCREEN_REOBSERVED");
+            foreach (var invalid in new Action<ProbeSnapshot>[] {
+                s => SelectHistory(s).Texts.Last().Enabled = false,
+                s => { var node = SelectHistory(s).Texts.Last(); var row = RowRoot(SelectHistory(s), node); s.Nodes.RemoveAll(n => n.Node == node.Node || n.Node == row.Node); },
+                s => SetTestName(SelectHistory(s).Texts.Last(), "help", "recreated-command-runtime"),
+                s => SetTestName(SelectHistory(s).Texts.Last(), "help "),
+                s => s.RootNameFingerprint = "other chat",
+                s => AppendTestHistorySiblingText(s, SelectHistory(s).Texts.Last(), "not a clock") })
+            {
+                var changed = Reobservation(); invalid(changed); Reject(() => ReobserveCandidate(accepted, changed));
+            }
+            var replacement = Reobservation(text: "pwrsi");
+            Reject(() => ReobserveCandidate(accepted, replacement));
             var future = CreateBaseline(second, "M345678", true);
             Need(Evaluate(future, second) == null, "COMMAND_SELFTEST_CONSUMED_OCCURRENCE");
             var next = History(); AppendTestHistoryText(next, "help"); AppendTestHistoryText(next, "HELP RESPONSE");

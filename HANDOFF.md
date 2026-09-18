@@ -1,4 +1,14 @@
-# Messenger Remote Control v0.3.0 handoff
+# Messenger Remote Control v0.3.1 handoff
+
+## Current update — 2026-09-18, v0.3.1
+
+- The private Win7 SP1 v0.3.0 field log confirms a completed Slave query, nine prepared replies (10,364 characters), and a clean guarded first-part UI send. Before part two, whole-row matching continued to find the same command but the visibility/enabled eligibility check returned no candidate. After 65 seconds, the round stopped with `ROUNDTRIP_REOBSERVATION_FAILED`. The compact log cannot distinguish an offscreen node from a disabled node; no raw message content is needed or published for this diagnosis.
+- Revalidation now permits an already accepted command to be offscreen while fresh snapshots still prove its enabled state, exact body and identity, ancestry, Ready boundary and target conversation. Initial command admission still requires visibility. Missing, replaced, disabled or changed requests still stop sending. No scrolling, old-proof reuse, send retry or history-advance relaxation is introduced.
+- App and installers are v0.3.1; wire protocol remains 0.3.0. Existing Slave v0.3.0 can stay installed; only Master needs this fix. Pairing, settings and checkpoint history remain compatible. The interrupted v0.3.0 report did not reach the checkpoint, so a new request may repeat its first part while including previously unsent content.
+- Regression checks cover nine offscreen reply handoffs with one durable request reservation, initial offscreen admission rejection, disabled/missing/recreated/changed/split-body candidates, ignored subsequent traffic, and existing owner/window/freshness/one-use guards. Non-content logs now include candidate visibility/enabled state and the actual prepared/confirmed/failed reply counts. Independent review found no remaining P1/P2 issue.
+- Local Windows 10 Release builds completed with zero warnings/errors; both actual EXE self-tests, both Inno Setup installer builds and release asset checks passed. Master installer install/same-version repair/uninstall/metadata/shortcut/settings/history-preservation checks also passed; private evidence is in `work/installer-smoke-e49cc494b9a743bbb5146b6f02568611/`. CI and public release verification are pending. Real Win7/Win11 messenger confirmation remains separate; do not restart completed PowerSI or ongoing HFSS tests. See [WIN7-TEST.md](WIN7-TEST.md) for the short multipart/next-query check.
+
+## Previous release — v0.3.0
 
 ## Current update — 2026-09-18, v0.3.0
 

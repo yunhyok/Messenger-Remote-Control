@@ -42,6 +42,9 @@ namespace RemoteMonitorMaster
             var reserved = false;
             var sendStageEntered = false;
             var phase = "REQUEST";
+            var preparedReplyCount = 0;
+            var confirmedReplyCount = 0;
+            var failedPart = 0;
             SupervisedSendTest.Outcome sent = null;
             try
             {
@@ -66,7 +69,8 @@ namespace RemoteMonitorMaster
                 Alive();
                 if (received.Proof == null)
                 {
-                    Result(log, received.Status, received.Reason, false, false);
+                    Result(log, received.Status, received.Reason, false, false, preparedReplyCount,
+                        confirmedReplyCount, failedPart);
                     return new Outcome(received.Message);
                 }
                 Need(received.Status == "CANDIDATE_OBSERVED" && received.Reason == "NONE", "ROUNDTRIP_OBSERVATION_INVALID");
@@ -132,6 +136,7 @@ namespace RemoteMonitorMaster
                     Alive();
                 }
                 var replies = consent.PrepareReplies(); // Status is sampled once; every immutable part is authorized separately below.
+                preparedReplyCount = replies.Length;
                 Alive();
                 if (samplesPcStatus)
                     log.Write("INFO", "PC_STATUS_READY", AuditLog.Field("sampled_after_request", true),
@@ -153,20 +158,25 @@ namespace RemoteMonitorMaster
                     var partConsent = consent.IsPcStatus ? consent.GetPreparedPart(index) : consent;
                     progress("ROUNDTRIP_SENDING:" + partNumber + "/" + replies.Length);
                     Alive();
+                    failedPart = partNumber;
                     sent = SendPrepared(replies[index], partConsent, partNumber, replies.Length);
                     sendMessages.Add("PART " + partNumber + "/" + replies.Length + Environment.NewLine + sent.Message);
                     if (!sent.CleanCompletion)
                     {
-                        Result(log, "SEND_STAGE_FINISHED", "PART_UNCERTAIN_ABORTED", reserved, true, replies.Length);
+                        Result(log, "SEND_STAGE_FINISHED", "PART_UNCERTAIN_ABORTED", reserved, true,
+                            preparedReplyCount, confirmedReplyCount, failedPart);
                         return new Outcome("ROUNDTRIP_SEND_STAGE_FINISHED - Reply sequence stopped after an uncertain part; delivery is NOT verified." +
                             Environment.NewLine + string.Join(Environment.NewLine, sendMessages), sent, false);
                     }
+                    confirmedReplyCount++;
+                    failedPart = 0;
                     if (consent.IsPcStatus) consent.RecordPreparedPartOutcome(index, sent);
                 }
                 var historySaved = !consent.IsPcStatus || consent.CommitPreparedOutput();
                 if (!historySaved) log.Write("WARN", "OUTPUT_HISTORY_NOT_SAVED", AuditLog.Field("reason", consent.OutputHistoryFailure));
                 // RunBound already supplies its action/result details. Never parse that text into a success or delivery claim.
-                Result(log, "SEND_STAGE_FINISHED", "SEE_SUPERVISED_SEND_RESULT", reserved, true, replies.Length);
+                Result(log, "SEND_STAGE_FINISHED", "SEE_SUPERVISED_SEND_RESULT", reserved, true,
+                    preparedReplyCount, confirmedReplyCount, failedPart);
                 return new Outcome("ROUNDTRIP_SEND_STAGE_FINISHED - The approved reply stage has ended; delivery is NOT verified." +
                     (historySaved ? string.Empty : " Output history could not be saved; the next request may repeat content.") +
                     Environment.NewLine + string.Join(Environment.NewLine, sendMessages), sent, true);
@@ -179,7 +189,8 @@ namespace RemoteMonitorMaster
                     if (log != null)
                     {
                         log.WriteException("ROUNDTRIP_FAILED", ex, AuditLog.Field("phase", phase));
-                        Result(log, sendStageEntered ? "UNKNOWN" : "REJECTED", reason, reserved, sendStageEntered);
+                        Result(log, sendStageEntered ? "UNKNOWN" : "REJECTED", reason, reserved, sendStageEntered,
+                            preparedReplyCount, confirmedReplyCount, failedPart);
                     }
                 }
                 catch { }
@@ -213,8 +224,10 @@ namespace RemoteMonitorMaster
             var baseline = ReceiveProbe.CreateBaseline(proof.Baseline.Snapshot, marker,
                 proof.Baseline.PlainCommands, proof.Baseline.ReadyRow);
             Need(baseline.MarkerHash == proof.Baseline.MarkerHash, "ROUNDTRIP_MARKER_MISMATCH");
-            var previous = ReceiveProbe.Evaluate(baseline, proof.Previous, log);
-            var final = ReceiveProbe.Evaluate(baseline, proof.Final, log);
+            var previous = baseline.PlainCommands ? ReceiveProbe.ReobserveCandidate(proof, proof.Previous, log) :
+                ReceiveProbe.Evaluate(baseline, proof.Previous, log);
+            var final = baseline.PlainCommands ? ReceiveProbe.ReobserveCandidate(proof, proof.Final, log) :
+                ReceiveProbe.Evaluate(baseline, proof.Final, log);
             if (baseline.PlainCommands)
             {
                 ReceiveProbe.ValidatePlainHistoryPrefix(proof.Previous, proof.Final, log, baseline);
@@ -222,7 +235,8 @@ namespace RemoteMonitorMaster
             }
             Need(ReferenceEquals(previous, proof.PreviousCandidate) && ReferenceEquals(final, proof.Candidate) &&
                 ReceiveProbe.SameCandidate(proof.Previous, previous, proof.Final, final), "ROUNDTRIP_REPEAT_NOT_PRESENT");
-            var current = ReceiveProbe.Evaluate(baseline, fresh, log);
+            var current = baseline.PlainCommands ? ReceiveProbe.ReobserveCandidate(proof, fresh, log) :
+                ReceiveProbe.Evaluate(baseline, fresh, log);
             Need(ReceiveProbe.SameCandidate(proof.Final, final, fresh, current), "ROUNDTRIP_HANDOFF_CANDIDATE_CHANGED");
             Need(!stop(), "ROUNDTRIP_CANCELLED");
             if (reserveToken)
@@ -253,7 +267,7 @@ namespace RemoteMonitorMaster
             Action<string, ProbeSnapshot> inspectSnapshot)
         {
             var observed = ReceiveProbe.Observe(window, log, marker, stop, ignored => progress("REVALIDATING"), owner, false,
-                inspectSnapshot, original.Baseline, false, true);
+                inspectSnapshot, original.Baseline, false, true, original);
             Need(observed.Status == "CANDIDATE_OBSERVED" && observed.Reason == "NONE" && observed.Proof != null,
                 "ROUNDTRIP_REOBSERVATION_FAILED");
             return SelectRefreshedProof(original, observed.Proof, owner, window);
@@ -276,12 +290,15 @@ namespace RemoteMonitorMaster
             return refreshed;
         }
 
-        private static void Result(AuditLog log, string status, string reason, bool reserved, bool sendStageEntered, int replyCount = 1)
+        private static void Result(AuditLog log, string status, string reason, bool reserved, bool sendStageEntered,
+            int preparedReplyCount, int confirmedReplyCount, int failedPart)
         {
             log.Write("INFO", "ROUNDTRIP_RESULT", AuditLog.Field("status", status), AuditLog.Field("reason", reason),
                 AuditLog.Field("diagnostic_token_reserved", reserved), AuditLog.Field("send_stage_entered", sendStageEntered),
                 AuditLog.Field("reservation_flag_means_confirmed", true), AuditLog.Field("failed_reservation_may_persist", true),
-                AuditLog.Field("prepared_replies", replyCount), AuditLog.Field("plain_body_verified", false),
+                AuditLog.Field("prepared_replies", preparedReplyCount), AuditLog.Field("confirmed_replies", confirmedReplyCount),
+                AuditLog.Field("failed_part", failedPart == 0 ? (object)"NONE" : failedPart),
+                AuditLog.Field("plain_body_verified", false),
                 AuditLog.Field("conversation_identity_verified", false), AuditLog.Field("delivery_verified", false),
                 AuditLog.Field("automatic_send_allowed", false));
         }
@@ -374,20 +391,34 @@ namespace RemoteMonitorMaster
             var owner = new object();
             var initial = ReceiveProbe.CreateBaseline(ReceiveProbe.CreateTestSnapshot(), marker, true);
             var window = new IntPtr(initial.Snapshot.Process.WindowHandle);
-            ProbeSnapshot History(int extras)
+            ProbeSnapshot History(int extras, bool candidateVisible = true, bool candidateEnabled = true)
             {
                 var snapshot = ReceiveProbe.CreateTestSnapshot();
                 ReceiveProbe.AppendTestHistoryText(snapshot, SupervisedSendTest.ReadyText("D345678"));
-                ReceiveProbe.AppendTestHistoryText(snapshot, "pwrsi");
+                var candidate = ReceiveProbe.AppendTestHistoryText(snapshot, "pwrsi");
+                candidate.Visible = candidateVisible;
+                candidate.Enabled = candidateEnabled;
                 for (var i = 0; i < extras; i++) ReceiveProbe.AppendTestHistoryText(snapshot, i % 2 == 0 ? "help" : "general message");
                 return snapshot;
             }
             var baseline = ReceiveProbe.BindReadyBoundary(initial, History(0));
-            ReceiveProbe.ObservationProof Proof(int extras, TimeSpan? age = null)
+            ReceiveProbe.ObservationProof Accepted()
             {
-                var previous = History(extras); var final = History(extras);
+                var previous = History(0); var final = History(0);
                 return new ReceiveProbe.ObservationProof(owner, window, new NativeMethods.WindowRectangle(), baseline,
-                    previous, ReceiveProbe.Evaluate(baseline, previous), final, ReceiveProbe.Evaluate(baseline, final), age);
+                    previous, ReceiveProbe.Evaluate(baseline, previous), final, ReceiveProbe.Evaluate(baseline, final));
+            }
+            ReceiveProbe.ObservationProof Proof(int extras, TimeSpan? age = null, bool candidateVisible = true,
+                bool candidateEnabled = true)
+            {
+                var previous = History(extras, candidateVisible, candidateEnabled);
+                var final = History(extras, candidateVisible, candidateEnabled);
+                var accepted = candidateVisible ? null : Accepted();
+                return new ReceiveProbe.ObservationProof(owner, window, new NativeMethods.WindowRectangle(), baseline,
+                    previous, candidateVisible ? ReceiveProbe.Evaluate(baseline, previous) :
+                        ReceiveProbe.ReobserveCandidate(accepted, previous),
+                    final, candidateVisible ? ReceiveProbe.Evaluate(baseline, final) :
+                        ReceiveProbe.ReobserveCandidate(accepted, final), age);
             }
             void Reject(Action action)
             {
@@ -404,9 +435,15 @@ namespace RemoteMonitorMaster
                 AuthorizeHandoffCore(busyProof, owner, window, marker, History(2), path, () => false, true);
                 Need(busyProof.DiagnosticTokenReserved, "OPERATING_BUSY_RESERVED_ONCE");
                 Reject(() => AuthorizeHandoffCore(busyProof, owner, window, marker, History(2), path, () => false, true));
-                var refreshed = SelectRefreshedProof(busyProof, Proof(3), owner, window);
-                AuthorizeHandoffCore(refreshed, owner, window, marker, History(4), path, () => false, false);
-                Need(File.ReadAllLines(path).Length == 1, "OPERATING_REPLY_REUSES_RESERVATION");
+                for (var part = 1; part <= 9; part++)
+                {
+                    var refreshed = SelectRefreshedProof(busyProof, Proof(part + 2, candidateVisible: false), owner, window);
+                    AuthorizeHandoffCore(refreshed, owner, window, marker,
+                        History(part + 3, candidateVisible: false), path, () => false, false);
+                }
+                Need(File.ReadAllLines(path).Length == 1, "OPERATING_NINE_OFFSCREEN_PARTS_REUSE_RESERVATION");
+                Reject(() => AuthorizeHandoffCore(Proof(3, candidateEnabled: false), owner, window, marker,
+                    History(4, candidateEnabled: false), path, () => false, false));
                 var changed = Proof(3);
                 ReceiveProbe.SetTestName(changed.Candidate, "help");
                 Reject(() => SelectRefreshedProof(busyProof, changed, owner, window));

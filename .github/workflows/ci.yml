@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: 'New stable release tag matching the source version, e.g. v0.3.0'
+        description: 'New stable release tag matching the source version, e.g. v0.3.1'
         required: true
         type: string
 
@@ -117,11 +117,11 @@ jobs:
             '',
             'Commands: help, total status, pwrsi. Pending targets return only their name, PID and Pending. The first acquired Output for each Slave certificate/session/PID/start-time/source-family identity is sent in full; later queries send only newly appended Output. Each multipart message is at most 1,400 characters.',
             '',
-            'v0.3.0 requires both Master and Slave because the protocol is 0.3.0; pairing and settings are preserved. Unchanged Output explicitly reports no additional Output, not proof that calculation stopped. A cleared log or changed prefix sends the current full Output marked reset/change; rolling OCR conservatively resends its current full viewport when its prefix changes. The existing 8 Mi-character per-text acquisition ceiling and 32 Mi-character batch/prepared-message ceilings produce explicit failures, never clipping. Screenshots and rejected raw model responses stay on Slave.',
+            'v0.3.1 fixes multipart reply revalidation when an already accepted command scrolls offscreen. The exact message, enabled state, conversation and target are still checked in fresh snapshots; new commands still require visibility. Upgrade Master to v0.3.1; existing Slave v0.3.0 remains compatible with protocol 0.3.0. Pairing, settings and output history are preserved. History advances only after all parts complete their guarded UI send; interrupted reports may repeat earlier parts on the next request without omitting unsent text.',
             '',
             "Download the installer for each role; portable ZIPs are optional. The Master installer embeds Microsoft .NET Framework 4.8. See [installation and operation](https://github.com/$env:GITHUB_REPOSITORY/blob/$env:RELEASE_TAG/INSTALL.md) and SHA256SUMS.txt.",
             '',
-            'v0.3.0 verification results are recorded in HANDOFF.md. Actual Win7 SP1 Master, Win11 Slave, a clean offline PC missing .NET 4.8 and the real messenger/PowerSI mobile path remain field-unverified until recorded there. Existing HFSS and completed PowerSI tests are not restarted.'
+            'Build, EXE self-test and installer verification results are recorded in HANDOFF.md. The v0.3.1 fix still needs a short real Win7 messenger check; CI does not substitute for actual Win7/Win11 or a clean offline PC missing .NET 4.8. Existing HFSS and completed PowerSI tests are not restarted.'
           )
           $notes | Set-Content -LiteralPath release-notes.md -Encoding UTF8
           gh release create $env:RELEASE_TAG --verify-tag --latest --target $env:GITHUB_SHA --title "Messenger Remote Control $env:RELEASE_TAG" --notes-file release-notes.md @files
