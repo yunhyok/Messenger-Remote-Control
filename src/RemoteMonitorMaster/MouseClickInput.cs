@@ -116,6 +116,18 @@ namespace RemoteMonitorMaster
             CheckIdleInput(expectedRoot, thread, hitThread);
         }
 
+        // Read-only: operational activation uses this without requiring the pointer to be over its target.
+        internal static bool IsForegroundInputQuiet()
+        {
+            var foreground = NativeMethods.GetForegroundWindow();
+            uint pid;
+            var thread = NativeMethods.GetWindowThreadProcessId(foreground, out pid);
+            if (foreground == IntPtr.Zero || thread == 0 || pid == 0) return false;
+            var info = new GuiThreadInfo { Size = (uint)Marshal.SizeOf(typeof(GuiThreadInfo)) };
+            return GetGUIThreadInfo(thread, ref info) && info.Active == foreground && info.Capture == IntPtr.Zero &&
+                info.MenuOwner == IntPtr.Zero && info.MoveSize == IntPtr.Zero && (info.Flags & 0x1E) == 0;
+        }
+
         private static void CheckIdleInput(IntPtr expectedRoot, uint thread, uint hitThread)
         {
             void CheckGui(uint targetThread, bool requireActive)

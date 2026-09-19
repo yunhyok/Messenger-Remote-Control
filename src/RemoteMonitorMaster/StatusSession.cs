@@ -94,11 +94,16 @@ namespace RemoteMonitorMaster
                 Need(log != null && stop != null && progress != null, "STATUS_REQUEST_INVALID");
                 Need(Thread.CurrentThread.GetApartmentState() == ApartmentState.MTA, "PROBE_REQUIRES_MTA");
                 var process = ProcessIdentity.Capture(window);
+                Need(string.Equals(process.ProcessName, "KI-Messenger", StringComparison.OrdinalIgnoreCase),
+                    "PROBE_NOT_KI_MESSENGER");
                 NativeMethods.WindowRectangle bounds;
                 Need(NativeMethods.GetWindowRect(window, out bounds), "STATUS_WINDOW_UNAVAILABLE");
+                var target = plainCommands ? new OperationalTarget(window, process, bounds,
+                    () => Cancelled || stop(), phase => progress(CompletedRounds, phase, firstMarker), log) : null;
                 bool Stopped()
                 {
                     if (Cancelled || stop()) { Cancel(); return true; }
+                    if (target != null) { target.Check(); return false; }
                     uint pid;
                     NativeMethods.WindowRectangle current;
                     Need(window != IntPtr.Zero && NativeMethods.IsWindow(window) &&
@@ -123,6 +128,7 @@ namespace RemoteMonitorMaster
                     Volatile.Write(ref activeNotice, notice);
                     Alive();
                     progress(CompletedRounds, "NOTICE_READY", requestMarker);
+                    target?.PrepareSend();
                     var result = SupervisedSendTest.RunBoundObserved(window, log, notice.NoticeText,
                         new System.Windows.Point(), notice, Stopped, snapshot =>
                         {
@@ -149,6 +155,7 @@ namespace RemoteMonitorMaster
                 log.Write("INFO", "STATUS_SESSION_BEGIN", AuditLog.Field("slave_status", slave != null),
                     AuditLog.Field("plain_commands", plainCommands),
                     AuditLog.Field("idle_timeout", "NONE"), AuditLog.Field("per_request_replies", plainCommands ? "BOUNDED_PREPARED_PARTS" : "ONE"),
+                    AuditLog.Field("background_receive", target != null), AuditLog.Field("on_demand_activation", target != null),
                     AuditLog.Field("next_format", plainCommands ? "NONE" : "DIGITS_ONLY"), AuditLog.Field("compact_receive_log", true));
                 if (plainCommands) SendReady(marker);
                 while (true)
@@ -178,7 +185,7 @@ namespace RemoteMonitorMaster
                                 RequireReplyAbsent(snapshot, nextMarker);
                             }
                             Alive();
-                        }, baseline, true);
+                        }, baseline, true, target);
                     last = outcome.Message;
                     if (!FinishRequest(consent, outcome, nextBaseline))
                         throw new MonitorException("STATUS_REQUEST_STOPPED", "No next request will run.");

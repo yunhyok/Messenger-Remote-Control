@@ -540,6 +540,7 @@ namespace RemoteMonitorMaster
                 SupervisedSendTest.RunSelfTest();
                 MouseClickInput.RunSelfTest();
                 ReceiveMetadata.RunSelfTest();
+                OperationalTarget.RunSelfTest();
                 ReceiveProbe.RunSelfTest();
                 RoundTripTest.RunSelfTest(directory);
                 RoundTripSession.RunSelfTest(directory);

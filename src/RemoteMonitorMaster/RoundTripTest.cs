@@ -36,7 +36,7 @@ namespace RemoteMonitorMaster
 
         internal static Outcome ObserveWithStatePath(IntPtr window, AuditLog log, string incomingMarker, SupervisedSendTest.Consent consent,
             Func<bool> stop, Action<string> progress, string statePath, Action<string, ProbeSnapshot> inspectSnapshot,
-            ReceiveProbe.Baseline baseline = null, bool continuousWait = false)
+            ReceiveProbe.Baseline baseline = null, bool continuousWait = false, OperationalTarget target = null)
         {
             var owner = new object();
             var reserved = false;
@@ -65,7 +65,7 @@ namespace RemoteMonitorMaster
                     AuditLog.Field("plain_body_verified", false), AuditLog.Field("automatic_send_allowed", false));
                 phase = "RECEIVE";
                 var received = ReceiveProbe.Observe(window, log, incomingMarker, Stopped, progress, owner, false,
-                    inspectSnapshot, baseline, continuousWait, consent.IsPlainCommands);
+                    inspectSnapshot, baseline, continuousWait, consent.IsPlainCommands, target: target);
                 Alive();
                 if (received.Proof == null)
                 {
@@ -90,8 +90,10 @@ namespace RemoteMonitorMaster
                 SupervisedSendTest.Outcome SendPrepared(string payload, SupervisedSendTest.Consent partConsent, int partNumber, int partCount)
                 {
                     Alive();
+                    target?.PrepareSend(); // Bring back only the selected chat, before either fresh reply observation.
+                    Alive();
                     var single = consent.IsPlainCommands &&
-                        !(partNumber == 0 && received.Proof.Elapsed < TimeSpan.FromSeconds(5))
+                        !(target == null && partNumber == 0 && received.Proof.Elapsed < TimeSpan.FromSeconds(5))
                         ? RefreshObservation(received.Proof, owner, window, incomingMarker, Stopped, progress, log, inspectSnapshot)
                         : null;
                     var sendProof = received.Proof;
@@ -234,8 +236,8 @@ namespace RemoteMonitorMaster
                 ReceiveProbe.Evaluate(baseline, proof.Final, log);
             if (baseline.PlainCommands)
             {
-                ReceiveProbe.ValidatePlainHistoryPrefix(proof.Previous, proof.Final, log, baseline);
-                ReceiveProbe.ValidatePlainHistoryPrefix(proof.Final, fresh, log, baseline);
+                ReceiveProbe.ValidatePlainHistoryPrefix(proof.Previous, proof.Final, log, baseline, acceptedRequest: true);
+                ReceiveProbe.ValidatePlainHistoryPrefix(proof.Final, fresh, log, baseline, acceptedRequest: true);
             }
             Need(ReferenceEquals(previous, proof.PreviousCandidate) && ReferenceEquals(final, proof.Candidate) &&
                 ReceiveProbe.SameCandidate(proof.Previous, previous, proof.Final, final), "ROUNDTRIP_REPEAT_NOT_PRESENT");
@@ -274,7 +276,7 @@ namespace RemoteMonitorMaster
                 inspectSnapshot, original.Baseline, false, true, original, singleRefresh: true);
             Need(observed.Status == "CANDIDATE_REOBSERVED_ONCE" && observed.Reason == "NONE" &&
                 observed.Proof == null && observed.Single != null,
-                "ROUNDTRIP_REOBSERVATION_FAILED");
+                "ROUNDTRIP_REOBSERVATION_FAILED_" + observed.Reason);
             return observed.Single;
         }
 
@@ -314,8 +316,8 @@ namespace RemoteMonitorMaster
                 refreshed.Elapsed < TimeSpan.FromSeconds(15), "ROUNDTRIP_PROOF_EXPIRED_OR_WINDOW_CHANGED");
             Need(original.Baseline != null && original.Baseline.PlainCommands &&
                 ReferenceEquals(original.Baseline, refreshed.Baseline), "ROUNDTRIP_PROOF_INCOMPLETE");
-            ReceiveProbe.ValidatePlainHistoryPrefix(original.Final, refreshed.Previous, baseline: original.Baseline);
-            ReceiveProbe.ValidatePlainHistoryPrefix(refreshed.Previous, refreshed.Final, baseline: original.Baseline);
+            ReceiveProbe.ValidatePlainHistoryPrefix(original.Final, refreshed.Previous, baseline: original.Baseline, acceptedRequest: true);
+            ReceiveProbe.ValidatePlainHistoryPrefix(refreshed.Previous, refreshed.Final, baseline: original.Baseline, acceptedRequest: true);
             Need(ReceiveProbe.SameCandidate(original.Final, original.Candidate, refreshed.Previous, refreshed.PreviousCandidate) &&
                 ReceiveProbe.SameCandidate(original.Final, original.Candidate, refreshed.Final, refreshed.Candidate),
                 "ROUNDTRIP_REOBSERVATION_CHANGED");
@@ -497,8 +499,9 @@ namespace RemoteMonitorMaster
                     s => ReceiveProbe.SetTestName(s.Nodes.Single(n => n.PlainCommand == "pwrsi"), "help"),
                     s => ReceiveProbe.SetTestName(s.Nodes.Single(n => n.PlainCommand == "pwrsi"), "pwrsi", "replaced-runtime"),
                     s => s.Nodes.Remove(s.Nodes.Single(n => n.PlainCommand == "pwrsi")),
-                    s => ReceiveProbe.SetTestName(s.Nodes.Single(n => n.ReadyNoticeHash ==
-                        TokenStore.Hash(SupervisedSendTest.ReadyText("D345678"))), "changed Ready") })
+                    s => ReceiveProbe.SetTestName(s.Nodes.Single(n => n.Node ==
+                        s.Nodes.Single(text => text.ReadyNoticeHash == TokenStore.Hash(SupervisedSendTest.ReadyText("D345678"))).Parent),
+                        "", "recreated-ready-row") })
                 {
                     var first = Single(accepted, 1);
                     mutate(first.Snapshot);
@@ -516,10 +519,24 @@ namespace RemoteMonitorMaster
                 AuthorizeHandoffCore(busyProof, owner, window, marker, History(2), path, () => false, true);
                 Need(busyProof.DiagnosticTokenReserved, "OPERATING_BUSY_RESERVED_ONCE");
                 Reject(() => AuthorizeHandoffCore(busyProof, owner, window, marker, History(2), path, () => false, true));
-                for (var part = 1; part <= 9; part++)
+                for (var part = 1; part <= 10; part++)
                 {
                     var first = Single(busyProof, part + 2);
                     var second = History(part + 3, candidateVisible: false);
+                    // The first six parts succeed; later snapshots refresh historical Ready display evidence.
+                    if (part >= 7)
+                    {
+                        foreach (var snapshot in new[] { first.Snapshot, second })
+                        {
+                            var ready = snapshot.Nodes.Single(n => n.ReadyNoticeHash ==
+                                TokenStore.Hash(SupervisedSendTest.ReadyText("D345678")));
+                            if (part == 7) ReceiveProbe.SetTestName(ready, "refreshed Ready display");
+                            else if (part == 8) ReceiveProbe.SetTestName(ready, "");
+                            else if (part == 9) ready.ReadyNoticeHash = ready.ReadyNoticeSourceHash = null;
+                            else ReceiveProbe.AppendTestHistorySiblingText(snapshot, ready, "display metadata");
+                            Reject(() => ReceiveProbe.Evaluate(baseline, snapshot)); // New admission stays strict.
+                        }
+                    }
                     var refreshed = Complete(busyProof, first, second);
                     Need(ReferenceEquals(refreshed.Previous, first.Snapshot) && ReferenceEquals(refreshed.Final, second) &&
                         !ReferenceEquals(refreshed.Previous, refreshed.Final), "OPERATING_TWO_DISTINCT_FRESH_OBSERVATIONS");
@@ -527,7 +544,7 @@ namespace RemoteMonitorMaster
                     AuthorizeHandoffCore(refreshed, owner, window, marker, second, path, () => false, false);
                     Reject(() => AuthorizeHandoffCore(refreshed, owner, window, marker, second, path, () => false, false));
                 }
-                Need(File.ReadAllLines(path).Length == 1, "OPERATING_NINE_OFFSCREEN_PARTS_REUSE_RESERVATION");
+                Need(File.ReadAllLines(path).Length == 1, "OPERATING_TEN_PARTS_READY_REFRESH_REUSE_RESERVATION");
                 Reject(() => AuthorizeHandoffCore(Proof(3, candidateEnabled: false), owner, window, marker,
                     History(4, candidateEnabled: false), path, () => false, false));
                 var changed = Proof(3);

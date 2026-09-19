@@ -239,7 +239,8 @@ namespace RemoteMonitorMaster
                         var hasCommandGuide = false;
                         if (!commands.Text.Contains("COMMANDS") || !commands.Text.Contains("REPEAT UNTIL STOP") ||
                             !(bool)Field("plainCommands") || !approval.Text.Contains("help pwrsi") ||
-                            !approval.Text.Contains("ASCII") || !approval.Text.Contains("본문 인증") ||
+                            !approval.Text.Contains("ASCII") || !approval.Text.Contains("대화창 활성화") ||
+                            !approval.Text.Contains("최소화 복원") ||
                             !((TextBox)Field("details")).Text.Contains("모든 대상") ||
                             !((TextBox)Field("details")).Text.Contains("PART") || commandCode.Text != "WAIT")
                             throw new InvalidOperationException("Plain command operating consent/title was not explicit.");
@@ -267,6 +268,15 @@ namespace RemoteMonitorMaster
                         if (!commandNotice.Text.Contains("고정 명령어")) throw new InvalidOperationException("Plain command reply notice was not visible.");
                         if (!commandDetails.Text.Contains("허용 고정 명령어") || !commandDetails.Text.Contains("total status"))
                             throw new InvalidOperationException("Plain command READY guide was not explicit.");
+                        foreach (var phase in new[] { "WAITING_FOR_PC_IDLE", "RESTORING_TARGET", "ACTIVATING_TARGET" })
+                        {
+                            Call("ApplyOperatingProgress", 0, phase, "M234567", generation);
+                            if (commandCode.Text != "WAIT" || !commandNotice.Text.Contains("다른 대화창"))
+                                throw new InvalidOperationException("Target preparation must remain visibly waiting.");
+                        }
+                        Call("ApplyOperatingProgress", 0, "READY_TO_RECEIVE", "M234567", generation);
+                        if (commandCode.Text != "READY" || !commandNotice.Text.Contains("마우스 오버 불필요"))
+                            throw new InvalidOperationException("Background receive did not return to Ready.");
                         Call("ApplyOperatingProgress", 0, "COMMAND_NOT_MATCHED", "M234567", generation);
                         if (commandCode.Text != "READY" || !commandStatus.Text.Contains("지원 명령과 불일치") ||
                             !commandNotice.Text.Contains("앞뒤 공백은 허용"))

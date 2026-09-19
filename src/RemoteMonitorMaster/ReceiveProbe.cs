@@ -221,7 +221,7 @@ namespace RemoteMonitorMaster
             var selected = ValidateContinuity(baseline, current);
             if (baseline.PlainCommands)
             {
-                ValidatePlainHistoryPrefix(baseline.Snapshot, current, log, baseline);
+                ValidatePlainHistoryPrefix(baseline.Snapshot, current, log, baseline, acceptedRequest: !requireVisible);
                 // A request is one complete new message row. After removing one validated clock sibling,
                 // split reply/LLM Text nodes and command fragments can never become a request.
                 var rows = HistoryRows(selected);
@@ -269,16 +269,18 @@ namespace RemoteMonitorMaster
         }
 
         internal static void ValidatePlainHistoryPrefix(ProbeSnapshot previous, ProbeSnapshot current, AuditLog log = null,
-            Baseline baseline = null)
+            Baseline baseline = null, bool acceptedRequest = false)
         {
             var before = SelectHistory(previous);
             var after = SelectHistory(current);
             if (baseline != null && baseline.ReadyRow >= 0)
             {
-                Need(IsReadyRow(before, baseline.Marker, baseline.ReadyRow) &&
-                    IsReadyRow(after, baseline.Marker, baseline.ReadyRow), "RECEIVE_READY_BOUNDARY_CHANGED");
-                // Keep Ready and the first request exact; later traffic is ignored until the next Ready.
-                RequireHistoryPrefix(before, after, log, baseline.ReadyRow,
+                if (!acceptedRequest)
+                    Need(IsReadyRow(before, baseline.Marker, baseline.ReadyRow) &&
+                        IsReadyRow(after, baseline.Marker, baseline.ReadyRow), "RECEIVE_READY_BOUNDARY_CHANGED");
+                // After admission, Ready's display body is historical. Its row identity/order still stays exact,
+                // and ReobserveCandidate binds every current whole-message result to the accepted command.
+                RequireHistoryPrefix(before, after, log, baseline.ReadyRow + (acceptedRequest ? 1 : 0),
                     FirstCommandRow(HistoryRows(before), baseline.ReadyRow + 1));
             }
             else RequireHistoryPrefix(before, after, log);
@@ -452,7 +454,7 @@ namespace RemoteMonitorMaster
         internal static ObservationResult Observe(IntPtr window, AuditLog log, string marker, Func<bool> stop,
             Action<string> progress, object owner, bool collectMetadata, Action<string, ProbeSnapshot> inspectSnapshot = null,
             Baseline suppliedBaseline = null, bool continuousWait = false, bool plainCommands = false,
-            ObservationProof acceptedProof = null, bool singleRefresh = false)
+            ObservationProof acceptedProof = null, bool singleRefresh = false, OperationalTarget target = null)
         {
             var overall = Stopwatch.StartNew();
             var phaseClock = Stopwatch.StartNew();
@@ -472,6 +474,8 @@ namespace RemoteMonitorMaster
                         ReferenceEquals(acceptedProof.Owner, owner) && acceptedProof.Window == window &&
                         ReferenceEquals(acceptedProof.Baseline, suppliedBaseline), "RECEIVE_ACCEPTED_PROOF_MISMATCH");
                 Need(!singleRefresh || (acceptedProof != null && !collectMetadata), "RECEIVE_SINGLE_OBSERVATION_INVALID");
+                Need(target == null || (plainCommands && continuousWait && !collectMetadata && acceptedProof == null),
+                    "RECEIVE_BACKGROUND_SCOPE_INVALID");
                 bool Stopped()
                 {
                     if (guardFailure != null) return true;
@@ -480,15 +484,16 @@ namespace RemoteMonitorMaster
                     else if (!continuousWait && receiving != null && receiving.IsRunning && receiving.Elapsed >= TimeSpan.FromSeconds(60))
                         guardFailure = "RECEIVE_WAIT_TIME_LIMIT";
                     else if (window == IntPtr.Zero || !NativeMethods.IsWindow(window)) guardFailure = "RECEIVE_NO_TARGET";
-                    else if (NativeMethods.GetForegroundWindow() != window) guardFailure = "RECEIVE_FOREGROUND_CHANGED";
+                    else if (target == null && NativeMethods.GetForegroundWindow() != window) guardFailure = "RECEIVE_FOREGROUND_CHANGED";
                     else if (process != null)
                     {
                         uint pid;
                         NativeMethods.WindowRectangle current;
                         if (NativeMethods.GetWindowThreadProcessId(window, out pid) == 0 || pid != process.ProcessId) guardFailure = "RECEIVE_PROCESS_CHANGED";
-                        else if (bounds.HasValue && (!NativeMethods.GetWindowRect(window, out current) || !current.Equals(bounds.Value)))
+                        else if (target == null && bounds.HasValue && (!NativeMethods.GetWindowRect(window, out current) || !current.Equals(bounds.Value)))
                             guardFailure = "RECEIVE_WINDOW_MOVED";
                     }
+                    if (guardFailure == null) target?.Check();
                     return guardFailure != null;
                 }
                 void Alive() { Need(!Stopped(), guardFailure); }
@@ -600,6 +605,8 @@ namespace RemoteMonitorMaster
                         AuditLog.Field("truncated", availableNodes.Count > 64), AuditLog.Field("partial", partial),
                         AuditLog.Field("limit", 64), AuditLog.Field("plain_body_verified", false));
                 }
+                target?.PrepareRead();
+                phaseClock.Restart();
                 Alive();
                 process = ProcessIdentity.Capture(window);
                 Alive();
@@ -639,7 +646,7 @@ namespace RemoteMonitorMaster
                 if (singleRefresh)
                 {
                     Need(firstCandidate != null, "RECEIVE_ACCEPTED_CANDIDATE_CHANGED");
-                    ValidatePlainHistoryPrefix(acceptedProof.Final, firstSnapshot, log, baseline);
+                    ValidatePlainHistoryPrefix(acceptedProof.Final, firstSnapshot, log, baseline, acceptedRequest: true);
                     Alive();
                     Result(log, "CANDIDATE_REOBSERVED_ONCE", "NONE", polls);
                     return new ObservationResult("CANDIDATE_REOBSERVED_ONCE", "NONE",
@@ -655,10 +662,12 @@ namespace RemoteMonitorMaster
                 {
                     phaseClock.Restart(); // The inter-snapshot wait is not charged to the preceding snapshot's 15-second cap.
                     for (var i = 0; i < (baseline.ReadyRow >= 0 ? 2 : 10); i++) { Alive(); Thread.Sleep(100); }
+                    target?.PrepareRead();
                     SetPhase("POLLING");
                     var current = Capture();
                     polls++;
-                    if (plainCommands && previous != null) ValidatePlainHistoryPrefix(previous, current, log, baseline);
+                    if (plainCommands && previous != null)
+                        ValidatePlainHistoryPrefix(previous, current, log, baseline, acceptedRequest: acceptedProof != null);
                     var candidate = Candidate(current);
                     inspectSnapshot?.Invoke("POLL", current);
                     Alive();
@@ -687,6 +696,7 @@ namespace RemoteMonitorMaster
                         baseline.ReadyRow + 1 : HistoryRows(baseline.Selection).Count)
                         .SelectMany(RowContent).Any(n => Usable(n) && n.Identity.NameLength <= 64 && n.PlainCommand == null))
                         progress("COMMAND_NOT_MATCHED");
+                    else if (target != null) progress("READY_TO_RECEIVE");
                 }
             }
             catch (Exception ex)
@@ -1166,7 +1176,7 @@ namespace RemoteMonitorMaster
             return node;
         }
 
-        private static ProbeNode AppendTestHistorySiblingText(ProbeSnapshot snapshot, ProbeNode primary, string text)
+        internal static ProbeNode AppendTestHistorySiblingText(ProbeSnapshot snapshot, ProbeNode primary, string text)
         {
             var number = snapshot.Nodes.Max(n => n.Node) + 1;
             var node = new ProbeNode { Node = number, Parent = primary.Parent, Document = primary.Document,

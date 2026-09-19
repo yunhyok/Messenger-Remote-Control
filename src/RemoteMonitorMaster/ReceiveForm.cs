@@ -92,7 +92,7 @@ namespace RemoteMonitorMaster
                     ? "1. PC 메신저에는 아무것도 입력하지 않습니다. 개별 자기 대화창의 입력란을 비워 두세요.\r\n" +
                         "2. 확인란 → Start (5s) → 5초 안에 KI 제목 표시줄을 클릭합니다. 초록색 READY를 기다리세요.\r\n" +
                         (operating ? (plainCommands
-                            ? "3. READY 뒤 소문자 고정 명령어를 휴대폰에서 한 번 전송합니다. 각 답장을 확인한 뒤 다음 명령을 보내며, Stop 후 LOG READY에서 로그를 첨부합니다."
+                            ? "3. READY 뒤 휴대폰에서 명령을 보냅니다. 마우스 오버는 불필요하며 대화창이 뒤에 있어도 대기합니다. 발송할 때 선택한 창을 앞으로 가져옵니다."
                             : "3. 첫 READY의 M을 휴대폰에서 한 번 전송합니다. 이후 답장 NEXT 숫자 앞에 M을 붙여 Stop 전까지 반복하며, LOG READY 후 로그를 첨부합니다.")
                             : pcStatus ? "3. READY에서 휴대폰으로 M코드 한 번 전송 → " + ReportPrefix + " 답장 확인 → LOG READY에서 로그 첨부로 끝납니다."
                             : "3. READY 1/2에서 M 전송 → D 확인 → READY 2/2에서 새 M 전송 → 두 번째 D 확인으로 끝납니다.")
@@ -138,7 +138,7 @@ namespace RemoteMonitorMaster
                 ? (plainCommands
                     ? "본인의 개별 자기 대화창입니다. Slave " + slave.Address + ":" + slave.Port + "의 고정 읽기 전용 명령어 상태 답장을 Stop 전까지 전송하는 것을 승인합니다.\r\n" +
                         "허용 명령: help / help help / help total status / help pwrsi / total status / pwrsi (소문자, 단어 사이는 ASCII 공백 한 칸).\r\n" +
-                        "메시지 본문 인증을 주장하지 않으며 목록 밖의 명령은 승인하거나 실행하지 않습니다. 각 답장 부분마다 커서 이동·입력·클릭은 1회입니다."
+                        "발송 시 선택한 대화창 활성화·최소화 복원을 허용합니다. 각 답장 부분마다 커서 이동·입력·클릭은 1회이며, 목록 밖 명령은 실행하지 않습니다."
                     : "본인의 개별 자기 대화창입니다. " + (slave == null ? "이 PC" : "Slave " + slave.Address + ":" + slave.Port) + "의 읽기 전용 상태 답장을 Stop 전까지 반복 전송하는 것을 승인합니다.\r\n" +
                         StatusFields + " 커서 이동·입력·클릭은 각 1회입니다.\r\n" +
                         "첫 READY의 M만 보내고 이후에는 답장 NEXT 숫자 앞에 M을 붙여 보냅니다. Stop 후 LOG READY까지 마우스·키보드를 건드리지 않습니다.")
@@ -323,7 +323,8 @@ namespace RemoteMonitorMaster
                     : "5초 안에 KI 제목 표시줄을 클릭하세요. 첫 READY 전에는 보내지 마세요.")
                     : "5초 안에 KI 제목 표시줄을 클릭하세요. 휴대폰 전송은 아직 하지 마세요.") :
                     "5 SECONDS - activate the KI chat; do not send from the phone yet", false);
-                SetInteractionNotice("KI 창 선택 후에는 마스터 LOG READY까지 PC 조작을 멈춰 주세요.");
+                SetInteractionNotice(plainCommands ? "처음에 대화창을 한 번 선택하세요. READY 뒤 마우스 오버·앞면 유지는 필요 없습니다." :
+                    "KI 창 선택 후에는 마스터 LOG READY까지 PC 조작을 멈춰 주세요.");
                 if (stopped || EnvironmentChanged(approvedEnvironmentRevision)) { Stop("ENVIRONMENT_CHANGED - " + environmentReason); return; }
                 countdown.Start();
             }
@@ -512,7 +513,15 @@ namespace RemoteMonitorMaster
             activeRound = round;
             var completed = CompletedRoundCount;
             var count = "완료 " + completed + "회 / 명령 " + (round + 1) + "회";
-            if (phase == "NOTICE_READY" || phase == "NOTICE_BUSY")
+            if (phase == "WAITING_FOR_PC_IDLE" || phase == "ACTIVATING_TARGET" || phase == "RESTORING_TARGET")
+            {
+                code.Text = "WAIT";
+                SetStatus(phase == "WAITING_FOR_PC_IDLE" ? "PC 입력이 끝나기를 기다리고 있습니다. 요청은 유지됩니다." :
+                    phase == "RESTORING_TARGET" ? "처음 선택한 대화창의 최소화를 복원하고 있습니다." :
+                    "답장을 위해 처음 선택한 대화창을 앞으로 가져옵니다.", false);
+                SetInteractionNotice("다른 대화창으로 대상을 바꾸지 않습니다. 실제 전송 중에는 잠시 PC 입력을 멈춰 주세요.");
+            }
+            else if (phase == "NOTICE_READY" || phase == "NOTICE_BUSY")
             {
                 code.Text = "WAIT";
                 SetStatus(phase == "NOTICE_READY" ? "메신저로 Master Ready 안내를 보내는 중입니다." :
@@ -534,9 +543,10 @@ namespace RemoteMonitorMaster
             {
                 code.Text = "READY";
                 SetStatus("READY — " + count + " / 휴대폰에서 소문자 명령어 하나 (pwrsi에는 공백 불필요)", true);
-                SetInteractionNotice("휴대폰에서 고정 명령어 한 번 / 종료하려면 Stop");
+                SetInteractionNotice("다른 창 뒤에서도 고정 명령어 수신 대기 / 마우스 오버 불필요 / Stop으로 종료");
                 details.Text = "허용 고정 명령어: help / help help / help total status / help pwrsi / total status / pwrsi\r\n" +
                     "메신저의 Master Ready 이후 첫 명령 하나를 처리합니다. 처리 중 추가 메시지는 대기열에 넣지 않고 무시하므로 다음 Master Ready 뒤에 새 명령을 보내세요.\r\n" +
+                    "처음 선택한 대화창을 기억합니다. 다른 창 뒤에서는 그대로 읽고, 발송할 때 앞으로 가져옵니다. 최소화된 창은 복원합니다. PC 입력 중이면 잠시 기다립니다.\r\n" +
                     "total status는 Slave 프로그램 상태를 표시합니다. pwrsi는 모든 PowerSI 대상의 요청 시점 증거를 1,400자 이하 PART로 순서대로 보냅니다.\r\n" +
                     "Pending은 이름·PID·Pending만 표시하며 진행률·완료를 추측하지 않습니다. Stop 뒤 현재 호출이 끝나야 LOG READY가 표시됩니다.";
             }
