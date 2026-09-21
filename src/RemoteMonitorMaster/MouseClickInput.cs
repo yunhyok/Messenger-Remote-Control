@@ -45,9 +45,48 @@ namespace RemoteMonitorMaster
             public int Left, Top, Right, Bottom;
         }
 
+        [StructLayout(LayoutKind.Sequential)]
+        private struct LastInputInfo { public uint Size, Time; }
+
         private delegate uint InsertEvents(Input[] events, int size, out int error);
         // The field-proven guarded-input set: mouse buttons and Shift/Ctrl/Alt/Win. Shared with OperationalTarget.
         internal static readonly int[] HeldKeys = { 0x01, 0x02, 0x04, 0x05, 0x06, 0x10, 0x11, 0x12, 0x5B, 0x5C };
+
+        // The tick GetLastInputInfo reported once our own guarded click was fully inserted. The PC-idle gate treats
+        // exactly this tick as our own input so the Master never waits out its own SendInput packets; every other
+        // tick keeps the plain 1-second input-age rule.
+        private static readonly object OwnInputLock = new object();
+        private static uint? ownInputTick;
+
+        internal static uint? LastOwnInputTick
+        {
+            get { lock (OwnInputLock) { return ownInputTick; } }
+        }
+
+        // The single last-input tick reader for the Master; OperationalTarget uses this one.
+        internal static bool TryGetLastInputTick(out uint tick)
+        {
+            var info = new LastInputInfo { Size = (uint)Marshal.SizeOf(typeof(LastInputInfo)) };
+            tick = 0;
+            if (!GetLastInputInfo(ref info)) return false;
+            tick = info.Time;
+            return true;
+        }
+
+        // Pure recording rule: only a release packet the system accepted, together with a readable tick, replaces the
+        // stored tick. A failed insert or an unreadable tick keeps the previous value, and the tick is never cleared
+        // on use, because a newer real input always produces a different tick.
+        internal static uint? NextOwnInputTick(uint? current, int releaseInserted, bool tickAvailable, uint tick)
+        {
+            return releaseInserted == 1 && tickAvailable ? (uint?)tick : current;
+        }
+
+        private static void RecordOwnInput(int releaseInserted)
+        {
+            uint tick;
+            var available = TryGetLastInputTick(out tick);
+            lock (OwnInputLock) { ownInputTick = NextOwnInputTick(ownInputTick, releaseInserted, available, tick); }
+        }
 
         internal static void PositionOnce(System.Windows.Point target, int expectedPid, IntPtr expectedRoot,
             AuditLog log, Action guard, Action beforeMove)
@@ -265,6 +304,7 @@ namespace RemoteMonitorMaster
             }
 
             Action hold = Hold; // Allocate the held-phase delegate before committing the one DOWN attempt.
+            Action<int> record = RecordOwnInput; // Allocate the own-input recorder before the consent commit as well.
             Check();
             log.Write("INFO", "MOUSE_CLICK_READY", AuditLog.Field("input_events", 2),
                 AuditLog.Field("requested_press_ms", PressDurationMilliseconds), AuditLog.Field("hit_thread_same_as_root", result.HitThreadSameAsRoot),
@@ -273,7 +313,7 @@ namespace RemoteMonitorMaster
             Check();
             // ponytail: global input cannot atomically lock foreground/cursor; abort observed changes and require user inactivity.
             commit(); // Caller performs only its atomic consent commit here. No provider calls or logging follow it.
-            PressOnce(result, down, release, size, insert, hold);
+            PressOnce(result, down, release, size, insert, hold, record);
         }
 
         private static Input Button(bool swapped, bool up)
@@ -288,7 +328,8 @@ namespace RemoteMonitorMaster
             return inserted;
         }
 
-        private static void PressOnce(Result result, Input[] down, Input[] release, int size, InsertEvents insert, Action hold)
+        private static void PressOnce(Result result, Input[] down, Input[] release, int size, InsertEvents insert, Action hold,
+            Action<int> recordOwnInput)
         {
             var downReturned = false;
             var upReturned = false;
@@ -314,6 +355,11 @@ namespace RemoteMonitorMaster
                         result.ReleaseInserted = checked((int)insert(release, size, out error));
                         result.ReleaseError = error;
                         upReturned = true;
+                        // DOWN and UP are both in the system queue here; remember the tick our own click produced.
+                        // The recording rule ignores anything but an accepted release packet, so a failure records
+                        // nothing, and a recorder failure never replaces the click's own result or exception.
+                        try { recordOwnInput(result.ReleaseInserted); }
+                        catch (Exception) { } // Recording is an optimization; without it the plain 1-second rule applies.
                     }
                 }
                 finally
@@ -381,6 +427,8 @@ namespace RemoteMonitorMaster
                     var result = new Result();
                     var calls = 0;
                     var holds = 0;
+                    var records = 0;
+                    var recordedCount = -2;
                     var packetsValid = true;
                     uint Insert(Input[] events, int cbSize, out int error)
                     {
@@ -395,14 +443,20 @@ namespace RemoteMonitorMaster
                         return (uint)count;
                     }
                     var rejected = false;
-                    try { PressOnce(result, new[] { down }, new[] { up }, size, Insert, () => holds++); }
+                    try
+                    {
+                        PressOnce(result, new[] { down }, new[] { up }, size, Insert, () => holds++,
+                            inserted => { records++; recordedCount = inserted; });
+                    }
                     catch (Exception) { rejected = true; }
                     var returned = downCount >= 0 && (downCount == 0 || upCount >= 0);
                     Need(packetsValid && rejected == (downCount != 1 || upCount != 1) && holds == (downCount == 1 ? 1 : 0) &&
                         calls == (downCount == 0 ? 1 : 2) && result.DownInserted == downCount && result.Returned == returned &&
                         result.ReleaseAttempted == (downCount != 0) && result.ReleaseInserted == (downCount != 0 ? upCount : -1) &&
                         result.Inserted == (returned ? downCount + (downCount == 0 ? 0 : upCount) : -1) &&
-                        result.Error == (downCount == 0 ? 5 : 0) && result.ReleaseError == (downCount != 0 && upCount == 0 ? 6 : 0),
+                        result.Error == (downCount == 0 ? 5 : 0) && result.ReleaseError == (downCount != 0 && upCount == 0 ? 6 : 0) &&
+                        // The own-input tick is offered exactly once, only after a returned release insert.
+                        records == (downCount != 0 && upCount >= 0 ? 1 : 0) && recordedCount == (records == 1 ? upCount : -2),
                         "CLICK_SELF_TEST_EDGE_RESULTS");
                 }
             }
@@ -410,6 +464,7 @@ namespace RemoteMonitorMaster
             {
                 var result = new Result();
                 var calls = 0;
+                var records = 0;
                 uint Insert(Input[] events, int cbSize, out int error)
                 {
                     error = 0;
@@ -423,12 +478,37 @@ namespace RemoteMonitorMaster
                     {
                         if (cancelHold) throw new MonitorException("SEND_CANCELLED", "Synthetic cancellation.");
                         throw new InvalidOperationException("Synthetic held observation failure.");
-                    });
+                    }, inserted => { if (inserted == 1) records++; });
                 }
                 catch (Exception) { rejected = true; }
                 Need(rejected && calls == 2 && result.Returned && result.Inserted == 2 && result.DownInserted == 1 &&
-                    result.ReleaseAttempted && result.ReleaseInserted == 1, "CLICK_SELF_TEST_HELD_FAILURE_RELEASE");
+                    result.ReleaseAttempted && result.ReleaseInserted == 1 && records == 1,
+                    "CLICK_SELF_TEST_HELD_FAILURE_RELEASE");
             }
+            // A recorder failure must leave the click result and the click's own exception behaviour untouched.
+            var recorderResult = new Result();
+            var recorderCalls = 0;
+            uint RecorderInsert(Input[] events, int cbSize, out int error) { error = 0; recorderCalls++; return 1; }
+            var recorderRejected = false;
+            try
+            {
+                PressOnce(recorderResult, new[] { Button(false, false) }, new[] { Button(false, true) }, size, RecorderInsert,
+                    () => { }, inserted => { throw new InvalidOperationException("Synthetic recorder failure."); });
+            }
+            catch (Exception) { recorderRejected = true; }
+            Need(!recorderRejected && recorderCalls == 2 && recorderResult.Returned && recorderResult.Inserted == 2 &&
+                recorderResult.DownInserted == 1 && recorderResult.ReleaseInserted == 1, "CLICK_SELF_TEST_RECORD_FAILURE_IGNORED");
+            // Only an accepted release packet with a readable tick records; a failed insert keeps the previous value,
+            // and using the stored tick never clears it.
+            Need(NextOwnInputTick(null, 1, true, 7u) == 7u && NextOwnInputTick(5u, 1, true, 7u) == 7u &&
+                NextOwnInputTick(5u, 1, true, 5u) == 5u && NextOwnInputTick(5u, 0, true, 7u) == 5u &&
+                NextOwnInputTick(5u, -1, true, 7u) == 5u && NextOwnInputTick(5u, 2, true, 7u) == 5u &&
+                NextOwnInputTick(5u, 1, false, 7u) == 5u && NextOwnInputTick(null, 0, true, 7u) == null,
+                "CLICK_SELF_TEST_OWN_INPUT_TICK");
+            // A recorded tick is exactly what the PC-idle gate accepts as our own input; any other tick is unchanged.
+            Need(!OperationalTarget.IsInputRecent(1000, 900, 900u) && OperationalTarget.IsInputRecent(1000, 900, 901u) &&
+                OperationalTarget.IsInputRecent(1000, 900, null) && !OperationalTarget.IsInputRecent(2000, 900, 900u) &&
+                !OperationalTarget.IsInputRecent(2000, 900, null), "CLICK_SELF_TEST_OWN_INPUT_RULE");
         }
 
         private static void Need(bool condition, string reason)
@@ -452,5 +532,8 @@ namespace RemoteMonitorMaster
         [DllImport("user32.dll", ExactSpelling = true, SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool GetGUIThreadInfo(uint thread, ref GuiThreadInfo info);
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetLastInputInfo(ref LastInputInfo info);
     }
 }

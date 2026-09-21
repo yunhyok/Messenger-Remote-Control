@@ -58,7 +58,8 @@ namespace RemoteMonitorMaster
             IsPassword = false;
             runtimeId = ValidateSecurityValues(
                 cached.GetCachedPropertyValue(AutomationElement.ProcessIdProperty, true),
-                // Match Current.IsPassword's documented false default after the live guard above.
+                // Both values come from this batch, not from an earlier live read: the batch itself is the
+                // pre-content guard. false matches Current.IsPassword's documented default.
                 cached.GetCachedPropertyValue(AutomationElement.IsPasswordProperty, false),
                 cached.GetCachedPropertyValue(AutomationElement.RuntimeIdProperty, true),
                 expectedProcessId);
@@ -88,8 +89,8 @@ namespace RemoteMonitorMaster
             patternNames = string.Join(",", names.ToArray());
         }
 
-        internal static ProbeElementCache Capture(AutomationElement element, int expectedProcessId,
-            bool includeBoundingRectangle = false)
+        private static AutomationElement CaptureUpdated(AutomationElement element, int expectedProcessId,
+            bool includeBoundingRectangle)
         {
             if (element == null) throw new ArgumentNullException(nameof(element));
             if (expectedProcessId <= 0) throw new ArgumentOutOfRangeException(nameof(expectedProcessId));
@@ -120,7 +121,32 @@ namespace RemoteMonitorMaster
             var cached = element.GetUpdatedCache(request);
             if (cached == null)
                 throw new MonitorException("PROBE_CACHE_UNAVAILABLE", "The UI Automation element cache is unavailable.");
-            return new ProbeElementCache(cached, expectedProcessId, includeBoundingRectangle);
+            return cached;
+        }
+
+        internal static ProbeElementCache Capture(AutomationElement element, int expectedProcessId,
+            bool includeBoundingRectangle = false)
+        {
+            return new ProbeElementCache(CaptureUpdated(element, expectedProcessId, includeBoundingRectangle),
+                expectedProcessId, includeBoundingRectangle);
+        }
+
+        // The batch fetches ProcessId/IsPassword fresh from the provider, so the caller can tell a foreign or
+        // password element apart from an unknown batch failure without a second live guard round trip.
+        // No batched value is exposed and nothing beyond the failing check name leaves this method.
+        internal static bool TryCapture(AutomationElement element, int expectedProcessId,
+            bool includeBoundingRectangle, out ProbeElementCache cache, out string rejection)
+        {
+            cache = null;
+            var cached = CaptureUpdated(element, expectedProcessId, includeBoundingRectangle);
+            rejection = SecurityRejection(
+                cached.GetCachedPropertyValue(AutomationElement.ProcessIdProperty, true),
+                // Match Current.IsPassword's documented false default, exactly as the constructor does.
+                cached.GetCachedPropertyValue(AutomationElement.IsPasswordProperty, false),
+                expectedProcessId);
+            if (rejection != null) return false;
+            cache = new ProbeElementCache(cached, expectedProcessId, includeBoundingRectangle);
+            return true;
         }
 
         internal ElementIdentity CreateIdentity(string guardedCurrentName)
@@ -138,11 +164,21 @@ namespace RemoteMonitorMaster
 
         internal static int PatternCount { get { return Patterns.Length; } }
 
+        internal const string ForeignProcessRejection = "FOREIGN_OR_UNREADABLE_PID";
+        internal const string PasswordRejection = "PASSWORD_OR_UNREADABLE_GUARD";
+
+        // Names the failing security check without exposing any value; null means both checks passed.
+        internal static string SecurityRejection(object processId, object password, int expectedProcessId)
+        {
+            if (!(processId is int) || (int)processId != expectedProcessId) return ForeignProcessRejection;
+            if (!(password is bool) || (bool)password) return PasswordRejection;
+            return null;
+        }
+
         internal static string ValidateSecurityValues(object processId, object password, object runtimeId,
             int expectedProcessId)
         {
-            if (!(processId is int) || (int)processId != expectedProcessId ||
-                !(password is bool) || (bool)password)
+            if (SecurityRejection(processId, password, expectedProcessId) != null)
                 throw new MonitorException("PROBE_CONTENT_BLOCKED",
                     "The cached element is not a verified non-password target-process element.");
             var values = runtimeId as int[];
@@ -186,6 +222,12 @@ namespace RemoteMonitorMaster
             RejectSecurity(1, false, new int[0], 1);
             Need(ValidateSecurityValues(1, false, new[] { 42, 7 }, 1) == "42,7",
                 "PROBE_CACHE_SECURITY_VALID_REJECTED");
+            Need(SecurityRejection(AutomationElement.NotSupported, false, 1) == ForeignProcessRejection &&
+                SecurityRejection(2, false, 1) == ForeignProcessRejection &&
+                SecurityRejection(1, AutomationElement.NotSupported, 1) == PasswordRejection &&
+                SecurityRejection(1, true, 1) == PasswordRejection &&
+                SecurityRejection(1, false, 1) == null,
+                "PROBE_CACHE_SECURITY_REJECTION_REASON");
 
             Form fixture = null;
             IntPtr[] handles = null;
@@ -234,7 +276,14 @@ namespace RemoteMonitorMaster
                         {
                             var element = AutomationElement.FromHandle(handle);
                             var legacy = ElementIdentity.Capture(element);
-                            var batch = Capture(element, legacy.ProcessId, true);
+                            ProbeElementCache batch;
+                            string rejection;
+                            Need(TryCapture(element, legacy.ProcessId, true, out batch, out rejection) &&
+                                rejection == null && batch != null, "PROBE_CACHE_TRY_CAPTURE_REJECTED");
+                            ProbeElementCache foreign;
+                            Need(!TryCapture(element, legacy.ProcessId + 1, false, out foreign, out rejection) &&
+                                foreign == null && rejection == ForeignProcessRejection,
+                                "PROBE_CACHE_TRY_CAPTURE_FOREIGN_ACCEPTED");
                             var current = element.Current;
                             Need(batch.CreateIdentity(current.Name).Equals(legacy), "PROBE_CACHE_IDENTITY_MISMATCH");
                             Need(batch.ProcessId == current.ProcessId && batch.ControlType == current.ControlType &&

@@ -1162,6 +1162,21 @@ namespace RemoteMonitorMaster
         public readonly string SignerThumbprint;
         public readonly string WindowClass;
         public readonly long WindowHandle;
+        // Diagnostic only: true when this capture reused the cached verification of the identical file.
+        public readonly bool SignatureCached;
+
+        private static readonly object SignatureGate = new object();
+        private static SignatureCacheEntry signatureCache;
+
+        // The 14-argument shape is kept for the reflection-built self-test fixtures (ReadOnlyPair.TestProcess);
+        // a fixture identity is never a cached-signature identity.
+        private ProcessIdentity(int processId, long startUtcTicks, string processName, string path, string productName,
+            string productVersion, string fileVersion, long fileLength, long fileWriteUtcTicks, string signatureStatus,
+            string signerSubject, string signerThumbprint, string windowClass, long windowHandle)
+            : this(processId, startUtcTicks, processName, path, productName, productVersion, fileVersion, fileLength,
+                fileWriteUtcTicks, signatureStatus, signerSubject, signerThumbprint, windowClass, windowHandle, false)
+        {
+        }
 
         private ProcessIdentity(
             int processId,
@@ -1177,7 +1192,8 @@ namespace RemoteMonitorMaster
             string signerSubject,
             string signerThumbprint,
             string windowClass,
-            long windowHandle)
+            long windowHandle,
+            bool signatureCached)
         {
             ProcessId = processId;
             StartUtcTicks = startUtcTicks;
@@ -1193,6 +1209,7 @@ namespace RemoteMonitorMaster
             SignerThumbprint = signerThumbprint;
             WindowClass = windowClass;
             WindowHandle = windowHandle;
+            SignatureCached = signatureCached;
         }
 
         public static ProcessIdentity Capture(IntPtr window)
@@ -1212,29 +1229,36 @@ namespace RemoteMonitorMaster
                         throw new MonitorException("PROCESS_EXITED", "The target process exited.");
                     }
 
+                    // Every identity field below is still read live on every call; only the Authenticode
+                    // verification of a byte-identical file on the same running process is reused.
                     var path = System.IO.Path.GetFullPath(process.MainModule.FileName);
                     var version = FileVersionInfo.GetVersionInfo(path);
                     var file = new FileInfo(path);
+                    var startUtcTicks = process.StartTime.ToUniversalTime().Ticks;
+                    var fileLength = file.Length;
+                    var fileWriteUtcTicks = file.LastWriteTimeUtc.Ticks;
                     string signatureStatus;
                     string signerSubject;
                     string signerThumbprint;
-                    ReadSignature(path, out signatureStatus, out signerSubject, out signerThumbprint);
+                    var signatureCached = ReadCachedSignature((int)processId, startUtcTicks, path, fileLength,
+                        fileWriteUtcTicks, out signatureStatus, out signerSubject, out signerThumbprint);
 
                     return new ProcessIdentity(
                         (int)processId,
-                        process.StartTime.ToUniversalTime().Ticks,
+                        startUtcTicks,
                         process.ProcessName,
                         path,
                         version.ProductName ?? string.Empty,
                         version.ProductVersion ?? string.Empty,
                         version.FileVersion ?? string.Empty,
-                        file.Length,
-                        file.LastWriteTimeUtc.Ticks,
+                        fileLength,
+                        fileWriteUtcTicks,
                         signatureStatus,
                         signerSubject,
                         signerThumbprint,
                         NativeMethods.WindowClass(window),
-                        window.ToInt64());
+                        window.ToInt64(),
+                        signatureCached);
                 }
             }
             catch (MonitorException)
@@ -1276,9 +1300,11 @@ namespace RemoteMonitorMaster
                 AuditLog.Field("file_write_utc_ticks", FileWriteUtcTicks),
                 AuditLog.Field("signature_status", SignatureStatus),
                 AuditLog.Field("signer_subject", SignerSubject),
-                AuditLog.Field("signer_thumbprint", SignerThumbprint));
+                AuditLog.Field("signer_thumbprint", SignerThumbprint),
+                AuditLog.Field("signature_cached", SignatureCached));
         }
 
+        // SignatureCached is deliberately excluded: it describes how this capture was produced, not the target.
         public bool Equals(ProcessIdentity other)
         {
             return other != null &&
@@ -1311,6 +1337,88 @@ namespace RemoteMonitorMaster
         private static bool Equal(string left, string right)
         {
             return string.Equals(left ?? string.Empty, right ?? string.Empty, StringComparison.OrdinalIgnoreCase);
+        }
+
+        // Process-lifetime, single-entry, lock-protected reuse of one WinVerifyTrust + X509 pass. A miss drops the
+        // old entry before recomputing, so a verification failure never leaves a stale result behind.
+        private static bool ReadCachedSignature(int processId, long startUtcTicks, string path, long fileLength,
+            long fileWriteUtcTicks, out string status, out string subject, out string thumbprint)
+        {
+            lock (SignatureGate)
+            {
+                var entry = signatureCache;
+                if (entry != null && entry.Matches(processId, startUtcTicks, path, fileLength, fileWriteUtcTicks))
+                {
+                    status = entry.Status;
+                    subject = entry.Subject;
+                    thumbprint = entry.Thumbprint;
+                    return true;
+                }
+
+                signatureCache = null;
+                ReadSignature(path, out status, out subject, out thumbprint);
+                signatureCache = new SignatureCacheEntry(processId, startUtcTicks, path, fileLength,
+                    fileWriteUtcTicks, status, subject, thumbprint);
+                return false;
+            }
+        }
+
+        internal static void RunSelfTest()
+        {
+            var entry = new SignatureCacheEntry(4321, 1000L, @"C:\Dir\KI-Messenger.exe", 136L, 2000L,
+                "VALID_TRUSTED_OFFLINE", "CN=Example", "AABB");
+            Need(entry.Matches(4321, 1000L, @"c:\dir\ki-messenger.exe", 136L, 2000L),
+                "PROCESS_IDENTITY_SIGNATURE_KEY_REJECTED");
+            Need(!entry.Matches(4322, 1000L, @"C:\Dir\KI-Messenger.exe", 136L, 2000L),
+                "PROCESS_IDENTITY_SIGNATURE_KEY_PID");
+            Need(!entry.Matches(4321, 1001L, @"C:\Dir\KI-Messenger.exe", 136L, 2000L),
+                "PROCESS_IDENTITY_SIGNATURE_KEY_START");
+            Need(!entry.Matches(4321, 1000L, @"C:\Dir\Other.exe", 136L, 2000L),
+                "PROCESS_IDENTITY_SIGNATURE_KEY_PATH");
+            Need(!entry.Matches(4321, 1000L, null, 136L, 2000L),
+                "PROCESS_IDENTITY_SIGNATURE_KEY_NULL_PATH");
+            Need(!entry.Matches(4321, 1000L, @"C:\Dir\KI-Messenger.exe", 137L, 2000L),
+                "PROCESS_IDENTITY_SIGNATURE_KEY_LENGTH");
+            Need(!entry.Matches(4321, 1000L, @"C:\Dir\KI-Messenger.exe", 136L, 2001L),
+                "PROCESS_IDENTITY_SIGNATURE_KEY_WRITE_TIME");
+        }
+
+        private static void Need(bool condition, string message)
+        {
+            if (!condition) throw new InvalidOperationException("Self-test failed: " + message);
+        }
+
+        private sealed class SignatureCacheEntry
+        {
+            private readonly int processId;
+            private readonly long startUtcTicks;
+            private readonly string path;
+            private readonly long fileLength;
+            private readonly long fileWriteUtcTicks;
+
+            public readonly string Status;
+            public readonly string Subject;
+            public readonly string Thumbprint;
+
+            public SignatureCacheEntry(int processId, long startUtcTicks, string path, long fileLength,
+                long fileWriteUtcTicks, string status, string subject, string thumbprint)
+            {
+                this.processId = processId;
+                this.startUtcTicks = startUtcTicks;
+                this.path = path ?? string.Empty;
+                this.fileLength = fileLength;
+                this.fileWriteUtcTicks = fileWriteUtcTicks;
+                Status = status;
+                Subject = subject;
+                Thumbprint = thumbprint;
+            }
+
+            public bool Matches(int processId, long startUtcTicks, string path, long fileLength, long fileWriteUtcTicks)
+            {
+                return this.processId == processId && this.startUtcTicks == startUtcTicks &&
+                    this.fileLength == fileLength && this.fileWriteUtcTicks == fileWriteUtcTicks &&
+                    path != null && Equal(this.path, path);
+            }
         }
 
         private static void ReadSignature(string path, out string status, out string subject, out string thumbprint)
