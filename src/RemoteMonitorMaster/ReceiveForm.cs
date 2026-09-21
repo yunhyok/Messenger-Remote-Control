@@ -547,6 +547,14 @@ namespace RemoteMonitorMaster
                     "Stop을 누른 뒤 현재 조회/전송 호출이 끝나야 LOG READY가 표시됩니다. PC 입력란·마우스·키보드는 건드리지 마세요.\r\n" +
                     "상태 조회만 수행하며 휴대폰 실제 수신은 직접 확인합니다.";
             }
+            else if (phase == "REQUEST_RESUMED" || phase.StartsWith("REQUEST_RESUMED:", StringComparison.Ordinal))
+            {
+                code.Text = "WAIT";
+                var reason = phase.Length > "REQUEST_RESUMED:".Length ? phase.Substring("REQUEST_RESUMED:".Length) : null;
+                SetStatus("이전 요청이 입력 전에 중단되어 새 M코드로 다시 대기합니다" +
+                    (reason == null ? "" : " (사유: " + reason + ")") + " — 중단된 요청은 다시 보내지 않습니다.", false);
+                SetInteractionNotice("중단된 요청은 자동으로 재시도하지 않습니다. 새 M코드를 기다리세요.");
+            }
             else if (phase == "WAITING_FOR_REPEAT")
                 SetStatus(count + " M 표시 재확인 중 — 같은 M을 다시 보내지 마세요.", false);
             else if (phase == "SLAVE_QUERYING" || phase == "PC_STATUS_QUERYING")
@@ -600,6 +608,15 @@ namespace RemoteMonitorMaster
             {
                 code.Text = "WAIT";
                 SetStatus("같은 명령과 대화창을 재확인 중입니다. 새 명령을 보내지 마세요.", false);
+            }
+            else if (phase == "REQUEST_RESUMED" || phase.StartsWith("REQUEST_RESUMED:", StringComparison.Ordinal))
+            {
+                // 입력 전에 중단된 요청만 여기로 옵니다. 중단된 답장은 다시 보내지 않고 새 Ready만 보냅니다.
+                code.Text = "WAIT";
+                var reason = phase.Length > "REQUEST_RESUMED:".Length ? phase.Substring("REQUEST_RESUMED:".Length) : null;
+                SetStatus("이전 요청이 입력 전에 중단되어 새 Ready로 다시 대기합니다" +
+                    (reason == null ? "" : " (사유: " + reason + ")") + " — 중단된 요청은 다시 보내지 않습니다.", false);
+                SetInteractionNotice("새 Master Ready가 온 뒤에 명령을 다시 보내세요. 자동 재시도는 하지 않습니다.");
             }
             else if (phase == "BASELINE")
             {
@@ -834,7 +851,11 @@ namespace RemoteMonitorMaster
                 case "RECEIVE_PHASE_TIME_LIMIT":
                     return "화면 읽기 한 단계가 15초를 넘었습니다. 대화 기록이 매우 길면 새 대화를 사용하세요.";
                 case "STATUS_REQUEST_STOPPED":
-                    return "이번 요청이 중단되어 다음 요청을 시작하지 않았습니다.";
+                    return "자동 입력·전송이 시작된 뒤 이번 요청이 중단되어 다음 요청을 시작하지 않았습니다. 전달 여부는 확인되지 않으며 자동 재시도는 하지 않습니다. 휴대폰 수신을 직접 확인하고 새 세션을 시작하세요.";
+                case "STATUS_REQUEST_ABORT_LIMIT":
+                    return "요청이 연속 " + StatusSession.AbortResumeLimit + "회 중단되어 세션을 끝냈습니다. 새 세션을 시작하세요.";
+                case "ROUNDTRIP_PROOF_EXPIRED_OR_WINDOW_CHANGED":
+                    return "답장 증거가 허용 시간을 넘었거나 대화창이 바뀌었습니다. 대화 기록이 매우 길면 새 대화를 사용하세요.";
                 case "STATUS_TARGET_CHANGED":
                 case "STATUS_WINDOW_MOVED":
                 case "STATUS_PROCESS_CHANGED":

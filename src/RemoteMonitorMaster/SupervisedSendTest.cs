@@ -27,8 +27,12 @@ namespace RemoteMonitorMaster
         {
             internal readonly string Status, Reason, Message;
             internal readonly bool CleanCompletion;
-            internal Outcome(string status, string reason, string message, bool cleanCompletion)
-            { Status = status; Reason = reason; Message = message; CleanCompletion = cleanCompletion; }
+            // True when any cursor move, write, click, invoke or default action was attempted, or the state is unknown.
+            // Callers that cannot prove nothing was attempted omit the argument and get the conservative true.
+            internal readonly bool InputAttempted;
+            internal Outcome(string status, string reason, string message, bool cleanCompletion, bool? inputAttempted = null)
+            { Status = status; Reason = reason; Message = message; CleanCompletion = cleanCompletion;
+                InputAttempted = inputAttempted ?? true; }
         }
 
         internal sealed class Consent
@@ -608,7 +612,8 @@ namespace RemoteMonitorMaster
                     "One mouse click was queued. Message delivery is NOT verified. Check the PC and phone once; do not repeat this test.";
                 return new Outcome(status, inputState == "OTHER" ? "SEND_INPUT_CHANGED" : "NONE", message,
                     IsCleanCompletion(attempted, click, inputState, writeCalls, writeReturned, writeVerified,
-                        moveRequested && positioned, consent.Cancelled));
+                        moveRequested && positioned, consent.Cancelled),
+                    IsInputAttempted(attempted, click, writeCalls, moveRequested));
             }
             catch (Exception ex)
             {
@@ -638,13 +643,23 @@ namespace RemoteMonitorMaster
                     (moveRequested ? Environment.NewLine + "Cursor positioning was attempted; the pointer is not restored automatically." : "") +
                     (click.ReleaseAttempted && click.ReleaseInserted != 1 ? Environment.NewLine +
                         MouseReleaseWarning + " Move away from Send, then manually press and release the mouse button once. Collect the log." : "");
-                return new Outcome(status, reason, message, false);
+                return new Outcome(status, reason, message, false,
+                    IsInputAttempted(attempted, click, writeCalls, moveRequested));
             }
         }
 
         internal static bool IsValidMarker(string value)
         {
             return Protocol.IsDiagnosticMarker("DRAFT", value);
+        }
+
+        // Mirrors the SUPERVISED_SEND_RESULT attempt fields: cursor_move_verified/write_attempted/setvalue_calls,
+        // mouse_click_attempts/mouse_*_events_inserted, invoke_calls and default_action_calls (always 0 on this path).
+        // A missing click record is treated as unknown, therefore attempted.
+        internal static bool IsInputAttempted(bool attempted, MouseClickInput.Result click, int writeCalls, bool moveRequested)
+        {
+            return attempted || writeCalls != 0 || moveRequested || click == null || click.Returned ||
+                click.ReleaseAttempted || click.Inserted >= 0 || click.DownInserted >= 0 || click.ReleaseInserted >= 0;
         }
 
         internal static bool IsCleanCompletion(bool attempted, MouseClickInput.Result click, string inputState, int writeCalls,
