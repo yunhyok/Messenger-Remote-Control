@@ -25,7 +25,7 @@ namespace RemoteMonitorLink
 
     internal static class LinkVersion
     {
-        internal const string AppValue = "0.3.4";
+        internal const string AppValue = "0.3.5";
         internal const string Value = "0.3.0";
     }
 

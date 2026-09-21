@@ -1,6 +1,8 @@
 using System;
 using System.Diagnostics;
+using System.Globalization;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
 using System.Windows.Automation;
 
@@ -122,18 +124,119 @@ namespace RemoteMonitorMaster
             return window != IntPtr.Zero && IsIconic(window);
         }
 
+        // One sample of why PC input is not quiet yet. Never holds a window title, text or process path.
+        internal sealed class IdleDiagnosis
+        {
+            internal string Reason = "IDLE";
+            internal string HeldKeys = string.Empty;
+            internal uint InputAgeMilliseconds, ForegroundProcessId, GuiFlags;
+            internal bool ForegroundIsTarget, GuiQuiet, GuiAvailable, GuiActiveMatches, GuiCapture, GuiMenu, GuiMoveSize;
+        }
+
         private void WaitForPcIdle()
         {
+            var wait = Stopwatch.StartNew();
+            var nextRecord = TimeSpan.FromSeconds(2); // First record after 2 s, then every 10 s while still waiting.
+            var recorded = false;
+            var reportedPlainPhase = false;
+            string lastReason = null;
+            var reasonClock = Stopwatch.StartNew(); // A flapping blocker is published at most once per second.
             while (true)
             {
                 Check();
                 uint lastInput;
                 Need(TryGetLastInputTick(out lastInput), "TARGET_LAST_INPUT_UNAVAILABLE");
-                if (MouseClickInput.IsForegroundInputQuiet() &&
-                    IsInputIdle(unchecked((uint)Environment.TickCount), lastInput, GetAsyncKeyState)) return;
-                Report("WAITING_FOR_PC_IDLE");
+                var state = Diagnose(unchecked((uint)Environment.TickCount), lastInput);
+                if (state.Reason == "IDLE")
+                {
+                    if (recorded)
+                        log.Write("INFO", "OPERATIONAL_TARGET_IDLE_END", AuditLog.Field("waited_ms", wait.ElapsedMilliseconds));
+                    return;
+                }
+                if (!reportedPlainPhase) { Report("WAITING_FOR_PC_IDLE"); reportedPlainPhase = true; }
+                if (state.Reason != lastReason && (lastReason == null || reasonClock.ElapsedMilliseconds >= 1000))
+                {
+                    Report("WAITING_FOR_PC_IDLE:" + state.Reason); // Only a changed blocker is published, rate-limited.
+                    lastReason = state.Reason;
+                    reasonClock.Restart();
+                }
+                if (wait.Elapsed >= TimeSpan.FromSeconds(60))
+                {
+                    RecordIdleWait(state, wait.ElapsedMilliseconds, true);
+                    throw new MonitorException("TARGET_PC_NOT_IDLE",
+                        "PC input did not become idle within 60 seconds: " + state.Reason);
+                }
+                if (wait.Elapsed >= nextRecord)
+                {
+                    RecordIdleWait(state, wait.ElapsedMilliseconds, false);
+                    recorded = true;
+                    nextRecord += TimeSpan.FromSeconds(10);
+                }
                 Thread.Sleep(50);
             }
+        }
+
+        private IdleDiagnosis Diagnose(uint now, uint lastInput)
+        {
+            var state = new IdleDiagnosis { InputAgeMilliseconds = unchecked(now - lastInput) };
+            state.HeldKeys = DescribeHeldKeys(GetAsyncKeyState);
+            bool activeMatches, capture, menu, moveSize, available;
+            uint flags;
+            state.GuiQuiet = MouseClickInput.DescribeForegroundInput(out activeMatches, out capture, out menu,
+                out moveSize, out flags, out available);
+            state.GuiAvailable = available;
+            state.GuiActiveMatches = activeMatches;
+            state.GuiCapture = capture;
+            state.GuiMenu = menu;
+            state.GuiMoveSize = moveSize;
+            state.GuiFlags = flags;
+            var foreground = NativeMethods.GetForegroundWindow();
+            state.ForegroundIsTarget = foreground == window;
+            uint pid;
+            state.ForegroundProcessId = NativeMethods.GetWindowThreadProcessId(foreground, out pid) == 0 ? 0 : pid;
+            state.Reason = IdleWaitReason(IsInputRecent(now, lastInput), state.HeldKeys.Length != 0, state.GuiQuiet,
+                foreground != IntPtr.Zero);
+            return state;
+        }
+
+        private void RecordIdleWait(IdleDiagnosis state, long waitedMilliseconds, bool final)
+        {
+            log.Write("INFO", "OPERATIONAL_TARGET_IDLE_WAIT", AuditLog.Field("reason", state.Reason),
+                AuditLog.Field("input_age_ms", state.InputAgeMilliseconds), AuditLog.Field("held_keys", state.HeldKeys),
+                AuditLog.Field("foreground_is_target", state.ForegroundIsTarget),
+                AuditLog.Field("foreground_pid", state.ForegroundProcessId),
+                AuditLog.Field("gui_available", state.GuiAvailable), AuditLog.Field("gui_active_matches", state.GuiActiveMatches),
+                AuditLog.Field("gui_capture", state.GuiCapture), AuditLog.Field("gui_menu", state.GuiMenu),
+                AuditLog.Field("gui_movesize", state.GuiMoveSize), AuditLog.Field("gui_flags", Hex(state.GuiFlags)),
+                AuditLog.Field("waited_ms", waitedMilliseconds), AuditLog.Field("final", final));
+        }
+
+        private static string Hex(uint value)
+        {
+            return "0x" + value.ToString("X", CultureInfo.InvariantCulture);
+        }
+
+        // Exactly one blocker so the operator has one action. IDLE means both guarded predicates already hold.
+        internal static string IdleWaitReason(bool inputRecent, bool keyHeld, bool guiQuiet, bool hasForeground)
+        {
+            if (inputRecent) return "INPUT_RECENT";
+            if (keyHeld) return "KEY_HELD";
+            if (guiQuiet) return "IDLE";
+            return hasForeground ? "FOREGROUND_BUSY" : "NO_FOREGROUND";
+        }
+
+        // Only the guarded button/modifier list, so the record can never become a keystroke transcript.
+        internal static string DescribeHeldKeys(Func<int, short> getAsyncKeyState)
+        {
+            if (getAsyncKeyState == null) return string.Empty;
+            var held = new StringBuilder();
+            foreach (var key in MouseClickInput.HeldKeys)
+                if ((((ushort)getAsyncKeyState(key)) & 0x8000) != 0)
+                {
+                    if (held.Length != 0) held.Append(',');
+                    held.Append("0x").Append(key.ToString("X2", CultureInfo.InvariantCulture));
+                }
+            return held.ToString();
         }
 
         private void WaitForNormalBounds()
@@ -266,12 +369,22 @@ namespace RemoteMonitorMaster
             mutation();
         }
 
-        // The high bit is physical key-down. Deliberately ignore the low toggle bit.
-        internal static bool IsInputIdle(uint now, uint lastInput, Func<int, short> getAsyncKeyState)
+        // A last-input tick in the future (or past the wrap window) counts as input happening right now.
+        internal static bool IsInputRecent(uint now, uint lastInput)
         {
             var elapsed = unchecked(now - lastInput);
-            if (getAsyncKeyState == null || elapsed < 1000 || elapsed > int.MaxValue) return false;
-            for (var key = 1; key <= 254; key++)
+            return elapsed < 1000 || elapsed > int.MaxValue;
+        }
+
+        // The high bit is physical key-down. Deliberately ignore the low toggle bit.
+        // Only MouseClickInput.HeldKeys is swept: a held modifier or mouse button changes the meaning of the guarded
+        // click/SetValue, while active typing is already covered by the 1-second input-age rule. A sweep over every
+        // virtual key trips on phantom/IME key states (VK_HANGUL, VK_HANJA, stuck HID keys) and blocked the Win7 field
+        // Master forever. The click-time guard uses the same list, so the two checks cannot disagree.
+        internal static bool IsInputIdle(uint now, uint lastInput, Func<int, short> getAsyncKeyState)
+        {
+            if (getAsyncKeyState == null || IsInputRecent(now, lastInput)) return false;
+            foreach (var key in MouseClickInput.HeldKeys)
                 if ((((ushort)getAsyncKeyState(key)) & 0x8000) != 0) return false;
             return true;
         }
@@ -280,11 +393,25 @@ namespace RemoteMonitorMaster
         {
             Need(!NeedsActivation(true) && NeedsActivation(false), "TARGET_ACTIVATION_TRANSITION_CHANGED");
             Need(!IsInputIdle(1000, 1, key => 0), "TARGET_IDLE_INTERVAL_CHANGED");
-            Need(!IsInputIdle(2000, 1000, key => key == 20 ? unchecked((short)0x8000) : (short)1),
+            Need(!IsInputIdle(2000, 1000, key => key == 0x11 ? unchecked((short)0x8000) : (short)1),
                 "TARGET_HIGH_BIT_KEY_GUARD_CHANGED");
+            // A phantom or IME key outside the guarded list (VK_HANGUL, a letter) must never hold the wait open.
+            Need(IsInputIdle(2000, 1000, key => key == 0x15 || key == 0x19 || key == 0x41 ? unchecked((short)0x8000) : (short)1),
+                "TARGET_UNLISTED_KEY_BLOCKED_IDLE");
             Need(IsInputIdle(2000, 1000, key => (short)1), "TARGET_TOGGLE_BIT_WAS_TREATED_AS_DOWN");
             Need(IsInputIdle(100, unchecked((uint)-1000), key => 0), "TARGET_IDLE_TICK_WRAP_CHANGED");
             Need(!IsInputIdle(1000, 2000, key => 0), "TARGET_FUTURE_INPUT_TICK_ACCEPTED");
+            Need(!IsInputRecent(2000, 1000) && IsInputRecent(1000, 1) && IsInputRecent(1000, 2000) &&
+                !IsInputRecent(100, unchecked((uint)-1000)), "TARGET_INPUT_AGE_RULE_CHANGED");
+            Need(IdleWaitReason(true, true, false, false) == "INPUT_RECENT" &&
+                IdleWaitReason(false, true, true, true) == "KEY_HELD" &&
+                IdleWaitReason(false, false, false, true) == "FOREGROUND_BUSY" &&
+                IdleWaitReason(false, false, false, false) == "NO_FOREGROUND" &&
+                IdleWaitReason(false, false, true, true) == "IDLE", "TARGET_IDLE_REASON_PRIORITY_CHANGED");
+            Need(DescribeHeldKeys(key => key == 0x11 || key == 0x01 ? unchecked((short)0x8000) : (short)1) == "0x01,0x11" &&
+                DescribeHeldKeys(key => (short)1) == string.Empty && DescribeHeldKeys(null) == string.Empty &&
+                DescribeHeldKeys(key => key == 0x15 ? unchecked((short)0x8000) : (short)0) == string.Empty,
+                "TARGET_HELD_KEY_RECORD_CHANGED");
             Need(ActivationWaitState(false, new IntPtr(1), new IntPtr(1), new IntPtr(2)) == "READY" &&
                 ActivationWaitState(false, IntPtr.Zero, new IntPtr(1), new IntPtr(2)) == "WAIT" &&
                 ActivationWaitState(false, new IntPtr(2), new IntPtr(1), new IntPtr(2)) == "WAIT" &&

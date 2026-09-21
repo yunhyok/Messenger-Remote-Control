@@ -46,7 +46,8 @@ namespace RemoteMonitorMaster
         }
 
         private delegate uint InsertEvents(Input[] events, int size, out int error);
-        private static readonly int[] HeldKeys = { 0x01, 0x02, 0x04, 0x05, 0x06, 0x10, 0x11, 0x12, 0x5B, 0x5C };
+        // The field-proven guarded-input set: mouse buttons and Shift/Ctrl/Alt/Win. Shared with OperationalTarget.
+        internal static readonly int[] HeldKeys = { 0x01, 0x02, 0x04, 0x05, 0x06, 0x10, 0x11, 0x12, 0x5B, 0x5C };
 
         internal static void PositionOnce(System.Windows.Point target, int expectedPid, IntPtr expectedRoot,
             AuditLog log, Action guard, Action beforeMove)
@@ -119,13 +120,30 @@ namespace RemoteMonitorMaster
         // Read-only: operational activation uses this without requiring the pointer to be over its target.
         internal static bool IsForegroundInputQuiet()
         {
+            bool activeMatches, capture, menu, moveSize, available;
+            uint flags;
+            return DescribeForegroundInput(out activeMatches, out capture, out menu, out moveSize, out flags, out available);
+        }
+
+        // Same observation as IsForegroundInputQuiet, with the individual reasons kept for diagnostics. No titles or text.
+        internal static bool DescribeForegroundInput(out bool activeMatches, out bool capture, out bool menu,
+            out bool moveSize, out uint flags, out bool available)
+        {
+            activeMatches = capture = menu = moveSize = available = false;
+            flags = 0;
             var foreground = NativeMethods.GetForegroundWindow();
             uint pid;
             var thread = NativeMethods.GetWindowThreadProcessId(foreground, out pid);
             if (foreground == IntPtr.Zero || thread == 0 || pid == 0) return false;
             var info = new GuiThreadInfo { Size = (uint)Marshal.SizeOf(typeof(GuiThreadInfo)) };
-            return GetGUIThreadInfo(thread, ref info) && info.Active == foreground && info.Capture == IntPtr.Zero &&
-                info.MenuOwner == IntPtr.Zero && info.MoveSize == IntPtr.Zero && (info.Flags & 0x1E) == 0;
+            if (!GetGUIThreadInfo(thread, ref info)) return false;
+            available = true;
+            activeMatches = info.Active == foreground;
+            capture = info.Capture != IntPtr.Zero;
+            menu = info.MenuOwner != IntPtr.Zero;
+            moveSize = info.MoveSize != IntPtr.Zero;
+            flags = info.Flags;
+            return activeMatches && !capture && !menu && !moveSize && (flags & 0x1E) == 0;
         }
 
         private static void CheckIdleInput(IntPtr expectedRoot, uint thread, uint hitThread)
@@ -345,6 +363,11 @@ namespace RemoteMonitorMaster
             var size = Marshal.SizeOf(typeof(Input));
             Need(size == (IntPtr.Size == 8 ? 40 : 28) && Marshal.OffsetOf(typeof(Input), "Mouse").ToInt32() == (IntPtr.Size == 8 ? 8 : 4) &&
                 Marshal.SizeOf(typeof(GuiThreadInfo)) == (IntPtr.Size == 8 ? 72 : 48) && PressDurationMilliseconds == 120, "CLICK_SELF_TEST_LAYOUT");
+            // OperationalTarget reuses this exact list; a change here changes the idle contract too.
+            var expectedHeld = new[] { 0x01, 0x02, 0x04, 0x05, 0x06, 0x10, 0x11, 0x12, 0x5B, 0x5C };
+            Need(HeldKeys.Length == expectedHeld.Length, "CLICK_SELF_TEST_HELD_KEYS");
+            for (var index = 0; index < expectedHeld.Length; index++)
+                Need(HeldKeys[index] == expectedHeld[index], "CLICK_SELF_TEST_HELD_KEYS");
             foreach (var swapped in new[] { false, true })
             {
                 var down = Button(swapped, false);
