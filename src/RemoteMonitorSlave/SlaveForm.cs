@@ -22,7 +22,7 @@ namespace RemoteMonitorSlave
         private readonly Button start = new Button { Text = "Slave 시작" };
         private readonly Button stop = new Button { Text = "Stop" };
         private readonly Button export = new Button { Text = "연결파일 저장" };
-        private readonly Button refresh = new Button { Text = "현재 목록 새로고침" };
+        private readonly Button refresh = new Button { Text = "IP·프로그램 목록 새로고침" };
         private readonly Button powerSiCheck = new Button { Text = "PowerSI 확인" };
         private readonly Button outputAll = new Button { Text = "PowerSI 전체 수집" };
         private readonly Button replayVision = new Button { Text = "저장 화면 재판독" };
@@ -78,6 +78,7 @@ namespace RemoteMonitorSlave
             TabStop = false
         };
         private readonly TextBox pairing = new TextBox { ReadOnly = true, UseSystemPasswordChar = true };
+        private readonly ToolTip tips = new ToolTip();
         private readonly string dataPath;
         private readonly SlaveLog log;
         private SlaveIdentity identity;
@@ -86,6 +87,12 @@ namespace RemoteMonitorSlave
         private Action<MachineStatus> serverSnapshot;
         private CancellationTokenSource snapshotCancellation;
         private bool busy, closing, replayInProgress;
+        private readonly bool visionSettingsReset;
+        // What the last answered Master request served, for the completion line only (no protocol change).
+        private string lastServedKind;
+        private int lastServedTargets = -1, lastServedPending = -1;
+        // Reason of the request that just failed inside the Slave, kept for the CLIENT_REJECTED that follows it.
+        private string lastRequestFailure;
         private string pairingText;
         private int statusReplies;
         private const string MasterCompletionNotice = "메신저 운용 시에는 Master LOG READY까지 마스터 마우스·키보드를 건드리지 마세요.";
@@ -103,18 +110,13 @@ namespace RemoteMonitorSlave
             dataPath = testDirectory ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "RemoteMonitorSlave");
             log = new SlaveLog(Path.Combine(dataPath, "logs"));
             try { visionSettings = VisionSettingsStore.Load(Path.Combine(dataPath, "local-vision.json")); }
-            catch { log.Write("VISION_SETTINGS_INVALID"); }
+            catch { log.Write("VISION_SETTINGS_INVALID"); visionSettingsReset = true; }
             Controls.Add(new Label { Text = Text, Font = new Font(Font, FontStyle.Bold), Bounds = new Rectangle(18, 16, 804, 28) });
             Controls.Add(new Label { Text = "Slave를 시작하면 Master의 pwrsi 요청마다 모든 PowerSI를 한 번 수집합니다.\r\n" +
                 "Pending은 추가 수집 없이 회신합니다. 로컬 전체 수집과 저장한 화면 비교도 사용할 수 있습니다.",
                 Bounds = new Rectangle(18, 52, 804, 56) });
             address.SetBounds(18, 120, 246, 28);
-            foreach (var ip in NetworkInterface.GetAllNetworkInterfaces().Where(nic => nic.OperationalStatus == OperationalStatus.Up)
-                .SelectMany(nic => nic.GetIPProperties().UnicastAddresses).Select(item => item.Address)
-                .Where(ip => ip.AddressFamily == AddressFamily.InterNetwork && !IPAddress.IsLoopback(ip)).Distinct())
-                address.Items.Add(ip.ToString());
-            address.Items.Add("127.0.0.1");
-            address.SelectedIndex = -1;
+            LoadAddresses();
             address.AccessibleName = "Slave 수신용 이 PC의 IPv4 주소";
             start.SetBounds(276, 117, 130, 34);
             stop.SetBounds(418, 117, 100, 34);
@@ -130,7 +132,7 @@ namespace RemoteMonitorSlave
             pairing.AccessibleName = "인증 연결 코드 (숨김)";
             snapshot.SetBounds(180, 254, 642, 56);
             snapshot.Text = "현재 세션 프로그램 목록은 아직 읽지 않았습니다. 새로고침은 이 PC에서 읽기만 하며 수신을 시작하지 않습니다.";
-            refresh.SetBounds(18, 267, 150, 32);
+            refresh.SetBounds(18, 267, 162, 32);
             processes.SetBounds(18, 318, 804, 196);
             processes.AccessibleName = "현재 세션 프로그램 개요";
             processes.Columns.Add("pid", "PID");
@@ -159,27 +161,70 @@ namespace RemoteMonitorSlave
             anchorState.SetBounds(18, 764, 804, 40);
             anchorState.AccessibleName = "자동 Output 탐색·복사 및 Windows 응답 상태";
             Controls.AddRange(new Control[] { address, start, stop, export, powerSiCheck, outputAll, replayVision, refresh, state, pairing, snapshot, processes, outputTargets, powerSi, path, folder, visionSetup, visionPreview, anchorState });
-            Controls.Add(new Label { Text = "수집된 유효 Output 원문은 사내 Master로 전달되며 화면 이미지는 Slave에만 보관합니다. 수집은 한 번씩, 최대100초이며 Stop으로 취소할 수 있습니다. 이미지 판독은 이 PC의 LM Studio만 사용합니다.",
+            Controls.Add(new Label { Text = "수집된 유효 Output 원문은 사내 Master로 전달되며 화면 이미지는 Slave에만 보관합니다. 수집은 한 번씩, 최대 100초이며 Stop으로 취소할 수 있습니다. 이미지 판독은 이 PC의 LM Studio만 사용합니다.",
                 Bounds = new Rectangle(18, 720, 804, 42) });
+            const string listeningNote = "Slave 수신 중에는 사용할 수 없습니다. Stop 후 설정하고 다시 Slave 시작을 누르세요. 연결파일은 그대로 유효합니다.";
+            foreach (var listeningButton in new[] { powerSiCheck, outputAll, visionSetup })
+            {
+                tips.SetToolTip(listeningButton, listeningNote);
+                // A disabled button shows no tooltip, so the same sentence stays readable to assistive tools.
+                listeningButton.AccessibleDescription = listeningNote;
+            }
+            const string pairingNote = "연결파일은 인증정보입니다. Master PC로만 전달하세요.";
+            tips.SetToolTip(export, pairingNote);
+            export.AccessibleDescription = pairingNote;
             start.Click += async delegate { await StartServer(); };
-            address.SelectedIndexChanged += delegate { UpdateButtons(); };
+            address.SelectedIndexChanged += delegate
+            {
+                UpdateButtons();
+                if ((string)address.SelectedItem == "127.0.0.1")
+                    ShowActivity("127.0.0.1은 이 PC 내부 확인 전용입니다. 다른 PC의 Master는 이 주소로 연결할 수 없습니다.");
+            };
             stop.Click += delegate { StopServer(); };
-            export.Click += delegate { ExportPairing(); };
-            refresh.Click += async delegate { await RefreshSnapshot(); };
+            export.Click += delegate { Guarded(ExportPairing, "EXPORT"); };
+            // A bound listener keeps its address; otherwise the list is re-read, because cable/VPN/Wi-Fi changes
+            // during the session would otherwise leave an address no Master can reach.
+            refresh.Click += async delegate { if (server == null) LoadAddresses(); await RefreshSnapshot(); };
             powerSiCheck.Click += async delegate { await ReadOutputBuffer(); };
             outputAll.Click += async delegate { await ReadOutputBuffer(); };
             replayVision.Click += async delegate { await ReplayVision(); };
-            visionSetup.Click += delegate { ConfigureVision(); };
-            visionPreview.Click += delegate { ShowVisionPreview(); };
+            visionSetup.Click += delegate { Guarded(ConfigureVision, "VISION_SETUP"); };
+            visionPreview.Click += delegate { Guarded(ShowVisionPreview, "VISION_PREVIEW"); };
             folder.Click += delegate { try { Process.Start("explorer.exe", Path.GetDirectoryName(log.Path)); } catch { } };
             FormClosing += delegate { closing = true; CancelSnapshotRefresh(); StopServer(); };
             remoteProgress.Tick += delegate
             {
                 if (server != null && remoteClock != null)
-                    ShowActivity("Master 요청 PowerSI 판독 중 — " + (int)remoteClock.Elapsed.TotalSeconds + "초 경과 / 최대100초; Stop 가능");
+                    ShowActivity("Master 요청 PowerSI 판독 중 — " + (int)remoteClock.Elapsed.TotalSeconds + "초 경과 / 최대 100초; Stop 가능");
             };
             UpdateAnchorState();
+            if (visionSettingsReset)
+                ShowActivity("저장된 LM Studio 설정을 읽지 못해 초기화했습니다 (VISION_SETTINGS_INVALID). LM Studio 설정에서 다시 저장하세요.");
             UpdateButtons();
+        }
+
+        // Read from Windows on demand: the constructor and the refresh button share this list so a changed
+        // network does not strand the operator. Items stay bare IP strings because StartServer parses them.
+        private void LoadAddresses()
+        {
+            var found = new List<string>();
+            // Read first, replace after: Windows can refuse the adapter list, and the click path must not throw
+            // now that an unhandled UI exception stops the Slave.
+            try
+            {
+                foreach (var ip in NetworkInterface.GetAllNetworkInterfaces().Where(nic => nic.OperationalStatus == OperationalStatus.Up)
+                    .SelectMany(nic => nic.GetIPProperties().UnicastAddresses).Select(item => item.Address)
+                    .Where(ip => ip.AddressFamily == AddressFamily.InterNetwork && !IPAddress.IsLoopback(ip)).Distinct())
+                    found.Add(ip.ToString());
+            }
+            catch (NetworkInformationException) { try { log.Write("ADDRESS_LIST_UNAVAILABLE"); } catch { } }
+            var selected = address.SelectedItem as string;
+            address.Items.Clear();
+            foreach (var item in found) address.Items.Add(item);
+            address.Items.Add("127.0.0.1"); // Always last: this PC only, never a route for another PC's Master.
+            address.SelectedIndex = selected == null ? -1 : address.Items.IndexOf(selected);
+            // A single real address leaves nothing to choose; an existing selection is never overridden.
+            if (address.SelectedIndex < 0 && address.Items.Count == 2) address.SelectedIndex = 0;
         }
 
         private async Task StartServer()
@@ -225,11 +270,16 @@ namespace RemoteMonitorSlave
 
         private async Task WatchServer(StatusServer running)
         {
+            var unexpected = false;
             try { await running.Completion; }
-            catch { try { log.Write("LISTENER_FAILED"); } catch { } }
+            catch { unexpected = true; try { log.Write("LISTENER_FAILED"); } catch { } }
             if (!closing && ReferenceEquals(server, running))
             {
                 StopServer();
+                // StopServer and the listener's own STOPPED notice both read like a deliberate Stop; this path
+                // is a failure the operator has to act on, so it says so after them.
+                if (unexpected && !closing)
+                    ShowActivity("수신 대기가 예기치 않게 종료됐습니다 (LISTENER_FAILED). 로그를 확인하고 Slave 시작을 다시 누르세요.");
             }
         }
 
@@ -291,6 +341,7 @@ namespace RemoteMonitorSlave
                     ShowActivity("LISTENING — " + address.SelectedItem + ":" + source.Port + " 수신 중");
                     break;
                 case "CLIENT_CONNECTED":
+                    lastRequestFailure = null;
                     ShowActivity("연결 요청 수신 — 인증 확인 중…");
                     break;
                 case "STATUS_CAPTURING":
@@ -300,15 +351,31 @@ namespace RemoteMonitorSlave
                 case "PWRSI_CAPTURING":
                     ClearPowerSi();
                     remoteClock = Stopwatch.StartNew(); remoteProgress.Start();
-                    ShowActivity("PowerSI 상태 수집 중 — Pending 확인 후 Output 수집 (최대100초; Stop 가능)");
+                    ShowActivity("PowerSI 상태 수집 중 — Pending 확인 후 Output 수집 (최대 100초; Stop 가능)");
                     break;
                 case "STATUS_SENT":
                     remoteProgress.Stop(); remoteClock = null;
-                    ShowActivity("마스터로 상태 응답 완료 (" + (++statusReplies) + "회, " + DateTime.Now.ToString("HH:mm:ss") + ")");
+                    ShowActivity("Master 요청 처리 완료 — " + (lastServedKind ?? "요청") + " / " + (++statusReplies) + "회째 / " +
+                        DateTime.Now.ToString("HH:mm:ss") +
+                        (lastServedTargets < 0 ? "" : " / 대상 " + lastServedTargets + "개 · Pending " + lastServedPending + "개"));
+                    break;
+                case "COLLECT_FAILED":
+                    remoteProgress.Stop(); remoteClock = null;
+                    // One request failed inside the Slave; the listener keeps running, so this is not a Stop.
+                    lastRequestFailure = "Master 요청의 PowerSI 수집 중 내부 오류가 발생해 이번 요청은 실패로 회신했습니다 (COLLECT_FAILED). 수신 대기는 계속됩니다. 로그를 확인하세요.";
+                    ShowActivity(lastRequestFailure);
+                    break;
+                case "RESPONSE_FAILED":
+                    remoteProgress.Stop(); remoteClock = null;
+                    lastRequestFailure = "응답 작성 중 내부 오류가 발생해 이번 요청은 거부됐습니다 (RESPONSE_FAILED). 수신 대기는 계속됩니다.";
+                    ShowActivity(lastRequestFailure);
                     break;
                 case "CLIENT_REJECTED":
                     remoteProgress.Stop(); remoteClock = null;
-                    ShowActivity("연결 요청 거부됨 — 인증/형식을 확인하세요. 계속 수신 대기 중");
+                    // Both internal failures above are reported to the client as a rejection: keep the real reason
+                    // instead of blaming authentication or the request format.
+                    ShowActivity(lastRequestFailure ?? "연결 요청 거부됨 — 인증/형식을 확인하세요. 계속 수신 대기 중");
+                    lastRequestFailure = null;
                     break;
                 case "STOPPED":
                     remoteProgress.Stop(); remoteClock = null;
@@ -334,14 +401,14 @@ namespace RemoteMonitorSlave
             if (powerSiOnly)
             {
                 try { log.Write("LOCAL_PWRSI_BEGIN"); } catch { }
-                ShowActivity("로컬 PowerSI 확인 중 — 캡처 후 LM Studio 판독 (최대100초; Stop 가능)");
+                ShowActivity("로컬 PowerSI 확인 중 — 캡처 후 LM Studio 판독 (최대 100초; Stop 가능)");
             }
             var elapsed = Stopwatch.StartNew();
             var progress = new System.Windows.Forms.Timer { Interval = 1000 };
             progress.Tick += delegate
             {
                 if (powerSiOnly && ReferenceEquals(snapshotCancellation, cancellation))
-                    ShowActivity("로컬 PowerSI 확인 중 — " + (int)elapsed.Elapsed.TotalSeconds + "초 경과 / 최대100초; Stop 가능");
+                    ShowActivity("로컬 PowerSI 확인 중 — " + (int)elapsed.Elapsed.TotalSeconds + "초 경과 / 최대 100초; Stop 가능");
             };
             if (powerSiOnly) progress.Start();
             UpdateButtons();
@@ -436,6 +503,7 @@ namespace RemoteMonitorSlave
             try
             {
                 inventory.Validate();
+                RecordServed(captured.PowerSiOnly ? "pwrsi" : "total status", captured.PowerSiReport);
                 RenderSnapshot(inventory, captured.LocalTime, captured.PowerSiOnly
                     ? "Master 요청 — POWERSI/PWRSI만" : "Master 요청 — 현재 세션 전체");
                 if (captured.PowerSiReport != null)
@@ -459,6 +527,14 @@ namespace RemoteMonitorSlave
                 ClearPowerSi();
                 snapshot.Text = "인증된 Master 요청의 프로그램 목록을 표시하지 못했습니다. 미제공 — 실행 중은 완료 여부가 아닙니다.";
             }
+        }
+
+        // Counters for the completion line only; a request without a PowerSI report keeps them unknown (-1).
+        private void RecordServed(string kind, PowerSiReport report)
+        {
+            lastServedKind = kind;
+            lastServedTargets = report?.Targets == null ? -1 : report.Targets.Length;
+            lastServedPending = report?.Targets == null ? -1 : report.Targets.Count(item => item.State == "PENDING");
         }
 
         private void RenderSnapshot(ProcessInventory inventory, DateTime sampledAt, string source)
@@ -585,7 +661,13 @@ namespace RemoteMonitorSlave
             // OCR failure is not a failed copy: keep the independently collected full buffer and its UTC.
             if (sample.Buffer?.Text == null)
                 sample.Buffer = new OutputBufferResult { Code = code, Method = "NONE", Detail = "NONE" };
-            sample.Vision = sample.Vision ?? PowerSiObservation.VisionUnavailable("VISION_FAILED");
+            var observed = sample.Vision;
+            if (observed == null) sample.Vision = PowerSiObservation.VisionUnavailable("VISION_FAILED");
+            else if (sample.Runs.Contains(observed))
+                // That observation is already stored evidence of a completed run; a later failure gets its own,
+                // keeping the same projection code so the report reads exactly as before.
+                sample.Vision = PowerSiObservation.VisionUnavailable(
+                    observed.Code == "OK" || observed.Code == "OUTPUT_READ" ? "VISION_FAILED" : observed.Code);
             sample.Vision.LocalFailure = code;
         }
 
@@ -636,7 +718,7 @@ namespace RemoteMonitorSlave
                         var progress = new Progress<string>(stage =>
                         {
                             if (closing || cancellation.IsCancellationRequested || !ReferenceEquals(snapshotCancellation, cancellation)) return;
-                            ShowActivity(prefix + " / " + stage + " / 전체 수집 최대100초, Stop 가능");
+                            ShowActivity(prefix + " / " + stage + " / 전체 수집 최대 100초, Stop 가능");
                         });
                         var targetClock = Stopwatch.StartNew();
                         try
@@ -683,7 +765,7 @@ namespace RemoteMonitorSlave
                                             token => PowerSiScreenCapture.CheckResponsiveAsync(target, token)));
                                     if (IsPending(located.LocalFailure)) throw new InvalidDataException("SC_PENDING");
                                     sample.Runs.Add(located);
-                                    log.WritePowerSi(located);
+                                    try { log.WritePowerSi(located); } catch { }
                                     sample.Vision = located; // Preserve the locator frame/diagnostics even when no click is allowed.
                                     var anchor = OutputAutoCopy.AnchorFromVision(target, located);
                                     if (RecordVisibleEmpty(sample, located)) { /* No input or OCR for a visibly empty pane. */ }
@@ -746,9 +828,10 @@ namespace RemoteMonitorSlave
                             if (sample.Buffer.Code == "SC_PENDING")
                                 sample.Vision.LocalFailure = "PENDING_WINDOWS_NOT_RESPONDING_INPUT_STOPPED";
                             if (!sample.Runs.Contains(sample.Vision)) sample.Runs.Add(sample.Vision);
-                            log.WriteOutputBuffer(sample.Buffer);
-                            log.WritePowerSi(sample.Vision);
-                            log.Write("OUTPUT_TARGET_END", "pid=" + sample.Process.Pid + " code=" + LogValue(sample.Buffer.Code) + " elapsed_ms=" + targetClock.ElapsedMilliseconds);
+                            // Every other log call is guarded; a failing log file must not abort a finished target.
+                            try { log.WriteOutputBuffer(sample.Buffer); } catch { }
+                            try { log.WritePowerSi(sample.Vision); } catch { }
+                            try { log.Write("OUTPUT_TARGET_END", "pid=" + sample.Process.Pid + " code=" + LogValue(sample.Buffer.Code) + " elapsed_ms=" + targetClock.ElapsedMilliseconds); } catch { }
                         }
                     }
                 }
@@ -784,7 +867,10 @@ namespace RemoteMonitorSlave
                 {
                     outputTargets.Items.Clear();
                     foreach (var sample in outputSamples) outputTargets.Items.Add(sample);
-                    if (outputTargets.Items.Count > 0) outputTargets.SelectedIndex = 0;
+                    // A Master-initiated run must not leave Output on an unattended screen; the operator picks the PID.
+                    if (outputTargets.Items.Count > 0 && !remote) outputTargets.SelectedIndex = 0;
+                    else if (outputTargets.Items.Count > 0)
+                        ShowActivity("원격 요청 결과 " + outputTargets.Items.Count + "건 — 확인하려면 PID를 선택하세요.");
                     UpdateButtons();
                 }
             }
@@ -804,7 +890,12 @@ namespace RemoteMonitorSlave
                         try
                         {
                             cancellation.ThrowIfCancellationRequested();
-                            completion.TrySetResult(await ReadOutputBuffer(inventory, true, cancellation));
+                            // Same precedence as ApplySnapshot: a current Master request wins over a pending local
+                            // read, which would otherwise be answered with BUSY and no retry.
+                            if (!closing && !busy && !batchInProgress && snapshotCancellation != null) CancelSnapshotRefresh();
+                            var served = await ReadOutputBuffer(inventory, true, cancellation);
+                            RecordServed("pwrsi", served);
+                            completion.TrySetResult(served);
                         }
                         catch (OperationCanceledException) { completion.TrySetCanceled(); }
                         catch (Exception error) { completion.TrySetException(error); }
@@ -1374,14 +1465,30 @@ namespace RemoteMonitorSlave
                 "Slave 시작·연결파일·Master·메신저는 이번 테스트에 필요 없습니다. 화면/원문은 이 PC 안에서만 처리합니다." : MasterCompletionNotice);
         }
 
+        // UI-thread exceptions now end the process (SetUnhandledExceptionMode). A failed dialog or file action must not
+        // take the listener down with it: report it, log a code, and keep serving.
+        private void Guarded(Action action, string what)
+        {
+            try { action(); }
+            catch (Exception error)
+            {
+                try { log.Write("UI_ACTION_FAILED"); } catch { }
+                MessageBox.Show(this, "작업을 완료하지 못했습니다 (" + what + "): " + error.GetType().Name +
+                    "\r\n수신 대기는 계속됩니다. 로그 폴더의 최신 로그를 확인하세요.", Program.Title);
+            }
+        }
+
         private void ExportPairing()
         {
             if (server == null || pairingText == null) return;
+            if (MessageBox.Show(this,
+                "연결파일에는 이 Slave의 인증정보가 들어 있습니다. Master PC로만 직접 전달하고, 메일·공유 폴더·저장소·진단 로그와 함께 올리지 마세요.\r\n\r\n" +
+                "지금 저장할까요?", Program.Title, MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
             using (var dialog = new SaveFileDialog { Filter = "Slave 연결파일 (*.rmpair)|*.rmpair", FileName = "Slave-connection.rmpair", OverwritePrompt = true })
             {
                 if (dialog.ShowDialog(this) != DialogResult.OK) return;
                 try { File.WriteAllText(dialog.FileName, pairingText + Environment.NewLine, new System.Text.UTF8Encoding(false)); }
-                catch { MessageBox.Show("연결파일 저장 실패", Program.Title); }
+                catch (Exception error) { MessageBox.Show("연결파일 저장 실패: " + error.GetType().Name, Program.Title); }
             }
         }
 
@@ -1408,6 +1515,7 @@ namespace RemoteMonitorSlave
             if (disposing)
             {
                 remoteProgress.Dispose();
+                tips.Dispose();
                 closing = true;
                 CancelSnapshotRefresh();
                 var oldServer = server;
@@ -1440,6 +1548,15 @@ namespace RemoteMonitorSlave
                 read.BufferCode == "AUTO_COPY_READ");
             RecordTargetFailure(sample, "TARGET_TIMEOUT");
             Need(ProjectReportTarget(sample).State == "READ"); // Exact copy survives an independent OCR timeout.
+            // A run already stored as evidence is never stamped with a later failure code.
+            var storedRun = PowerSiObservation.VisionUnavailable("OUTPUT_REGION_UNCONFIRMED");
+            sample.Vision = storedRun;
+            sample.Runs.Add(storedRun);
+            RecordTargetFailure(sample, "TARGET_TIMEOUT");
+            Need(storedRun.LocalFailure == null && !ReferenceEquals(sample.Vision, storedRun) &&
+                sample.Vision.LocalFailure == "TARGET_TIMEOUT" && sample.Vision.Code == storedRun.Code &&
+                sample.Runs.Count == 1 && ReferenceEquals(sample.Runs[0], storedRun));
+            sample.Runs.Clear();
             RecordTargetFailure(sample, "SC_FOREGROUND_WAIT_PENDING");
             var pending = ProjectReportTarget(sample);
             pending.Validate();
@@ -1545,10 +1662,16 @@ namespace RemoteMonitorSlave
                 using (var form = new SlaveForm(directory))
                 {
                     if (!form.Text.Contains(LinkVersion.AppValue) || form.server != null || form.identity != null ||
-                        form.stop.Enabled || form.export.Enabled || form.start.Enabled || !form.refresh.Enabled || !form.powerSiCheck.Enabled ||
+                        form.stop.Enabled || form.export.Enabled || form.start.Enabled != (form.address.SelectedIndex >= 0) ||
+                        !form.refresh.Enabled || !form.powerSiCheck.Enabled ||
                         form.powerSiCheck.Text != "PowerSI 확인" || !form.pairing.UseSystemPasswordChar ||
                         form.powerSi.Text.Length != 0 || !form.powerSi.ReadOnly || !form.state.Text.Contains("STOPPED") || !form.outputAll.Enabled || form.replayVision.Enabled)
                         throw new InvalidOperationException("Slave UI started work without local Start or exposed credentials.");
+                    // Start still needs an address, but a host with exactly one real IPv4 may have it preselected.
+                    // Loopback stays last and is never chosen for the operator, whatever the host looks like.
+                    if ((string)form.address.Items[form.address.Items.Count - 1] != "127.0.0.1" ||
+                        (form.address.SelectedIndex >= 0 && (form.address.Items.Count != 2 || form.address.SelectedIndex != 0)))
+                        throw new InvalidOperationException("Address list lost its loopback entry or preselected the wrong address.");
                     var handle = form.Handle;
                     form.busy = true;
                     var remoteBusy = Task.Run(() => form.CollectRemoteOutput(new ProcessInventory(), CancellationToken.None));
@@ -1558,6 +1681,18 @@ namespace RemoteMonitorSlave
                     if (!remoteBusy.IsCompleted || remoteBusy.GetAwaiter().GetResult().Code != "BUSY")
                         throw new InvalidOperationException("Remote collection did not marshal to the shared UI collector.");
                     form.busy = false;
+                    using (var pendingLocalRead = new CancellationTokenSource())
+                    {
+                        form.snapshotCancellation = pendingLocalRead;
+                        var remoteWins = Task.Run(() => form.CollectRemoteOutput(new ProcessInventory(), CancellationToken.None));
+                        callbackClock.Restart();
+                        while (!remoteWins.IsCompleted && callbackClock.ElapsedMilliseconds < 5000)
+                        { Application.DoEvents(); Thread.Sleep(1); }
+                        if (!remoteWins.IsCompleted || remoteWins.GetAwaiter().GetResult().Code == "BUSY" ||
+                            !pendingLocalRead.IsCancellationRequested || form.snapshotCancellation != null)
+                            throw new InvalidOperationException("A Master request did not supersede a pending local refresh.");
+                    }
+                    form.ClearPowerSi();
                     form.address.SelectedItem = "127.0.0.1";
                     if (!form.start.Enabled || form.server != null) throw new InvalidOperationException("Explicit address selection failed.");
                     using (var localCancellation = new CancellationTokenSource())
@@ -1660,8 +1795,19 @@ namespace RemoteMonitorSlave
                         if (!form.state.Text.Contains("프로그램 상태 수집 중") || !form.state.Text.Contains("약0.5초"))
                             throw new InvalidOperationException("Slave process capture activity was not visible.");
                         form.ApplyActivity(currentServer, "STATUS_SENT");
-                        if (!form.state.Text.Contains("상태 응답 완료") || form.statusReplies != 1)
+                        if (!form.state.Text.Contains("Master 요청 처리 완료") || !form.state.Text.Contains("1회째") ||
+                            !form.state.Text.Contains("total status") || form.statusReplies != 1)
                             throw new InvalidOperationException("Slave status reply activity was not visible.");
+                        form.ApplyActivity(currentServer, "COLLECT_FAILED");
+                        if (!form.state.Text.Contains("COLLECT_FAILED") || !form.state.Text.Contains("수신 대기는 계속됩니다"))
+                            throw new InvalidOperationException("A failed Master collection looked like a stopped listener.");
+                        form.ApplyActivity(currentServer, "CLIENT_REJECTED");
+                        if (!form.state.Text.Contains("COLLECT_FAILED"))
+                            throw new InvalidOperationException("The generic rejection replaced the real reason of the same request.");
+                        form.ApplyActivity(currentServer, "RESPONSE_FAILED");
+                        if (!form.state.Text.Contains("RESPONSE_FAILED") || !form.state.Text.Contains("수신 대기는 계속됩니다"))
+                            throw new InvalidOperationException("A failed response looked like a stopped listener.");
+                        form.ApplyActivity(currentServer, "CLIENT_CONNECTED");
                         form.ApplyActivity(currentServer, "CLIENT_REJECTED");
                         if (!form.state.Text.Contains("거부됨")) throw new InvalidOperationException("Slave rejection activity was not visible.");
                         form.ApplySnapshot(currentServer, powerSiCaptured);
@@ -2062,8 +2208,9 @@ namespace RemoteMonitorSlave
                     var copyTime = first.ReceivedUtc;
                     RecordTargetFailure(first, "TARGET_TIMEOUT");
                     if (first.Buffer.Text != copiedBuffer.Text || first.ReceivedUtc != copyTime || first.Vision.LocalFailure != "TARGET_TIMEOUT" ||
-                        TranscriptOf(first.Vision) != null)
-                        throw new InvalidOperationException("Later OCR failure discarded independently collected full text or kept a valid transcript.");
+                        TranscriptOf(first.Vision) != null ||
+                        first.Runs[0].LocalFailure != null || TranscriptOf(first.Runs[0]) == null)
+                        throw new InvalidOperationException("Later OCR failure discarded independently collected full text, kept a valid transcript, or restamped a stored run.");
                     Console.WriteLine("PASS: two-target selection, independent comparisons/ZIP payloads, pending and Stop preservation");
                     form.ClearPowerSi();
                     using (var reader = new FileStream(form.log.Path, FileMode.Open, FileAccess.Read, FileShare.None))

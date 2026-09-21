@@ -204,7 +204,7 @@ try {
         Write-Host "$($roleSpec.Product): install, upgrade, uninstall, metadata, shortcut, and local-data checks passed."
     }
     if ($restartRequired) {
-        Write-Host "Installer smoke checks stopped early for v$version: a restart is required before the remaining checks can run."
+        Write-Host "Installer smoke checks stopped early for v${version}: a restart is required before the remaining checks can run."
     } else {
         Set-Content -LiteralPath (Join-Path $workRoot 'result.txt') -Value "Installer smoke checks passed for v$version." -Encoding ASCII
     }
