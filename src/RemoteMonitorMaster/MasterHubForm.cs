@@ -14,7 +14,7 @@ namespace RemoteMonitorMaster
         private readonly AuditLog log;
         private readonly TextBox pairing = new TextBox { UseSystemPasswordChar = true };
         private readonly Label target = new Label();
-        private readonly TextBox result = new TextBox { Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical };
+        private readonly TextBox result = new TextBox { Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical, TabStop = false };
         private readonly Button import = new Button { Text = "연결파일 열기" };
         private readonly Button query = new Button { Text = "직접 상태 조회 (선택)" };
         private readonly Button slavePhone = new Button { Text = "PowerSI 보고서 + 명령어 운용" };
@@ -30,8 +30,11 @@ namespace RemoteMonitorMaster
             Text = AppInfo.Title + " - MASTER / SLAVE";
             Font = new Font("Segoe UI", 9F);
             AutoScaleMode = AutoScaleMode.Dpi;
+            AutoScaleDimensions = new SizeF(96F, 96F);
             ClientSize = new Size(880, 470);
-            MinimumSize = Size;
+            AutoScroll = true;
+            AutoScrollMinSize = ClientSize; // 기본 크기는 그대로 두고 축소·스크롤만 허용합니다.
+            MinimumSize = new Size(700, 420);
             StartPosition = FormStartPosition.CenterScreen;
             Controls.Add(new Label { Text = Text, Font = new Font(Font, FontStyle.Bold), Bounds = new Rectangle(18, 16, 844, 28) });
             Controls.Add(new Label { Text = "1. 다른 PC에서 Slave를 시작하고 연결파일을 저장합니다.\r\n" +
@@ -50,10 +53,10 @@ namespace RemoteMonitorMaster
             result.Text = "v" + LinkVersion.AppValue + ": 메신저의 고정 읽기 전용 명령으로 Slave 상태와 PowerSI 증거를 요청합니다.\r\n" +
                 "pwrsi 그대로 입력하세요. total status는 단어 사이 한 칸입니다. 앞뒤 공백은 자동 제거합니다. 기존 M코드는 체크 시에만 사용합니다.\r\n" +
                 "pwrsi는 요청 시점에 한 번 수집하고 모든 대상을 표시합니다. 각 답장은 1,400자 이하이며 PART 순서대로 전송합니다.\r\n" +
-                "Pending 대상은 이름·PID·Pending만 표시합니다. 그 밖의 대상은 출처·수집 시각·설명·수집된 Output 전체 또는 이전 전송 이후 추가분를 표시합니다.\r\n" +
-                "보고서 수집은 최대100초, 전체 조회는 최대120초입니다. 진행률이나 완료율은 추측하지 않습니다.";
-            var path = new TextBox { Text = log.FilePath, ReadOnly = true, Bounds = new Rectangle(18, 389, 666, 25) };
-            var folder = new Button { Text = "Open Log Folder", Bounds = new Rectangle(694, 386, 168, 32) };
+                "Pending 대상은 이름·PID·Pending만 표시합니다. 그 밖의 대상은 출처·수집 시각·설명·수집된 Output 전체 또는 이전 전송 이후 추가분을 표시합니다.\r\n" +
+                "보고서 수집은 최대 100초, 전체 조회는 최대 120초입니다. 진행률이나 완료율은 추측하지 않습니다.";
+            var path = new TextBox { Text = log.FilePath, ReadOnly = true, TabStop = false, Bounds = new Rectangle(18, 389, 666, 25) };
+            var folder = new Button { Text = "로그 폴더 열기", Bounds = new Rectangle(694, 386, 168, 32) };
             Controls.AddRange(new Control[] { pairing, import, target, query, slavePhone, legacyMarker, localPhone, result, path, folder });
             Controls.Add(new Label { Text = "연결파일에는 인증키가 있습니다. 마스터 PC로만 전달하며, 진단 로그와 함께 첨부하지 마세요.",
                 Bounds = new Rectangle(18, 428, 844, 28) });
@@ -62,7 +65,11 @@ namespace RemoteMonitorMaster
             query.Click += async delegate { await Query(); };
             slavePhone.Click += delegate { if (endpoint != null) OpenPhone(endpoint, !legacyMarker.Checked); };
             localPhone.Click += delegate { OpenPhone(null, false); };
-            folder.Click += delegate { try { Process.Start("explorer.exe", log.FolderPath); } catch { result.Text = log.FolderPath; } };
+            folder.Click += delegate
+            {
+                try { using (Process.Start("explorer.exe", "\"" + log.FolderPath + "\"")) { } }
+                catch { MessageBox.Show(this, "로그 폴더를 직접 여세요:\r\n" + log.FolderPath, AppInfo.Title); }
+            };
             FormClosing += delegate { closing = true; pending?.Cancel(); };
             ParseEndpoint();
         }
@@ -109,7 +116,8 @@ namespace RemoteMonitorMaster
                 result.Text = "SLAVE STATUS — 연결·인증·현재 상태 조회 성공\r\n" +
                     "시각: " + state.LocalTime.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) +
                     "\r\n부팅 경과: " + state.UptimeMinutes + "분\r\nRAM: " + state.AvailableMiB + " / " + state.TotalMiB +
-                    " MiB (사용 가능 / 전체)\r\nSlave 버전: " + state.Version + ProcessDetails(state.Processes);
+                    " MiB (사용 가능 / 전체)\r\nSlave 통신 규약: " + state.Version +
+                    " (Slave 앱 버전은 Slave 창 제목에서 확인)" + ProcessDetails(state.Processes);
                 log.Write("INFO", "SLAVE_QUERY_COMPLETE");
             }
             catch (Exception ex)

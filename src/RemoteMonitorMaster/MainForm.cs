@@ -6,6 +6,8 @@ using System.Windows.Forms;
 
 namespace RemoteMonitorMaster
 {
+    // Legacy diagnostic screen kept only for the self-test: Program and MasterHubForm never open it,
+    // and Core.cs TestMainForm is its only caller, asserting the exact "Stop" / "Open Log Folder" captions.
     internal sealed class MainForm : Form
     {
         private static readonly string marker = "D" + Protocol.CreateDiagnosticDigits();

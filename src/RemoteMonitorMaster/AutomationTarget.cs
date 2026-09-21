@@ -57,6 +57,8 @@ namespace RemoteMonitorMaster
             this.send = send;
         }
 
+        // Legacy self-test-only diagnostic path: unreachable from Program/MasterHubForm; only Core.cs exercises it.
+        // RejectAutomationInDiagnosticBuild below throws unconditionally, so no bind, input or send can follow.
         public static AutomationTarget Bind(IntPtr window, AuditLog log)
         {
             AppInfo.RejectAutomationInDiagnosticBuild();
@@ -252,6 +254,8 @@ namespace RemoteMonitorMaster
             }
         }
 
+        // Legacy self-test-only diagnostic path: unreachable from Program/MasterHubForm; only Core.cs exercises it.
+        // RejectAutomationInDiagnosticBuild below throws unconditionally, so no automatic reply is ever sent.
         public void SendPong(AuditLog log, string token, Func<bool> stopRequested)
         {
             AppInfo.RejectAutomationInDiagnosticBuild();
