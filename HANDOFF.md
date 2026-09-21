@@ -85,7 +85,7 @@ Windows 활성화 거부, 대상 변경, 실제 입력 중 간섭 또는 불확�
 **v0.3.4 검증 수준(2026-09-21):**
 
 - Linux에서 net48 참조 어셈블리로 두 프로젝트 컴파일: 경고 0, 오류 0. Mono로 클래스별 자체 검사를 개별 실행해 Windows API가 필요 없는 단위(Master 14개, Slave/Link 8개)가 모두 통과했고, 변경 전과 통과 목록이 동일합니다(신규 검사 추가분 제외).
-- Windows Release 빌드·실제 EXE `--self-test`·설치파일 생성·설치/재설치/제거 검사는 PR의 CI(Windows Server 2025)에서 실행합니다. 결과는 PR #1의 체크와 이 문서의 다음 갱신에 기록합니다.
+- [CI run 35558060129](https://github.com/yunhyok/Messenger-Remote-Control/actions/runs/35558060129)(Windows Server 2025, 커밋 `fc28435`)에서 두 Release 빌드, 두 실제 EXE `--self-test`(새 Windows 전용 검사 포함), 두 설치파일 생성·자산 검사, 두 역할의 설치/동일 버전 재설치/제거/설정 보존 검사가 통과했습니다. 앞선 두 실행은 `test-installers.ps1`의 `$version:` 파싱 오류로 설치 검사 단계에서 실패했고 같은 PR에서 수정했습니다.
 - 고대비(High Contrast) 모드가 켜진 Windows에서 `--self-test`를 실행하면 `ReceiveForm`의 색상 단언(`DarkGreen`/`LightYellow`)과 F25의 시스템 색 대체가 충돌할 수 있습니다. 일반 테마(CI 포함)에서는 영향이 없습니다.
 
 **미확인:** 실제 Win7 KI-Messenger에서 0.3.4의 한국어 Ready 안내·카운트다운·`COMMAND_NOT_VISIBLE`·Ready 대기 한도의 동작, Win11 Slave의 실제 디스플레이 배율에서 자동 복사(D1)와 캡처, 새로 추가된 Windows 전용 자체 검사(`TestCollectFailureIsolation`, `PowerSiVision.SelfTest`)의 실행, .NET 4.8이 없는 깨끗한 오프라인 PC의 설치 경로. 2026-09-21 검토에는 새로운 현장 성공/실패 결과가 포함되지 않았습니다.
