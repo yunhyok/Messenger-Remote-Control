@@ -13,9 +13,9 @@ namespace RemoteMonitorMaster
     internal static class SupervisedSendTest
     {
         internal const string MouseReleaseWarning = "Mouse-button release was NOT confirmed.";
-        internal const string ReadyNotice = "Master Ready. You may send help, total status, or pwrsi.";
-        internal const string PowerSiBusyNotice = "Processing pwrsi. Wait for the response and Master Ready. Messages sent meanwhile are ignored.";
-        internal const string StatusBusyNotice = "Processing total status. Wait for the response and Master Ready. Messages sent meanwhile are ignored.";
+        internal const string ReadyNotice = "Master Ready. help, total status, pwrsi 중 하나를 보내세요.";
+        internal const string PowerSiBusyNotice = "Processing pwrsi. 답장과 다음 Master Ready를 기다리세요. 그 사이 보낸 메시지는 무시됩니다.";
+        internal const string StatusBusyNotice = "Processing total status. 답장과 다음 Master Ready를 기다리세요. 그 사이 보낸 메시지는 무시됩니다.";
 
         internal static string ReadyText(string marker)
         {

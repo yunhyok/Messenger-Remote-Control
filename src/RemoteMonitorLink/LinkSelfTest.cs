@@ -307,7 +307,7 @@ namespace RemoteMonitorLink
             }
         }
 
-        private static void TestMalformedParsing()
+        internal static void TestMalformedParsing()
         {
             const string pin = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
             const string token = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";

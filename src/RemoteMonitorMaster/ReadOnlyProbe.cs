@@ -203,7 +203,7 @@ namespace RemoteMonitorMaster
                 Detail("document_node", document);
                 Detail("control_type", typeRead && type != null ? type.ProgrammaticName : "<unavailable>");
                 var nativeHandle = cached.NativeWindowHandle;
-                Detail("native_hwnd", "0x" + unchecked((uint)nativeHandle).ToString("X", CultureInfo.InvariantCulture));
+                if (fields != null) Detail("native_hwnd", "0x" + unchecked((uint)nativeHandle).ToString("X", CultureInfo.InvariantCulture));
                 var enabled = cached.IsEnabled;
                 Detail("enabled", enabled);
                 var offscreen = cached.IsOffscreen;
@@ -231,10 +231,13 @@ namespace RemoteMonitorMaster
                 if (Read(node, "Name", () => { CheckContentAllowed(element); return element.Current.Name; }, out name))
                 {
                     RecordMatch(node, 0, "Name", name);
-                    Detail("name_shape_hint", NameShape(name, marker));
-                    var label = (name ?? string.Empty).Replace("&", string.Empty).Trim();
-                    Detail("send_label_match", string.Equals(label, "Send", StringComparison.OrdinalIgnoreCase) ||
-                        label == "보내기" || label == "전송");
+                    if (fields != null)
+                    {
+                        Detail("name_shape_hint", NameShape(name, marker));
+                        var label = (name ?? string.Empty).Replace("&", string.Empty).Trim();
+                        Detail("send_label_match", string.Equals(label, "Send", StringComparison.OrdinalIgnoreCase) ||
+                            label == "보내기" || label == "전송");
+                    }
                 }
                 else Detail("send_label_match", "<unavailable>");
 

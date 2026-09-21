@@ -119,7 +119,7 @@ namespace RemoteMonitorMaster
                     primary[index] = Stage(snapshot, pinHash, report.SessionId, target, PrimaryLane,
                         family, target.OutputText, mutations);
 
-                if (family == DirectFamily && target.OcrText != null && target.OcrCapturedUtc.HasValue)
+                if (family == DirectFamily && target.OcrCapturedUtc.HasValue && !string.IsNullOrWhiteSpace(target.OcrText))
                     secondary[index] = Stage(snapshot, pinHash, report.SessionId, target, SecondaryLane,
                         OcrFamily, target.OcrText, mutations);
             }
@@ -155,10 +155,10 @@ namespace RemoteMonitorMaster
             Entry prior;
             string kind;
             string deltaText;
+            string digest = Hash(text); // One full-body digest per lane; the prefix digest below stays separate.
 
             if (snapshot.Entries.TryGetValue(key, out prior))
             {
-                string digest = Hash(text);
                 if (prior.Length == text.Length && prior.Digest == digest)
                 {
                     kind = PowerSiOutputDelta.Unchanged;
@@ -183,7 +183,7 @@ namespace RemoteMonitorMaster
                 deltaText = text;
             }
 
-            mutations.Add(new Mutation(baseKey, key, text.Length, Hash(text), pinHash, sessionId,
+            mutations.Add(new Mutation(baseKey, key, text.Length, digest, pinHash, sessionId,
                 target.Pid, target.StartUtcTicks.Value, lane, family));
             return new PowerSiOutputDelta(kind, deltaText);
         }

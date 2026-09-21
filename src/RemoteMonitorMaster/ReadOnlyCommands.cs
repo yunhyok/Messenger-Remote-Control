@@ -132,10 +132,10 @@ namespace RemoteMonitorMaster
                 case "help": body = "허용 명령: help | help help | help total status | help pwrsi | total status | pwrsi"; break;
                 case "help help": body = "help는 허용 명령을 표시합니다. help 다음에 명령을 쓰면 해당 설명을 표시합니다."; break;
                 case "help total status": body = "total status는 Slave 시각, 가동 시간, RAM, 버전과 최대 8개 프로세스의 이름·PID·CPU·RAM·경과 시간을 표시합니다. CPU는 시뮬레이션 진행률이 아닙니다."; break;
-                case "help pwrsi": body = "pwrsi는 모든 PowerSI를 한 번 수집합니다. 처음에는 수집된 Output 전체, 이후에는 마지막 전송 이후 추가분을 보냅니다. 변동이 없으면 알립니다. 조회·답장 준비는 최대 120초이며, 긴 답장은 여러 메시지로 나뉩니다. 다음 Master Ready까지 기다리세요."; break;
+                case "help pwrsi": body = "pwrsi는 모든 PowerSI를 한 번 수집합니다. 처음에는 수집된 Output 전체, 이후에는 마지막 전송 이후 추가분을 보냅니다. 변동이 없으면 알립니다. 조회·답장 준비는 최대 120초이며, 긴 답장은 여러 메시지로 나뉩니다. 다음 Master Ready까지 기다리세요. 답장 머리글의 PWRSI REPORT 번호는 Master Ready의 대괄호 번호와 같은 숫자이며, 같은 보고서의 PART는 001/003처럼 이어집니다."; break;
                 default: throw new MonitorException("COMMAND_INVALID", "Unknown read-only command.");
             }
-            return "HELP " + nonce + " | " + body + " | 명령은 표시된 소문자로 입력하세요. pwrsi에는 공백이 없고 total status의 단어 사이는 한 칸입니다. 바깥 공백은 허용하며 답장을 확인한 뒤 다음 명령을 보내세요.";
+            return "HELP " + nonce + "\r\n" + body + "\r\n명령은 표시된 소문자로 입력하세요. pwrsi에는 공백이 없고 total status의 단어 사이는 한 칸입니다. 바깥 공백은 허용하며 답장을 확인한 뒤 다음 명령을 보내세요.";
         }
 
         internal static string FormatStatus(string command, string nonce, MachineStatus state)
@@ -227,19 +227,22 @@ namespace RemoteMonitorMaster
                     "대상 수집 UTC: " + (target.CapturedUtc.HasValue ? Utc(target.CapturedUtc.Value) : "확인 불가"),
                     "설명: " + StateExplanation(target.State, target.Source) + " [code " + target.Code + "]"
                 };
+                var captured = target.State == "READ" || target.State == "VISIBLE_EMPTY";
+                if (!captured) lines.Add(RecoveryAdvice(target.Code));
+                if (!string.IsNullOrEmpty(target.VisionCode) && target.VisionCode.StartsWith("VISION_", StringComparison.Ordinal))
+                    lines.Add("로컬 LLM: " + RecoveryAdvice(target.VisionCode) + " [code " + target.VisionCode + "]");
+                // Every required status line is in place before Output; order must not depend on lazy evaluation.
                 IEnumerable<string> details = lines;
-                if (target.State == "READ" || target.State == "VISIBLE_EMPTY")
+                if (captured)
                 {
                     details = details.Concat(OutputLines(prepared?.Primary[index], target.OutputText, target.Source == "OCR"));
-                    if (!string.IsNullOrEmpty(target.OcrText))
+                    // Same predicate as Validate and the output history: whitespace-only OCR carries no capture time.
+                    if (target.OcrCapturedUtc.HasValue && !string.IsNullOrWhiteSpace(target.OcrText))
                     {
                         details = details.Concat(new[] { "별도 로컬 OCR | 수집 UTC: " + Utc(target.OcrCapturedUtc.Value) })
                             .Concat(OutputLines(prepared?.Secondary[index], target.OcrText, true));
                     }
                 }
-                else lines.Add(RecoveryAdvice(target.Code));
-                if (!string.IsNullOrEmpty(target.VisionCode) && target.VisionCode.StartsWith("VISION_", StringComparison.Ordinal))
-                    lines.Add("로컬 LLM: " + RecoveryAdvice(target.VisionCode) + " [code " + target.VisionCode + "]");
                 blocks.Add(new ReportBlock("증거: " + repeat, "증거 계속: " + repeat, details));
             }
             return PackReport(nonce, blocks, checkPreparation);
@@ -286,11 +289,12 @@ namespace RemoteMonitorMaster
         {
             Need((command == "total status" || command == "pwrsi") && Protocol.IsDiagnosticMarker("DRAFT", nonce));
             var reason = exception is OutputTooLargeException ? "전체 답장이 안전한 처리 한도(32 Mi 문자)를 넘었습니다. 내용을 잘라 보내거나 전송 이력을 갱신하지 않았습니다." :
-                exception is LinkVersionMismatchException ? "Master/Slave 버전이 맞지 않습니다. 두 프로그램을 v" + AppInfo.Version + "으로 맞추세요." :
-                exception is TimeoutException ? "Slave 응답 시간이 초과되었습니다. 자동 재시도하지 않습니다." :
+                exception is LinkVersionMismatchException mismatch ? "Slave와 통신 규약이 다릅니다 (Master " + LinkVersion.Value +
+                    " / 받은 값 " + mismatch.ActualVersion + "). 프로토콜 " + LinkVersion.Value + "을 지원하는 Slave 버전으로 맞추세요." :
+                exception is TimeoutException ? "Slave 응답 시간이 초과되었습니다. 자동 재시도하지 않습니다. Slave 화면의 수집 진행 표시를 확인한 뒤 다시 요청하세요." :
                 exception is InvalidDataException ? "Slave 응답 형식 또는 Master/Slave 버전이 맞지 않습니다." :
-                exception is AuthenticationException ? "Slave 연결 인증을 확인하지 못했습니다." :
-                exception is IOException || exception is SocketException ? "Slave 연결에서 응답을 받지 못했습니다." :
+                exception is AuthenticationException ? "Slave 연결 인증을 확인하지 못했습니다. Slave를 다시 시작하고 새 연결파일을 Master에서 여세요." :
+                exception is IOException || exception is SocketException ? "Slave 연결에서 응답을 받지 못했습니다. Slave 화면의 LISTENING 표시와 IP·방화벽을 확인하세요." :
                 "Slave 상태 조회에 실패했습니다.";
             if (command == "pwrsi")
                 return PackReport(nonce, new[] { new ReportBlock(string.Empty, string.Empty,
@@ -565,7 +569,7 @@ namespace RemoteMonitorMaster
                     {
                         Pid = 31, StartUtcTicks = captured.AddHours(-2).Ticks, ProcessName = longName,
                         CapturedUtc = captured, State = "READ", Source = "AUTO_COPY", Code = "AUTO_COPY_READ",
-                        OutputText = excerpt
+                        VisionCode = "VISION_TIMEOUT", OutputText = excerpt
                     },
                     new PowerSiTargetReport
                     {
@@ -589,6 +593,8 @@ namespace RemoteMonitorMaster
                 joined.Contains("line1 ") && joined.Contains("line12 ") && joined.Contains("로컬 OCR") && !joined.Contains("CPU") && !joined.Contains("RAM"));
             var firstExcerpt = joined.IndexOf("수집된 Output 전체", StringComparison.Ordinal);
             Need(firstExcerpt > 0 && Occurrences(joined, longName) == 1);
+            var visionIndex = joined.IndexOf("로컬 LLM: ", StringComparison.Ordinal);
+            Need(visionIndex > 0 && visionIndex < firstExcerpt && joined.Contains("[code VISION_TIMEOUT]"));
             foreach (var target in state.PowerSiReport.Targets)
             {
                 var identityAndState = target.ProcessName + " (PID " + target.Pid.ToString(CultureInfo.InvariantCulture) + ") — " +
@@ -672,9 +678,19 @@ namespace RemoteMonitorMaster
             state.PowerSiReport = new PowerSiReport { CapturedUtc = captured, SessionId = 7 };
             Need(string.Join("\n", FormatPowerSi(nonce, state)).Contains("PowerSI 대상을 찾지 못"));
 
+            state.PowerSiReport = new PowerSiReport
+            {
+                CapturedUtc = captured, SessionId = 7,
+                Targets = new[] { new PowerSiTargetReport { Pid = 34, StartUtcTicks = captured.Ticks,
+                    ProcessName = "PowerSI Blank OCR", CapturedUtc = captured, State = "READ", Source = "AUTO_COPY",
+                    Code = "AUTO_COPY_READ", OutputText = "본문", OcrText = " " } }
+            };
+            var blankOcr = string.Join("\n", FormatPowerSi(nonce, state));
+            Need(blankOcr.Contains("본문") && !blankOcr.Contains("별도 로컬 OCR") && !blankOcr.Contains("LLM 전사본"));
+
             var mismatch = FormatQueryFailure("pwrsi", nonce, new LinkVersionMismatchException("0.1.58"));
-            Need(mismatch.Length == 1 && IsReportPart(mismatch[0], nonce, 1, 1) && mismatch[0].Contains("v" + AppInfo.Version) &&
-                !mismatch[0].Contains("0.1.58"));
+            Need(mismatch.Length == 1 && IsReportPart(mismatch[0], nonce, 1, 1) && mismatch[0].Contains(LinkVersion.Value) &&
+                mismatch[0].Contains("0.1.58"));
             var timeout = FormatQueryFailure("pwrsi", nonce, new TimeoutException());
             Need(timeout.Length == 1 && timeout[0].Contains("자동 재시도하지 않습니다"));
             Need(IsExpectedQueryFailure(new InvalidDataException()) && IsExpectedQueryFailure(new SocketException()) &&

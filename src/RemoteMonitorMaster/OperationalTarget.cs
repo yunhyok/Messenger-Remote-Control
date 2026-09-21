@@ -63,6 +63,7 @@ namespace RemoteMonitorMaster
         // Read-only capture is allowed while a normal target is behind another window.
         internal void PrepareRead()
         {
+            reportedPhase = null; // Each prepared read reports its own waiting/activating phases again.
             Check();
             if (!IsMinimized(window)) return;
             RequireUsableInputDesktop();
@@ -73,7 +74,7 @@ namespace RemoteMonitorMaster
             VerifyRootIdentity();
             Report("RESTORING_TARGET");
             RunWhenVerified(VerifyMutationGuard, VerifyMutationRoot,
-                () => Need(ShowWindowAsync(window, SwRestore), "TARGET_RESTORE_REJECTED"));
+                () => Need(Attempted("ShowWindowAsync", ShowWindowAsync(window, SwRestore)), "TARGET_RESTORE_REJECTED"));
             WaitForNormalBounds();
             Check();
             VerifyFullIdentity();
@@ -95,7 +96,8 @@ namespace RemoteMonitorMaster
                 Report("ACTIVATING_TARGET");
                 var priorForeground = NativeMethods.GetForegroundWindow();
                 RunWhenVerified(VerifyMutationGuard, VerifyMutationRoot,
-                    () => Need(TryActivateOnce(() => SetForegroundWindow(window)), "TARGET_ACTIVATION_REJECTED"));
+                    () => Need(TryActivateOnce(() => Attempted("SetForegroundWindow", SetForegroundWindow(window))),
+                        "TARGET_ACTIVATION_REJECTED"));
                 var wait = Stopwatch.StartNew();
                 while (true)
                 {
@@ -157,20 +159,29 @@ namespace RemoteMonitorMaster
 
         private void CaptureRootIdentity(out string runtimeId, out string nameHash)
         {
-            Check();
-            var root = AutomationElement.FromHandle(window);
-            Need(root != null, "TARGET_ROOT_UNAVAILABLE");
-            object pid = root.GetCurrentPropertyValue(AutomationElement.ProcessIdProperty, true);
-            object password = root.GetCurrentPropertyValue(AutomationElement.IsPasswordProperty, true);
-            Need(pid is int && (int)pid == process.ProcessId && password is bool && !(bool)password,
-                "TARGET_ROOT_PROTECTED_OR_FOREIGN");
-            object native = root.GetCurrentPropertyValue(AutomationElement.NativeWindowHandleProperty, true);
-            Need(native is int && new IntPtr((int)native) == window, "TARGET_ROOT_WINDOW_CHANGED");
-            runtimeId = UiaPointProbe.Format(root.GetRuntimeId());
-            Need(!string.IsNullOrEmpty(runtimeId), "TARGET_ROOT_RUNTIME_UNAVAILABLE");
-            // Read Name only after the PID/password guard; it can contain conversation content on a bad provider.
-            nameHash = TokenStore.Hash(root.Current.Name ?? string.Empty);
-            Check();
+            // A provider can drop the root between guards; a UIA/COM failure is a stop, not an unhandled crash.
+            try
+            {
+                Check();
+                var root = AutomationElement.FromHandle(window);
+                Need(root != null, "TARGET_ROOT_UNAVAILABLE");
+                object pid = root.GetCurrentPropertyValue(AutomationElement.ProcessIdProperty, true);
+                object password = root.GetCurrentPropertyValue(AutomationElement.IsPasswordProperty, true);
+                Need(pid is int && (int)pid == process.ProcessId && password is bool && !(bool)password,
+                    "TARGET_ROOT_PROTECTED_OR_FOREIGN");
+                object native = root.GetCurrentPropertyValue(AutomationElement.NativeWindowHandleProperty, true);
+                Need(native is int && new IntPtr((int)native) == window, "TARGET_ROOT_WINDOW_CHANGED");
+                runtimeId = UiaPointProbe.Format(root.GetRuntimeId());
+                Need(!string.IsNullOrEmpty(runtimeId), "TARGET_ROOT_RUNTIME_UNAVAILABLE");
+                // Read Name only after the PID/password guard; it can contain conversation content on a bad provider.
+                nameHash = TokenStore.Hash(root.Current.Name ?? string.Empty);
+                Check();
+            }
+            catch (MonitorException) { throw; }
+            catch (Exception ex)
+            {
+                throw new MonitorException("TARGET_ROOT_UNAVAILABLE", "The operational target root could not be read.", ex);
+            }
         }
 
         private void VerifyRootIdentity()
@@ -218,6 +229,15 @@ namespace RemoteMonitorMaster
                 finally { Marshal.FreeHGlobal(memory); }
             }
             finally { CloseDesktop(desktop); }
+        }
+
+        // Record why Windows denied the call before the caller converts it into a stop reason. No retry.
+        private bool Attempted(string call, bool result)
+        {
+            if (!result)
+                log.Write("WARN", "OPERATIONAL_TARGET_DENIED", AuditLog.Field("call", call),
+                    AuditLog.Field("win32_error", Marshal.GetLastWin32Error()));
+            return result;
         }
 
         private void Report(string phase)

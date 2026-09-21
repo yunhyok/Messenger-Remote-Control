@@ -218,19 +218,20 @@ namespace RemoteMonitorMaster
             }
         }
 
+        // One SHA256 per thread; ComputeHash resets the state itself, so no Initialize is needed between uses.
+        [ThreadStatic] private static SHA256 threadHash;
+
         public static string Hash(string token)
         {
-            using (var sha256 = SHA256.Create())
+            var sha256 = threadHash ?? (threadHash = SHA256.Create());
+            var bytes = sha256.ComputeHash(Encoding.UTF8.GetBytes(token));
+            var builder = new StringBuilder(bytes.Length * 2);
+            foreach (var value in bytes)
             {
-                var bytes = sha256.ComputeHash(Encoding.UTF8.GetBytes(token));
-                var builder = new StringBuilder(bytes.Length * 2);
-                foreach (var value in bytes)
-                {
-                    builder.Append(value.ToString("X2", CultureInfo.InvariantCulture));
-                }
-
-                return builder.ToString();
+                builder.Append(value.ToString("X2", CultureInfo.InvariantCulture));
             }
+
+            return builder.ToString();
         }
     }
 
@@ -505,6 +506,8 @@ namespace RemoteMonitorMaster
             var path = Path.Combine(directory, "seen-tokens.txt");
             try
             {
+                RemoteMonitorLink.LinkSelfTest.TestMalformedParsing(); // Shared parsing guards; no socket is opened here.
+                RemoteMonitorLink.PowerSiReport.RunSelfTest();
                 string token;
                 Require(Protocol.TryParsePing("!RM PING abc-123", out token), "valid PING was rejected");
                 Require(token == "abc-123", "token changed");
@@ -589,15 +592,20 @@ namespace RemoteMonitorMaster
             }
             finally
             {
-                if (File.Exists(path))
+                // Cleanup is best effort; a leftover temporary file must never replace the self-test verdict.
+                try
                 {
-                    File.Delete(path);
-                }
+                    if (File.Exists(path))
+                    {
+                        File.Delete(path);
+                    }
 
-                if (Directory.Exists(directory))
-                {
-                    Directory.Delete(directory);
+                    if (Directory.Exists(directory))
+                    {
+                        Directory.Delete(directory, true);
+                    }
                 }
+                catch { }
             }
         }
 

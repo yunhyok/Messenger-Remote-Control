@@ -213,11 +213,20 @@ namespace RemoteMonitorMaster
 
         internal static ProbeNode Evaluate(Baseline baseline, ProbeSnapshot current, AuditLog log = null)
         {
-            return EvaluateCore(baseline, current, log, true);
+            bool blocked;
+            return EvaluateCore(baseline, current, log, true, out blocked);
         }
 
-        private static ProbeNode EvaluateCore(Baseline baseline, ProbeSnapshot current, AuditLog log, bool requireVisible)
+        // blocked: the pinned first command row exists but is offscreen or disabled, so the round cannot advance.
+        internal static ProbeNode Evaluate(Baseline baseline, ProbeSnapshot current, AuditLog log, out bool blocked)
         {
+            return EvaluateCore(baseline, current, log, true, out blocked);
+        }
+
+        private static ProbeNode EvaluateCore(Baseline baseline, ProbeSnapshot current, AuditLog log, bool requireVisible,
+            out bool blocked)
+        {
+            blocked = false;
             var selected = ValidateContinuity(baseline, current);
             if (baseline.PlainCommands)
             {
@@ -251,7 +260,9 @@ namespace RemoteMonitorMaster
                         AuditLog.Field("details_truncated", newContent.Length > 8));
                 }
                 Need(appended.Length <= 1, "RECEIVE_COMMAND_NOT_UNIQUE");
-                return appended.Length == 1 && appended[0].Enabled && (!requireVisible || appended[0].Visible) ? appended[0] : null;
+                var admissible = appended.Length == 1 && appended[0].Enabled && (!requireVisible || appended[0].Visible);
+                blocked = baseline.ReadyRow >= 0 && appended.Length == 1 && !admissible;
+                return admissible ? appended[0] : null;
             }
             var matches = selected.Texts.Where(n => Usable(n) && n.Identity.NameHash == baseline.MarkerHash).Take(2).ToArray();
             Need(matches.Length <= 1, "RECEIVE_CANDIDATE_NOT_UNIQUE");
@@ -262,7 +273,8 @@ namespace RemoteMonitorMaster
         {
             Need(accepted != null && accepted.Baseline != null && accepted.Baseline.PlainCommands &&
                 accepted.Final != null && accepted.Candidate != null, "RECEIVE_ACCEPTED_PROOF_REQUIRED");
-            var candidate = EvaluateCore(accepted.Baseline, current, log, false);
+            bool blocked;
+            var candidate = EvaluateCore(accepted.Baseline, current, log, false, out blocked);
             Need(SameCandidate(accepted.Final, accepted.Candidate, current, candidate),
                 "RECEIVE_ACCEPTED_CANDIDATE_CHANGED");
             return candidate;
@@ -524,8 +536,11 @@ namespace RemoteMonitorMaster
                     var pid = Read(() => root.GetCurrentPropertyValue(AutomationElement.ProcessIdProperty, true));
                     var password = Read(() => root.GetCurrentPropertyValue(AutomationElement.IsPasswordProperty, true));
                     Need(pid is int && (int)pid == process.ProcessId && password is bool && !(bool)password, "RECEIVE_ROOT_CHANGED");
-                    Need(new IntPtr(Read(() => root.Current.NativeWindowHandle)) == window &&
-                        UiaPointProbe.Format(Read(root.GetRuntimeId)) == snapshot.Nodes.Single(n => n.Node == 1).Identity.RuntimeId, "RECEIVE_ROOT_CHANGED");
+                    Need(new IntPtr(Read(() => root.Current.NativeWindowHandle)) == window, "RECEIVE_ROOT_CHANGED");
+                    // A dropped root returns no runtime id; report the receive stage instead of the point-probe reason.
+                    var rootRuntime = Read(root.GetRuntimeId);
+                    Need(rootRuntime != null && rootRuntime.Length > 0 && rootRuntime.Length <= 64 &&
+                        UiaPointProbe.Format(rootRuntime) == snapshot.Nodes.Single(n => n.Node == 1).Identity.RuntimeId, "RECEIVE_ROOT_CHANGED");
                     Need(log.Fingerprint(Read(() => root.Current.Name)) == snapshot.RootNameFingerprint, "RECEIVE_ROOT_CHANGED");
                 }
                 void CheckMetadataPath(AutomationElement element, ProbeNode expected, HistorySelection selection)
@@ -547,7 +562,9 @@ namespace RemoteMonitorMaster
                         var hwnd = cursor.GetCachedPropertyValue(AutomationElement.NativeWindowHandleProperty, false);
                         Need(hwnd is int, "RECEIVE_METADATA_NATIVE_UNAVAILABLE");
                         var native = new IntPtr((int)hwnd);
-                        var runtime = UiaPointProbe.Format(cursor.GetCachedPropertyValue(AutomationElement.RuntimeIdProperty, true) as int[]);
+                        var runtimeId = cursor.GetCachedPropertyValue(AutomationElement.RuntimeIdProperty, true) as int[];
+                        Need(runtimeId != null && runtimeId.Length > 0 && runtimeId.Length <= 64, "RECEIVE_METADATA_ELEMENT_CHANGED");
+                        var runtime = UiaPointProbe.Format(runtimeId);
                         Need(visited.Add(runtime), "RECEIVE_METADATA_PATH_CYCLE");
                         if (depth == 0) Need(runtime == expected.Identity.RuntimeId && (int)hwnd == expected.NativeHwnd, "RECEIVE_METADATA_ELEMENT_CHANGED");
                         if (native != IntPtr.Zero)
@@ -623,19 +640,26 @@ namespace RemoteMonitorMaster
                 if (continuousWait && plainCommands)
                 {
                     Baseline ready;
+                    var readyWait = Stopwatch.StartNew();
                     while ((ready = BindReadyBoundary(baseline, firstSnapshot, log)) == null)
                     {
+                        phaseClock.Restart(); // Each retry capture gets its own snapshot budget; the wait is bounded below.
                         Alive();
+                        Need(readyWait.Elapsed < TimeSpan.FromSeconds(60), "RECEIVE_READY_NOT_OBSERVED");
                         ReleaseLive(firstSnapshot);
                         Thread.Sleep(100);
                         firstSnapshot = Capture();
                     }
                     baseline = ready;
                 }
+                var commandBlocked = false;
                 ProbeNode Candidate(ProbeSnapshot snapshot)
                 {
-                    return acceptedProof == null ? Evaluate(baseline, snapshot, log) :
-                        ReobserveCandidate(acceptedProof, snapshot, log);
+                    if (acceptedProof != null) { commandBlocked = false; return ReobserveCandidate(acceptedProof, snapshot, log); }
+                    bool blocked;
+                    var evaluated = Evaluate(baseline, snapshot, log, out blocked);
+                    commandBlocked = blocked;
+                    return evaluated;
                 }
                 var firstCandidate = suppliedBaseline == null ? null : Candidate(firstSnapshot);
                 inspectSnapshot?.Invoke("BASELINE", firstSnapshot);
@@ -692,6 +716,12 @@ namespace RemoteMonitorMaster
                     previous = current;
                     previousCandidate = candidate;
                     if (candidate != null) progress("WAITING_FOR_REPEAT");
+                    else if (commandBlocked)
+                    {
+                        // The pinned command row stays; it is not admissible yet and no later row may replace it.
+                        log.Write("INFO", "RECEIVE_COMMAND_NOT_VISIBLE", AuditLog.Field("poll", polls));
+                        progress("COMMAND_NOT_VISIBLE");
+                    }
                     else if (plainCommands && HistoryRows(SelectHistory(current)).Skip(baseline.ReadyRow >= 0 ?
                         baseline.ReadyRow + 1 : HistoryRows(baseline.Selection).Count)
                         .SelectMany(RowContent).Any(n => Usable(n) && n.Identity.NameLength <= 64 && n.PlainCommand == null))
@@ -1033,6 +1063,20 @@ namespace RemoteMonitorMaster
                 Nodes = new List<ProbeNode>(next.Nodes) };
             var newCommand = AppendTestHistoryText(later, "total status");
             Need(Evaluate(newBound, later) == newCommand, "READY_BOUNDARY_NEXT_REQUEST");
+
+            // A pinned first command that is not yet admissible blocks the round; no later row may take its place.
+            var hidden = History(); AppendTestHistoryText(hidden, readyText);
+            AppendTestHistoryText(hidden, "pwrsi").Visible = false;
+            var hiddenBound = BindReadyBoundary(before, hidden);
+            bool blockedCommand;
+            Need(hiddenBound != null && Evaluate(hiddenBound, hidden, null, out blockedCommand) == null && blockedCommand,
+                "READY_BOUNDARY_COMMAND_NOT_VISIBLE");
+            var hiddenLater = new ProbeSnapshot { Complete = hidden.Complete, Process = hidden.Process,
+                RootNameFingerprint = hidden.RootNameFingerprint, LayoutRejection = hidden.LayoutRejection,
+                Nodes = new List<ProbeNode>(hidden.Nodes) };
+            AppendTestHistoryText(hiddenLater, "pwrsi");
+            Need(Evaluate(hiddenBound, hiddenLater, null, out blockedCommand) == null && blockedCommand,
+                "READY_BOUNDARY_BLOCKED_COMMAND_PINNED");
 
             var paddedReady = History(); var padded = AppendTestHistoryText(paddedReady, "\u00a0" + readyText + " ");
             var paddedBound = BindReadyBoundary(before, paddedReady);

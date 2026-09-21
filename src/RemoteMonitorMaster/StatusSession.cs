@@ -93,13 +93,16 @@ namespace RemoteMonitorMaster
                 Need(TryClaim(), "STATUS_SESSION_ALREADY_USED_OR_CANCELLED");
                 Need(log != null && stop != null && progress != null, "STATUS_REQUEST_INVALID");
                 Need(Thread.CurrentThread.GetApartmentState() == ApartmentState.MTA, "PROBE_REQUIRES_MTA");
+                // Fail before the expensive identity capture; OperationalTarget still performs its own check.
+                Need(!plainCommands || NativeMethods.GetForegroundWindow() == window, "TARGET_INITIAL_FOREGROUND_REQUIRED");
                 var process = ProcessIdentity.Capture(window);
                 Need(string.Equals(process.ProcessName, "KI-Messenger", StringComparison.OrdinalIgnoreCase),
                     "PROBE_NOT_KI_MESSENGER");
                 NativeMethods.WindowRectangle bounds;
                 Need(NativeMethods.GetWindowRect(window, out bounds), "STATUS_WINDOW_UNAVAILABLE");
+                var reported = firstMarker; // The background phase callback must name the current round, not the first.
                 var target = plainCommands ? new OperationalTarget(window, process, bounds,
-                    () => Cancelled || stop(), phase => progress(CompletedRounds, phase, firstMarker), log) : null;
+                    () => Cancelled || stop(), phase => progress(CompletedRounds, phase, reported), log) : null;
                 bool Stopped()
                 {
                     if (Cancelled || stop()) { Cancel(); return true; }
@@ -120,6 +123,7 @@ namespace RemoteMonitorMaster
                 var store = new TokenStore(statePath);
                 var allocated = new HashSet<string>(StringComparer.Ordinal);
                 var marker = Allocate(store, allocated, firstMarker);
+                reported = marker;
                 ReceiveProbe.Baseline original = null, baseline = null;
                 void SendReady(string requestMarker)
                 {
@@ -196,6 +200,7 @@ namespace RemoteMonitorMaster
                     Alive();
                     baseline = nextBaseline;
                     marker = nextMarker;
+                    reported = marker;
                     if (plainCommands) SendReady(marker);
                 }
             }
@@ -203,7 +208,9 @@ namespace RemoteMonitorMaster
             {
                 Cancel();
                 var reason = (ex as MonitorException)?.ReasonCode ?? "STATUS_SESSION_FAILED";
-                try { log?.Write("INFO", "STATUS_SESSION_END", AuditLog.Field("reason", reason),
+                // An unexpected failure keeps its exception identity; a declared stop reason stays INFO.
+                if (!(ex is MonitorException)) { try { log?.WriteException("STATUS_SESSION_FAILED", ex); } catch { } }
+                try { log?.Write(reason == "STATUS_SESSION_FAILED" ? "WARN" : "INFO", "STATUS_SESSION_END", AuditLog.Field("reason", reason),
                     AuditLog.Field("completed_rounds", CompletedRounds), AuditLog.Field("pending_write", PendingWrite),
                     AuditLog.Field("send_attempted", SendAttempted), AuditLog.Field("elapsed_ms", clock.ElapsedMilliseconds)); }
                 catch { }
