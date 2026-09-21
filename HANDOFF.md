@@ -1,195 +1,148 @@
-# Messenger Remote Control v0.3.3 handoff
+# Messenger Remote Control — 점검 인계
 
-## Current update — 2026-09-19, v0.3.3
+갱신: 2026-09-21. Claude를 포함한 다음 검토자가 현재 구현과 검증 범위를 파악하기 위한 진입 문서입니다. 과거 계획보다 이 문서와 실제 소스, 사용자의 최신 지시를 우선합니다.
 
-- The private Win7 v0.3.1 log stops at 2026-09-18 17:47:17 KST during the first request: ten reply parts prepared, six guarded UI sends complete, seventh rejected with `RECEIVE_READY_BOUNDARY_CHANGED`, then `STATUS_REQUEST_STOPPED` with zero completed rounds. The final 430-node snapshot completed in 5.188 seconds with stable root checks. This proves an early guarded session stop, not a one-hour idle timeout or a process crash. Ready label/metadata/row composition changes can trigger the check; the compact log does not identify the exact provider mutation.
-- Initial Ready binding and new-command admission remain strict. Once a command has been accepted, Ready's display body is historical state; all row identities/order/paths and the accepted command's exact whole body, enabled state and ancestry remain protected. No pruning, rebasing or replay is introduced. The real receive rejection code now appears in the local round-trip failure code. Ten-part regression coverage changes/blanks Ready text, removes derived Ready metadata and adds display siblings after six successful handoffs, in both current observations, while retaining strict new-admission rejection.
-- The user explicitly authorizes remembering the initially clicked chat, reading it behind other windows and bringing it forward when input is needed. Plain operating mode keeps one HWND/process-start/root identity and normal bounds for the session. Normal covered-window capture does not activate it; the selected minimized window is restored for readback, so it does not remain minimized while operation is active. Before Ready, Busy and every reply part, Master waits for at least one second of quiet input/no held keys or active menu/drag, checks the default input desktop and original identities, then requests foreground once. The two fresh reply observations occur after activation, including Busy; v0.3.2 batching and first-capture proof age remain.
-- Restore/activation checks include process and root identity before the native action, quiet input again after identity reads, cancellation, bounded asynchronous restore/foreground transitions and exact final geometry. Windows activation denial is a clear pre-write failure, with no focus tricks or uncertain-send retry. Actual write/click retains strict foreground, point, ancestry and draft checks. Lock/session switch/suspend still cancel; this update does not enable locked-desktop operation or automatic restart of closed messenger processes.
-- Product wording now explains one initial chat selection, no continuous mouse hover/foreground requirement, background waiting and target preparation states. Only Master needs upgrading; Slave v0.3.0/0.3.1/0.3.2 remains compatible through protocol 0.3.0. Pairing/settings/output-history locations are unchanged.
-- Final local Windows 10 Release builds completed with zero warnings/errors and both actual EXE self-tests passed, including ten-part Ready refresh, activation/idle/cancellation guards and UI state regressions. Both Inno Setup 7.1.0 installer builds and asset checks passed. Master install/same-version repair/uninstall/metadata/shortcut/settings/history-preservation checks passed; private evidence is in `work/installer-smoke-0b5d234e1f214aa58d4cc69444dfbc9b/`.
-- A separate-process owned WPF fixture invoked the actual compiled `OperationalTarget` helper: covered-window Check/PrepareRead preserved the other window's foreground; PrepareSend activated only the selected target; minimized restore preserved exact bounds; changed root identity and cancellation rejected before activation/restoration. All passed without messenger input, clicks or sends. An early offscreen fixture DPI mismatch was corrected in the harness, without changing product guards. Private results are in `work/operational-target-final-pass.log`; harness and copied binary also remain ignored. Independent code review found no remaining substantive P1/P2 issue. Real Win7 KI-Messenger background/restore/activation behavior remains field-unverified; use only the next ordinary request in WIN7-TEST.md, without clearing history or repeating PowerSI/HFSS work.
-- Published [v0.3.3 stable Release](https://github.com/yunhyok/Messenger-Remote-Control/releases/tag/v0.3.3) through [CI run 35424960922](https://github.com/yunhyok/Messenger-Remote-Control/actions/runs/35424960922), source/tag `e31a67c68ca33986016be00cf4990d8d81f9d8ec`. Windows Server 2025 CI passed both Release builds with zero warnings/errors, both actual EXE self-tests and both installer install/same-version repair/uninstall/metadata/shortcut/settings/history-preservation checks. Public API verifies Public/main, non-draft, non-prerelease, Latest and the exact source tag. All five assets were downloaded anonymously and checked against GitHub digests, byte lengths, SHA256SUMS, ZIP allowlists, actual installer/EXE versions, embedded source commit and matching Slave binaries. Private evidence is in `work/v033-public-verification.log` and `work/stable-v0.3.3-ci.log`. Later verification-record edits are documentation only. These checks do not establish actual Win7/Win11 or a clean offline installation without an existing runtime.
+## 1. 현재 상태와 읽는 순서
 
-Downloads (only Master needs upgrading with Slave v0.3.0/0.3.1/0.3.2):
+| 항목 | 기준 |
+|---|---|
+| 저장소 | `yunhyok/Messenger-Remote-Control`, Public, 기본 브랜치 `main` |
+| 앱·설치파일 | **v0.3.3**, Master와 Slave 모두 동일 버전 |
+| 통신 규약 | **0.3.0** — 앱 버전과 별개 |
+| 정식 배포 소스·태그 | `v0.3.3` → `e31a67c68ca33986016be00cf4990d8d81f9d8ec` |
+| 배포 이후 변경 | 문서·저장소 관리 파일 정리만 진행. 실행 코드·프로젝트·설치 스크립트 변경 없음 |
+| 호환성 | Master v0.3.3 + Slave v0.3.0/0.3.1/0.3.2/0.3.3. 0.2.x에서는 두 역할 모두 갱신 |
+| 실행 환경 | Windows 7 SP1 Master / Windows 11 Slave, .NET Framework 4.8 |
+| 이번 인계 범위 | 점검 준비와 저장소 정리. 새 기능 구현이나 새 Release가 아님 |
 
-- [Master setup v0.3.3](https://github.com/yunhyok/Messenger-Remote-Control/releases/download/v0.3.3/Messenger-Remote-Control-Master-Setup-0.3.3.exe), SHA256 `37A6B14333D86D63A26C609B5A8F0AA214082EF5F30E8CB2B860AF97222278CF`.
-- Optional [Slave setup v0.3.3](https://github.com/yunhyok/Messenger-Remote-Control/releases/download/v0.3.3/Messenger-Remote-Control-Slave-Setup-0.3.3.exe), SHA256 `AE8C1577CE7A0326250ECC9B11A002410FAB769A7872660A2E60F48B434AEB45`.
-- [SHA256SUMS.txt](https://github.com/yunhyok/Messenger-Remote-Control/releases/download/v0.3.3/SHA256SUMS.txt). Portable ZIPs remain optional.
+먼저 [AGENTS.md](https://github.com/yunhyok/Messenger-Remote-Control/blob/main/AGENTS.md)의 프로젝트 제약을 읽고 이 문서의 소스 지도와 점검 항목을 따라갑니다. 사용법은 [README.md](README.md), 설치는 [INSTALL.md](INSTALL.md), 최소 현장 확인은 [WIN7-TEST.md](https://github.com/yunhyok/Messenger-Remote-Control/blob/main/WIN7-TEST.md)와 [SLAVE-TEST.md](SLAVE-TEST.md)에 있습니다.
 
-## Previous release — v0.3.2
+[과거 인계 기록](https://github.com/yunhyok/Messenger-Remote-Control/blob/main/docs/history/HANDOFF-through-v0.3.3.md)은 별도 보존했습니다. 그 안의 5줄/600자 발췌, pre-release, 창 복원 금지 등은 당시 정책이며 현재 요구가 아닙니다. 기존 `Remote-Control-App` 저장소와 HFSS 작업은 별개입니다. 이 저장소의 출발점은 `Remote-Control-App@1365e2c249d00b2a73634c77cd7bc82247f82405`(PowerSI v0.1.58)입니다.
 
-## Current update — 2026-09-18, v0.3.2
+## 2. 실제 운영 흐름
 
-- The user reports v0.3.1 works functionally, including the previously interrupted full-output reply path, but multipart transmission is slow. This is functional field feedback, not a timed benchmark or clean-install verification.
-- The earlier private Win7 log records approximately 16.7 seconds for one part, including three full UIA snapshots taking 4.103, 4.458 and 4.054 seconds (12.615 seconds combined). The usual inter-snapshot wait is only 200 ms; readback waits stop as soon as the expected state appears. The dominant work is repeated cross-process property and pattern discovery.
-- v0.3.2 batches fresh, element-only UIA metadata/pattern and send-scope reads. A fresh accepted-command snapshot and the sender's own fresh snapshot form the two current observations, reducing the per-reply full traversal count from three to two. The first observation's age is retained; original accepted proof content serves only as an identity anchor. Accepted-command/offscreen checks, action-boundary validation, 1,400-character parts, ordering, one-use send consent, uncertain-send abort and commit-after-all-parts history remain. No cached UI state is reused across reply parts.
-- Owned, separate-process fixtures compared five elements over 20 iterations, five timing samples with alternating identity-read order. Full identity/pattern equality passed. On the WPF provider, median legacy identity capture was 372.64 ms per 100 elements versus 188.50 ms for the new metadata-plus-identity batch; security-scope reads were 32.42 versus 30.15 ms. The native WinForms proxy showed no benefit (43.82 versus 48.72 ms, security scope 0.29 versus 0.59 ms). These component timings demonstrate provider-dependent behavior, not real KI-Messenger throughput or a guaranteed Win7 speedup. Private harness/results remain in `work/ProbeCacheBenchmark.cs` and `work/v032-benchmark*.log`.
-- Actual .NET Framework self-testing found that the own WinForms root can omit `IsPassword`: the original probe's `Current.IsPassword` uses UIA's documented false default. Probe caching preserves that same default, with live pre-content checks intact; send-scope checks retain their pre-existing strict unsupported-value rejection. The focused Master EXE test passed after this compatibility correction.
-- Regression checks cover actual .NET Framework UIA cache/identity/pattern compatibility, malformed security metadata, two distinct current observations, shared first-capture age and expiry, cancellation, changed owner/window/bounds/message/Ready/ancestry, and nine offscreen reply parts with one-use proofs and one durable reservation. Independent review found no release-blocking correctness or security issue.
-- Local Windows 10 Release builds completed with zero warnings/errors; both actual EXE self-tests, ZIP packages, both Inno Setup installer builds and release asset checks passed. Master installer install/same-version repair/uninstall/metadata/shortcut/settings/history-preservation checks passed; private evidence is in `work/installer-smoke-1a5d5187d01a4b8b84a3ba81af028f0d/`.
-- Published [v0.3.2 stable Release](https://github.com/yunhyok/Messenger-Remote-Control/releases/tag/v0.3.2) through [CI run 35328184548](https://github.com/yunhyok/Messenger-Remote-Control/actions/runs/35328184548), source/tag `b07a5fd9a8a44a9426aba14b1e593cede250a67d`. Windows Server 2025 CI passed both builds with zero warnings/errors, both actual EXE self-tests and both installer install/same-version repair/uninstall/metadata/shortcut/settings/history-preservation checks. The public API confirms Public/main, non-draft, non-prerelease, Latest and the exact source tag. All five assets were downloaded anonymously and checked against GitHub digests, byte lengths, SHA256SUMS, ZIP allowlists, actual installer/EXE versions, embedded source commit and matching Slave binaries. Private verification evidence is in `work/v032-public-verification.log`; CI evidence is in `work/stable-v0.3.2-ci.log`. Later verification-record changes are documentation only.
-- App/installers are v0.3.2; protocol remains 0.3.0. Only Master needs to upgrade; existing Slave v0.3.0/0.3.1 and pairing/settings/history remain compatible. Actual Win7 messenger speed, target-OS installation and a clean offline installation without an existing runtime remain unverified for this update. Do not restart PowerSI/HFSS field tests.
+1. Master 운용 Start 후 5초 안에 KI-Messenger의 나와의 대화창을 한 번 선택합니다. 해당 세션의 HWND, 프로세스 시작 시각, UIA root, 창 위치·크기를 고정합니다.
+2. 대화창을 확인한 뒤 `Master Ready [회차 번호]`를 보냅니다. Ready 이후 **새 메시지의 전체 본문**이 허용 명령과 일치해야 접수합니다.
+3. `pwrsi`/`total status`는 처리 안내를 한 번 보낸 뒤 Slave에 요청합니다. 처리 중 다른 메시지는 큐에 넣지 않고 무시합니다. `help`에는 느린 조회 안내가 없습니다.
+4. Slave는 PowerSI별 수집 자료·출처·시각·상태를 반환합니다. Master가 전체/추가 Output을 판별하고 최대 1,400자씩 고정된 답장을 준비합니다.
+5. 각 부분 전송 전에 같은 대화와 접수 명령을 다시 확인합니다. 모든 부분의 보호된 UI 전송이 완료되어야 Output 이력을 저장하고 다음 Ready로 돌아갑니다.
 
-Downloads (Master upgrade is sufficient with Slave v0.3.0/0.3.1):
+허용 명령: `help`, `help help`, `help total status`, `help pwrsi`, `total status`, `pwrsi`. 임의 명령 실행, 자동 감시, PowerSI 실행·종료는 제공하지 않습니다.
 
-- [Master setup v0.3.2](https://github.com/yunhyok/Messenger-Remote-Control/releases/download/v0.3.2/Messenger-Remote-Control-Master-Setup-0.3.2.exe), SHA256 `1EF28C778F94F00F927AAA65716A83413D6484F78904C1438E590DC94D3D2D25`.
-- Optional [Slave setup v0.3.2](https://github.com/yunhyok/Messenger-Remote-Control/releases/download/v0.3.2/Messenger-Remote-Control-Slave-Setup-0.3.2.exe), SHA256 `79D30AFB79C0D2E6EC645E547FC8593F985F640E510DB68C5BF5A307285E7346`.
-- [SHA256SUMS.txt](https://github.com/yunhyok/Messenger-Remote-Control/releases/download/v0.3.2/SHA256SUMS.txt). Portable ZIPs remain optional.
+일반 창 뒤에서도 수신 검사를 계속합니다. 최소화된 선택 창은 읽기 전에 복원합니다. Ready·처리 안내·각 답장 입력 전에 PC 입력이 1초 이상 멈추고 누른 키·메뉴·끌기가 없는지 확인한 다음 선택 창만 앞으로 가져옵니다. 마우스를 계속 올려둘 필요는 없습니다. 다른 HWND/프로세스를 찾아 대체하지 않습니다.
 
-## Previous release — v0.3.1
+Windows 활성화 거부, 대상 변경, 실제 입력 중 간섭 또는 불확실한 전송은 사유를 남기고 중단합니다. 잠금·사용자 세션 전환·절전 후 자동 재개하지 않습니다. 상시 idle 종료 제한은 없지만, 모든 환경 변화에서 세션이 유지된다는 보장은 아닙니다.
 
-## Current update — 2026-09-18, v0.3.1
+## 3. 소스 지도
 
-- The private Win7 SP1 v0.3.0 field log confirms a completed Slave query, nine prepared replies (10,364 characters), and a clean guarded first-part UI send. Before part two, whole-row matching continued to find the same command but the visibility/enabled eligibility check returned no candidate. After 65 seconds, the round stopped with `ROUNDTRIP_REOBSERVATION_FAILED`. The compact log cannot distinguish an offscreen node from a disabled node; no raw message content is needed or published for this diagnosis.
-- Revalidation now permits an already accepted command to be offscreen while fresh snapshots still prove its enabled state, exact body and identity, ancestry, Ready boundary and target conversation. Initial command admission still requires visibility. Missing, replaced, disabled or changed requests still stop sending. No scrolling, old-proof reuse, send retry or history-advance relaxation is introduced.
-- App and installers are v0.3.1; wire protocol remains 0.3.0. Existing Slave v0.3.0 can stay installed; only Master needs this fix. Pairing, settings and checkpoint history remain compatible. The interrupted v0.3.0 report did not reach the checkpoint, so a new request may repeat its first part while including previously unsent content.
-- Regression checks cover nine offscreen reply handoffs with one durable request reservation, initial offscreen admission rejection, disabled/missing/recreated/changed/split-body candidates, ignored subsequent traffic, and existing owner/window/freshness/one-use guards. Non-content logs now include candidate visibility/enabled state and the actual prepared/confirmed/failed reply counts. Independent review found no remaining P1/P2 issue.
-- Local Windows 10 Release builds completed with zero warnings/errors; both actual EXE self-tests, both Inno Setup installer builds and release asset checks passed. Master installer install/same-version repair/uninstall/metadata/shortcut/settings/history-preservation checks also passed; private evidence is in `work/installer-smoke-e49cc494b9a743bbb5146b6f02568611/`.
-- Published [v0.3.1 stable Release](https://github.com/yunhyok/Messenger-Remote-Control/releases/tag/v0.3.1) through [CI run 35324995856](https://github.com/yunhyok/Messenger-Remote-Control/actions/runs/35324995856), source/tag `fa567b88c3c91feb5bfd0adf200e473e28b75bdb`. Windows Server 2025 CI passed both builds, both actual EXE self-tests and both installer install/same-version repair/uninstall/metadata/shortcut/settings/history-preservation checks. The public API confirms Public/main, non-draft, non-prerelease, Latest and the exact source tag. All five assets were downloaded anonymously and checked against GitHub digests, byte lengths, SHA256SUMS, ZIP allowlists, actual installer/EXE versions, embedded source commit and matching Slave binaries. Private verification evidence is in `work/v031-public-verification.log`. Later verification-record changes are documentation only.
-- Real Win7/Win11 messenger confirmation and a clean offline installation without an existing runtime remain unverified for this update. CI does not substitute for these environments. Do not restart completed PowerSI or ongoing HFSS tests; see [WIN7-TEST.md](WIN7-TEST.md) for the short multipart/next-query check.
+모든 경로는 저장소 루트 기준입니다. 별도의 solution/test 프로젝트 없이 두 `.csproj`와 실제 EXE의 `--self-test`를 사용합니다. `RemoteMonitorLink/*.cs`는 양쪽 프로젝트에 공유 소스로 포함됩니다.
 
-Downloads (Master upgrade is sufficient when Slave v0.3.0 is installed):
+| 검토 대상 | 진입점·주요 파일 |
+|---|---|
+| Master 시작·화면 | `src/RemoteMonitorMaster/Program.cs` → `MasterHubForm.cs` → `ReceiveForm.cs` |
+| 운영 세션·Ready·다음 요청 | `src/RemoteMonitorMaster/StatusSession.cs` |
+| 처음 선택한 창 기억·복원·활성화 | `src/RemoteMonitorMaster/OperationalTarget.cs` |
+| 명령 접수·Ready 경계·재확인 | `src/RemoteMonitorMaster/ReceiveProbe.cs`, `ReceiveMetadata.cs` |
+| 최신 UIA 읽기·캐시 | `src/RemoteMonitorMaster/ReadOnlyProbe.cs`, `ProbeElementCache.cs` |
+| 요청부터 분할 발송·최종 이력 저장 | `src/RemoteMonitorMaster/RoundTripTest.cs`, `SupervisedSendTest.cs` |
+| 실제 입력·클릭·대상 확인 | `src/RemoteMonitorMaster/SupervisedSendTest.cs`, `MouseClickInput.cs`, `UiaPointProbe.cs` |
+| 명령 처리·보고서 구성 | `src/RemoteMonitorMaster/ReadOnlyCommands.cs` (`FormatPowerSi`) |
+| 전체/추가/변경 Output과 이력 | `src/RemoteMonitorMaster/PowerSiOutputHistory.cs` |
+| Slave 시작·공용 수집 | `src/RemoteMonitorSlave/Program.cs`, `SlaveForm.cs` (`CollectRemoteOutput` → `ReadOutputBuffer`, `ResponsiveStep`) |
+| 직접 버퍼·자동 복사 | `src/RemoteMonitorSlave/OutputBufferCapture.cs`, `OutputAutoCopy.cs` |
+| 목록·대상 식별·응답 검사·화면 | `src/RemoteMonitorLink/ProcessInventory.cs`, `PowerSiObservation.cs`, `PowerSiScreenCapture.cs` |
+| 로컬 이미지 판독 | `src/RemoteMonitorLink/PowerSiVision.cs`, `LocalVisionClient.cs` |
+| 인증 통신·버전·복수 보고서 | `src/RemoteMonitorLink/StatusTransport.cs`, `LinkTypes.cs`, `PowerSiReport.cs` |
+| 자체 검사 집계 | `src/RemoteMonitorMaster/Core.cs`, `src/RemoteMonitorLink/LinkSelfTest.cs`; 관련 클래스의 `RunSelfTest` |
+| 빌드·설치·배포 | `scripts/`, `installer/MessengerRemoteControl.iss`, `.github/workflows/ci.yml` |
 
-- [Master setup v0.3.1](https://github.com/yunhyok/Messenger-Remote-Control/releases/download/v0.3.1/Messenger-Remote-Control-Master-Setup-0.3.1.exe), SHA256 `84F70C427D2568E950042EDC3CAB472B7370A441DAF142A4D6366670FACA2E73`.
-- Optional [Slave setup v0.3.1](https://github.com/yunhyok/Messenger-Remote-Control/releases/download/v0.3.1/Messenger-Remote-Control-Slave-Setup-0.3.1.exe), SHA256 `2DF280596D021698923D97BCCED959B269BBD4F6D79B2DD1D28F1B99D4F7DBCA`.
-- [SHA256SUMS.txt](https://github.com/yunhyok/Messenger-Remote-Control/releases/download/v0.3.1/SHA256SUMS.txt). Portable ZIPs remain optional.
+진단용 화면과 과거 실험 경로도 남아 있습니다. 운용 경로를 확인할 때는 `StatusSession`의 plain-command 경로부터 추적하고, 비슷한 이름의 진단 함수만 수정하지 않도록 합니다.
 
-## Previous release — v0.3.0
+## 4. 유지해야 할 동작과 데이터 경계
 
-## Current update — 2026-09-18, v0.3.0
+- **Pending:** Windows 응답 검사에서 Pending이면 `전체 Process Name (PID): Pending`만 회신합니다. 각 수집 단계 전후 확인에서 Pending으로 바뀌면 이미 확보한 Output도 제외합니다. 추가 활성화·캡처·복사·LLM 호출·재시도를 하지 않습니다. PowerSI 내부 계산 대기와 Windows 비응답은 구분합니다.
+- **대상 식별:** PID만 사용하지 않습니다. 시작 시각·세션을 함께 고정하고, Output 이력은 Slave 인증서·세션·PID·시작 시각·출처 계열로 분리합니다.
+- **전체와 추가분:** 처음에는 수집된 전체 본문, 다음에는 기존 본문의 정확한 접두부 뒤에 추가된 부분만 보냅니다. 같으면 추가 Output 없음, 접두부/출처가 바뀌거나 비워지면 변경 안내와 현재 전체 본문을 보냅니다. OCR은 수집된 뷰포트 범위이며 보이지 않는 전체 로그를 확보했다고 주장하지 않습니다.
+- **이름·분할:** 한 보고서의 첫 등장은 전체 이름+PID입니다. 32자를 넘는 이름의 재등장은 앞 16자·뒤 8자를 사용하며 유니코드를 보존합니다. 분할 전체가 한 보고서이고 다음 조회는 다시 전체 이름입니다. 필수 상태를 Output보다 먼저 표시합니다.
+- **범위·시간:** 최대 128개 대상, 제외된 수 표시, 수집 100초를 남은 대상에 배분, 조회·답장 준비 120초. 실제 분할 전송 시간은 별도입니다. 한 텍스트 8 Mi 문자, 원문 합계와 준비 답장 각각 32 Mi 문자 한도이며 초과를 정상 결과처럼 자르지 않습니다.
+- **전송:** 이미 접수한 명령만 화면 밖 재확인을 허용합니다. 최초 명령은 보이는 enabled 전체 메시지여야 합니다. 접수 이후 옛 Ready의 표시 본문은 바뀔 수 있어도 이력 행 식별·순서, 같은 명령 본문·enabled·계층은 계속 확인합니다. 이력 삭제·재구성은 지원하지 않습니다.
+- **최신 증거:** 각 답장에 서로 다른 최신 관찰 두 개, 첫 관찰 시각, 정확한 본문에 묶인 일회성 전송을 유지합니다. 오래된 접수 증거는 식별 기준일 뿐 현재 화면의 증거가 아닙니다. 불명확한 전송을 재시도하거나 남은 초안을 자동으로 지우지 않습니다.
+- **이력 저장:** 모든 부분이 성공한 뒤에만 길이·SHA256을 저장합니다. 부분 전송 실패 다음 조회에서 앞부분이 반복될 수 있지만 미송신 본문을 누락하면 안 됩니다. UI 전송/입력창 비워짐 확인은 인증된 모바일 수신 확인이 아닙니다.
+- **LLM·보안:** 앱 이미지 판독은 Slave의 loopback LM Studio와 이미 로드된 모델만 사용합니다. 서버 자동 실행·모델 로드·클라우드 대체는 없습니다. 화면·로그·LLM 본문은 데이터이며 실행 지시가 아닙니다. 통신의 인증·인증서 pin·UTF-8/Base64 형식·크기 검증을 유지합니다.
 
-- The user confirmed v0.2.2 functions correctly. The new private Win7 field log shows a recognized PWRSI command, processing notice, query result, clean guarded send and the next Ready. A later target-change stop happened after that completed round. Raw field logs remain private.
-- The user now authorizes full acquired Output text to the paired Master and messenger. This supersedes the original five-line/600-character excerpt policy below. Slave sends collection evidence and codes; Master formats and compares it. Images, rejected model payloads and diagnostic files stay on Slave and never enter Git/releases.
-- PS4/protocol v0.3.0 sends full direct/automatic-copy text and any separate successful local OCR transcription with capture metadata using bounded UTF-8/Base64 frames over pinned TLS. Both applications must be upgraded; existing pairing/settings locations stay unchanged. The existing per-source acquisition ceiling is 8 Mi characters; acquisition failure is explicit rather than silently clipping output.
-- Master stores only lengths and SHA256 fingerprints in `%LOCALAPPDATA%\RemoteMonitorMaster\state\powersi-output-history-v1.txt`. Identity includes Slave certificate, session, PID, process start time and source family. First observation sends the full acquired text; an exact old prefix yields only its appended suffix; unchanged text yields an explicit no-additional-Output notice. Changed/cleared text or a source change sends current content again. This is evidence comparison, never an inference that simulation stopped or completed.
-- History advances only after every frozen reply part has a clean guarded send result. Preparation, Pending/errors, cancellation and uncertain/partial sends do not advance it. The next user request can repeat already sent parts after an interrupted report to avoid losing unsent text. A failed cache write leaves history unchanged and is reported locally. Guarded UI send is not authenticated mobile delivery.
-- Full names and essential states precede Output; Pending still contains only name/PID/Pending. Messages remain at most 1,400 characters, including report ID and part count. Long lines split without breaking surrogate pairs; control code points are displayed as `\uXXXX`; line endings are normalized. Larger reports take longer to send; existing target/proof/input checks remain enforced and stop uncertain sends.
-- Ready/processing/ignore-until-next-Ready behavior is preserved. No automatic monitoring, simulation restart, LLM startup/loading, cloud inference or repeated completed field tests were added.
-- Each raw batch and prepared reply set has an explicit 32 Mi-character aggregate bound to protect the Win7 Master. Oversize batches retain target identities and Pending states but replace other data with REPORT_TOO_LARGE; no output history advances. Formatting enumerates bounded lines/chunks, supports cancellation/deadline checks, and never silently clips a normal report.
-- Independent reviews identified and fixed surrogate-boundary cases in frame counts and history-prefix hashing, and added aggregate/preparation bounds. A real .NET Framework history-only stress check reproduced intermittent checkpoint IOException (3/100, IO_80070000); checkpoint writes now retry at most twice after 10/20 ms, rereading and requiring the staged disk revision each time. Messenger sends are never retried. The subsequent targeted loop passed 100/100, and failure codes are logged without raw text.
-- Final local Windows 10 Release builds, both actual EXE self-tests, ZIP/installer asset checks, and Master installer install/same-version repair/uninstall/metadata/shortcut/settings/history-preservation checks passed. Local smoke evidence remains private in `work/installer-smoke-9795aecb0b334fb2a269af5d3df61228/`.
-- Published [v0.3.0 stable Release](https://github.com/yunhyok/Messenger-Remote-Control/releases/tag/v0.3.0) through [CI run 35322811591](https://github.com/yunhyok/Messenger-Remote-Control/actions/runs/35322811591), source/tag `329ea454e270a22c780b17f9ee294bd3ff319268`. Windows Server 2025 CI passed both builds, both actual EXE self-tests and both installer install/same-version repair/uninstall/metadata/shortcut/settings/history-preservation checks. Public API confirms non-draft, non-prerelease, Latest and the exact source commit. All five assets were anonymously downloaded and verified against GitHub digests, byte lengths, SHA256SUMS, ZIP allowlists, installer/EXE versions, embedded source commit and matching Slave binaries. Later verification-record changes are documentation only.
-- New real Win7/Win11 full-output/delta messenger behavior and clean offline installation without an existing runtime remain field-unverified; CI does not replace those environments. Existing long PowerSI/HFSS tests were not restarted.
+## 5. 최근 수정과 확인 수준
 
-Downloads (both roles must upgrade):
+| 변경 | 근거와 한계 |
+|---|---|
+| v0.3.0 전체 Output·Master 추가분 처리 | 원문 전달 계약 PS4, 프로토콜 0.3.0, 길이/해시 이력 도입. 이전 5줄/600자 제한 폐기 |
+| v0.3.1 접수 명령의 화면 밖 재확인 | 첫 부분 이후 명령의 표시 상태 때문에 후속 전송이 중단되는 경로 수정. 최초 접수 조건은 유지 |
+| v0.3.2 분할 속도 | UIA 속성 읽기 배치, 부분별 전체 순회 3회→2회. 별도 WPF 시험에서 개선; 실제 KI-Messenger 속도 보장은 아님 |
+| v0.3.3 Ready 재확인 | 비공개 **v0.3.1** 로그에서 첫 요청 10부분 중 6부분 뒤 7번째 전 `RECEIVE_READY_BOUNDARY_CHANGED` → `STATUS_REQUEST_STOPPED`. 장시간 idle 종료나 프로세스 충돌이 입증된 로그는 아님. 정확한 Ready 표시 변화는 로그만으로 확정 불가 |
+| v0.3.3 선택 창 자동 준비 | 배경 읽기, 선택 창 복원·활성화, 입력 대기. 다른 창 대체나 강제 focus 우회는 없음 |
 
-- [Master setup v0.3.0](https://github.com/yunhyok/Messenger-Remote-Control/releases/download/v0.3.0/Messenger-Remote-Control-Master-Setup-0.3.0.exe), SHA256 `E902C1B52F10E1B49258D85EE5BEE967AC43E208CC86C884828CE48B3A30375A`.
-- [Slave setup v0.3.0](https://github.com/yunhyok/Messenger-Remote-Control/releases/download/v0.3.0/Messenger-Remote-Control-Slave-Setup-0.3.0.exe), SHA256 `9BF6962E706517E096C37D5DD3797F44AB85E89EC578469F21CB5DD86E50C066`.
-- [SHA256SUMS.txt](https://github.com/yunhyok/Messenger-Remote-Control/releases/download/v0.3.0/SHA256SUMS.txt). Portable ZIPs remain optional.
+**v0.3.3 검증 완료:** 로컬 Windows 10에서 두 Release 빌드(경고/오류 0), 두 실제 EXE 자체 검사, 두 Inno Setup 7.1.0 설치파일·자산 검사, Master 설치/동일 버전 재설치/제거/설정·이력 보존 검사. 별도 WPF 시험 창에서 배경 읽기 시 전면 유지, 선택 창 활성화, 정확한 위치·크기 복원, root 변경·취소 거부를 확인했습니다.
 
-## Historical releases and earlier scope
+[CI run 35424960922](https://github.com/yunhyok/Messenger-Remote-Control/actions/runs/35424960922)은 Windows Server 2025에서 두 빌드·실제 EXE 검사와 양쪽 설치/동일 버전 재설치/제거/설정 보존을 통과했습니다. 공개 다운로드 5개는 익명 다운로드, GitHub digest·길이·SHA256SUMS, ZIP 파일 허용 목록, 설치파일/EXE 버전, 내장 소스 커밋, 두 ZIP의 Slave 바이너리 일치를 확인했습니다.
 
-# Messenger Remote Control v0.2.2 handoff
+**미확인:** 실제 Win7 KI-Messenger에서 v0.3.3의 배경 읽기·복원·활성화와 다음 요청까지의 운영, 이번 버전의 실제 Win7/Win11 설치, .NET 4.8이 없는 깨끗한 오프라인 PC의 선행 런타임/UAC/재부팅 경로. 동일 버전 재설치 결과를 모든 이전 버전 업그레이드의 증거로 보지 않습니다. 2026-09-21 인계 준비 요청에는 새로운 현장 성공/실패 결과가 포함되지 않았습니다.
 
-## Current update — 2026-09-18, v0.2.2
+## 6. Claude 점검 우선순위
 
-- The private Win7 SP1 v0.2.1 field log confirms Ready was sent and the first receive baseline then rejected `RECEIVE_HISTORY_CONTENT_CHANGED` before command recognition. The old row 19 primary Name changed while row/path/native identities matched; history grew from 22 to 25 rows. The log proves a stopped session, not an application crash, and does not reveal the changed private text.
-- Each locally sent Ready now carries the round marker. The first receive capture binds an exact, newly appended whole Ready row, keeps a cursor immediately after it, and preserves an already-arrived command. Only this explicit boundary permits older display-body refreshes; old rows never become commands. Missing Ready waits read-only within the existing 15-second phase limit; ambiguous/wrong boundaries remain rejected.
-- Operational sessions take the first complete allowed command after Ready. Additional messages/commands are ignored without queuing until the next Ready; they cannot replace the accepted command or trigger another query. Ready-through-command bodies and all structural row/target checks remain strict. Later copies of Ready and changed bodies in ignored traffic do not stop an established request. One processing notice explains the ignore policy.
-- Faster acknowledgement: the first processing notice uses the just-observed proof when younger than five seconds, with the existing 15-second pre-write validity checks still enforced. No retry on expiry/uncertain sends. Results after queries and every multipart reply still revalidate. Operational polling pauses 200 ms between full snapshots and uses compact logs for receive, refresh and send. Actual field latency has not been measured for v0.2.2.
-- Adjacent clock-shaped siblings are recognized and kept separate from command bodies. Displayed minute-resolution times cannot distinguish same-minute requests and are not the ordering key; the unique Ready boundary, message order and exact candidate checks are used.
-- App/installers are v0.2.2; protocol remains v0.2.0 and existing Slave v0.2.0 is compatible. This is a Master-only behavior fix. Both local Release builds and actual EXE self-tests passed on Windows 10; the final Master build/self-test was repeated after the Ready outer-space/source-hash guard. New checks cover the 22-to-25-row field shape, immediate and pre-Ready commands, ignored extra traffic and Ready quotations, no queue across rounds, invalid/missing Ready, raw candidate/target changes, one-time Busy reservation and refreshed final handoff. Independent review found no remaining release blocker. Do not restart long PowerSI/HFSS tests.
+아래 질문은 이미 확인된 버그 목록이 아닙니다.
 
-Published [v0.2.2 stable Release](https://github.com/yunhyok/Messenger-Remote-Control/releases/tag/v0.2.2) through [CI run 35317597397](https://github.com/yunhyok/Messenger-Remote-Control/actions/runs/35317597397), source/tag `1ced5f7e18d7014e20d7840cef495fdcc44b7e15`. CI on Windows Server 2025 passed both builds, both actual EXE self-tests and both installer install/same-version repair/uninstall/metadata/shortcut/local-data checks. Public API confirms non-draft, non-prerelease and Latest v0.2.2. All five assets were downloaded anonymously and checked against GitHub digests, byte lengths, SHA256SUMS, ZIP allowlists, EXE/installer versions and embedded source commit; the Slave binaries match between ZIPs. Real Win7 messenger timing and the new end-to-end field path remain unverified; these CI results do not establish real Win7/Win11 or clean missing-runtime installation. Later edits to this record are documentation only.
+1. **세션 수명:** Ready 직후 명령, 접수 후 추가 메시지, 분할 후 다음 Ready에서 정상 대기가 유지되는가? 안전 중단과 앱 종료를 로그 코드로 구분할 수 있는가?
+2. **창과 입력:** 배경 읽기에 불필요한 foreground 요구가 남았는가? 활성화/복원 전후 취소·PID 재사용·root 변경·입력 간섭을 막는가? 실제 입력 전 최신 검사가 유지되는가?
+3. **수신 증거:** 최초 접수와 접수 후 재확인의 차이가 모든 호출부에 일관적인가? Ready 본문 완화가 명령 변경·삭제·교체·재실행을 허용하지 않는가?
+4. **본문과 이력:** 전체/추가/빈/변경 본문, 긴 유니코드 이름·줄, 분할 실패, 이력 기록 실패에서 누락이나 조기 체크포인트가 없는가?
+5. **Slave와 통신:** 수집 중 Pending 전환, LLM 장애, 취소·시간 초과, PID 재사용이 다른 대상 결과를 지우지 않는가? 크기·형식·인증 검사가 양쪽에서 일치하는가?
+6. **검사 공백:** 실제 호출 경로를 검증하는 검사인지, 합성 시험만 확인한 부분을 현장 성공으로 오인하지 않는지 구분한다.
 
-- [Master setup v0.2.2](https://github.com/yunhyok/Messenger-Remote-Control/releases/download/v0.2.2/Messenger-Remote-Control-Master-Setup-0.2.2.exe), SHA256 `EBBB97C551279219488369D858B0D50DC5E6BD54A4F095F3AFD129E12286AB1A`.
-- Optional [Slave setup v0.2.2](https://github.com/yunhyok/Messenger-Remote-Control/releases/download/v0.2.2/Messenger-Remote-Control-Slave-Setup-0.2.2.exe), SHA256 `B8CA7FB887F78FA9767BE6AE971B23853EF60FE7F828497402A3759C33289D5F`.
-- [SHA256SUMS.txt](https://github.com/yunhyok/Messenger-Remote-Control/releases/download/v0.2.2/SHA256SUMS.txt). Portable ZIPs remain optional; deliver the setup EXE links to the user.
+인계 준비 중 확인한 **메타데이터 불일치**: 두 `src/RemoteMonitorMaster/app.manifest`, `src/RemoteMonitorSlave/app.manifest`의 `assemblyIdentity`는 `0.2.1.0`이고 `.csproj`의 앱/파일 버전은 `0.3.3/0.3.3.0`입니다. 실제 UI·설치파일 버전 검사는 0.3.3으로 통과했습니다. 매니페스트 버전의 의도와 영향은 검토가 필요하며, 이를 실행 장애 원인으로 단정하지 않습니다. 이번 문서 정리에서 배포 코드나 매니페스트를 바꾸지는 않았습니다.
 
-## Stable release policy — 2026-09-18
+검토 결과에는 중요도(P1/P2/P3), 파일·행/함수, 재현 조건, 영향, 최소 수정안, 필요한 회귀 검사를 적습니다. 근거가 부족하면 가설로 표시합니다. 코드를 수정한다면 실제 진입점을 추적하고 기존 공용 함수를 먼저 재사용합니다.
 
-The user requested regular Releases rather than pre-releases. CI now accepts the exact `v<source-version>` tag and publishes a stable Release marked Latest. The v0.2.1 application behavior and compatibility are unchanged; this update changes delivery only. Existing RC tags/assets remain historical and are not overwritten.
+이전 네 스킬의 의도도 이어갑니다: integrated-agent-flow는 독립 검토와 근거 확인, ponytail은 최소 변경과 기존 도구 재사용, visualize는 필요한 경우만 도식화, i-have-adhd는 명확한 다음 행동과 적은 수동 단계입니다. 해당 플러그인이 없어도 이 문서와 AGENTS.md만으로 점검할 수 있습니다.
 
-Published [v0.2.1 stable Release](https://github.com/yunhyok/Messenger-Remote-Control/releases/tag/v0.2.1) through [CI run 35288794647](https://github.com/yunhyok/Messenger-Remote-Control/actions/runs/35288794647), source/tag `b422307386a071d8a01606d6103f4badf6fddcdc`. Both builds, actual EXE self-tests and both installer install/same-version repair/uninstall/configuration-preservation checks passed on Windows Server 2025. The public API confirms `prerelease=false`, `draft=false` and Latest points to v0.2.1. All five assets were downloaded anonymously; GitHub digests, sizes, SHA256SUMS, exact ZIP entries, product/file versions, embedded source commit and identical Slave binaries across ZIPs passed. Real Win7/Win11 and messenger field limitations below remain unchanged. Later verification-record changes are documentation only.
+## 7. 검증 명령과 배포
 
-- [Master installer](https://github.com/yunhyok/Messenger-Remote-Control/releases/download/v0.2.1/Messenger-Remote-Control-Master-Setup-0.2.1.exe), SHA256 `A463BE21596CA4F25362B4E82B76F653345AC6F45DA31A5A4ED9009DF40A6813`.
-- [Slave installer](https://github.com/yunhyok/Messenger-Remote-Control/releases/download/v0.2.1/Messenger-Remote-Control-Slave-Setup-0.2.1.exe) / [Slave ZIP](https://github.com/yunhyok/Messenger-Remote-Control/releases/download/v0.2.1/Messenger-Remote-Control-Slave-v0.2.1-win11-net48.zip), ZIP SHA256 `D12EC20A7B78DB89AA5F8B8A49650E6C87CB448DA6AB9787B0CCC69A45AC5658`.
-- [Full ZIP](https://github.com/yunhyok/Messenger-Remote-Control/releases/download/v0.2.1/Messenger-Remote-Control-v0.2.1-win7-win11-net48.zip) / [SHA256SUMS.txt](https://github.com/yunhyok/Messenger-Remote-Control/releases/download/v0.2.1/SHA256SUMS.txt).
+저장소 루트에서 Windows PowerShell과 .NET SDK 8 계열을 사용합니다(CI는 8.0.x). 앱 대상 런타임은 계속 .NET Framework 4.8입니다.
 
-## Current update — 2026-09-17
+```powershell
+git status --short --branch
+git diff v0.3.3 -- src scripts installer .github/workflows/ci.yml
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-package.ps1
+```
 
-- User-requested production notifications: a bound, locally started plain-command session sends `Master Ready`, sends the fixed processing/wait notice before a `pwrsi` or `total status` query, sends the result parts, then sends `Master Ready` again. No notice is attempted before the self-chat/window is selected and validated. Help skips the slow-query notice.
-- The private Win7 SP1 v0.2.0 field log proves command recognition and a completed Slave query, followed by `SEND_WRITE_NOT_VERIFIED`: one SetValue returned, input classified OTHER, zero Send clicks. The log does not contain the draft, so the precise text difference is unproven. A separate earlier session rejected changed old history content; that guard remains intact.
-- Shared send readback now treats CRLF and LF as equivalent and preserves every other character, including whitespace and numbers. It waits up to six read-only samples for provider propagation, within the existing overall send deadline. No write/click retry, broad whitespace normalization or draft overwrite is added. Private logs record lengths, CR/LF counts and a keyed fingerprint, never draft text.
-- Ready and processing notices use fixed allowlisted text and one-use consent through the same guarded sender. Busy notices consume a fresh command proof and reserve its token before a Slave query. A failed notice prevents the query/rearm; cancellation and pending drafts include notice attempts. Revalidation shows WAIT, not READY. Startup baseline precedes Ready so an immediate new command is retained; notices do not count as commands.
-- App/installer version is 0.2.1; the unchanged wire contract remains 0.2.0. Existing offline Slave v0.2.0 works with the new Master. Updated Slave packages are optional for this Master-only behavior fix. `total status` labels the transmitted version as protocol version.
-- Both local Release builds and actual EXE self-tests passed on Windows 10; ZIP packaging passed. New checks cover CRLF/LF equivalence, changed digits/whitespace rejection, delayed readback, cancellation, exact one-use notices, pending notice drafts, and a command immediately after Ready.
-- Actual KI-Messenger send success for this update remains field-unverified. The original failed draft must be reviewed/cleared by the user before a new session; the app must not clear it automatically. Transport failure cannot safely send another error notice; the local Master shows the error and stops.
+`build-package.ps1`은 두 프로젝트 restore/build, 실제 EXE `--self-test`, ZIP 생성을 실행합니다. 결과는 `dist/verification-v0.3.3/`입니다. 이번 문서 정리만을 위해 앱 검사를 반복하거나 운영 중인 프로그램을 실행할 필요는 없습니다. 코드 수정 시 변경 범위에 맞춰 사용합니다.
 
-Published [v0.2.1-rc1](https://github.com/yunhyok/Messenger-Remote-Control/releases/tag/v0.2.1-rc1) from immutable source/tag `6ab6c6fa39ed97cd6b53eb7d5f9c7c7ed7adc04a` via [CI run 35200668399](https://github.com/yunhyok/Messenger-Remote-Control/actions/runs/35200668399). Both build and release jobs passed. The Windows Server 2025 runner passed both EXE self-tests and both installer install/same-version repair/uninstall/metadata/shortcut/local-data checks. This is not a real Win7/Win11 field send test.
-All five public assets were downloaded without authentication and verified against their GitHub digests, byte lengths, SHA256SUMS, exact ZIP entry lists, installer/EXE versions and embedded source commit. The two ZIPs contain identical Slave binaries. Later changes to this verification record are documentation only.
+설치 관련 변경을 검증할 때만 아래를 실행합니다. 실제 설치/제거를 수행하므로 전용 검증 PC에서 사용합니다. 이미 설치된 역할에 대한 스크립트의 충돌 방지 검사를 따릅니다.
 
-- [Master installer](https://github.com/yunhyok/Messenger-Remote-Control/releases/download/v0.2.1-rc1/Messenger-Remote-Control-Master-Setup-0.2.1.exe), SHA256 `751BB8AE3EBA2DCC5883FEC2057EB83FD25B0C988058A94AB4BF09B00CC22462`.
-- [Full ZIP](https://github.com/yunhyok/Messenger-Remote-Control/releases/download/v0.2.1-rc1/Messenger-Remote-Control-v0.2.1-win7-win11-net48.zip) and [SHA256SUMS.txt](https://github.com/yunhyok/Messenger-Remote-Control/releases/download/v0.2.1-rc1/SHA256SUMS.txt).
-- Optional [Slave installer](https://github.com/yunhyok/Messenger-Remote-Control/releases/download/v0.2.1-rc1/Messenger-Remote-Control-Slave-Setup-0.2.1.exe) / [Slave ZIP](https://github.com/yunhyok/Messenger-Remote-Control/releases/download/v0.2.1-rc1/Messenger-Remote-Control-Slave-v0.2.1-win11-net48.zip), ZIP SHA256 `7CB9E1DAF44B55E5A23BBF409AEE6F507350E042510B9C4BAA042EFF211ABA57`.
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-installers.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-installers.ps1 -Role Master
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-release-assets.ps1
+```
 
-## Previous release baseline — v0.2.0
+Win11 이상 설치 조건을 만족하는 검증 호스트에서는 `-Role Both`를 사용할 수 있습니다. Win10/Server 결과가 실제 Win7 검증을 대체하지 않습니다. Inno Setup과 공식 .NET 오프라인 설치본의 다운로드·검증은 빌드 단계에서 하며 설치파일 실행 중 다운로드는 없습니다. 자세한 방법은 INSTALL.md에 있습니다.
 
-## 1. Source and scope
+정식 배포는 `.github/workflows/ci.yml`의 `workflow_dispatch release_tag`로 수행합니다. **v0.3.3은 이미 존재하므로 다시 지정하지 않습니다.** 향후 코드 수정 배포는 새 앱 버전과 일치하는 미사용 `v<version>` 태그를 사용하고 기존 태그·자산을 교체하지 않습니다. 이번 문서 정리는 버전 갱신·재배포 없이 커밋합니다.
 
-Independent repository: `yunhyok/Messenger-Remote-Control`, default branch `main`.
-Source snapshot: `yunhyok/Remote-Control-App@1365e2c249d00b2a73634c77cd7bc82247f82405` (PowerSI v0.1.58).
-Only source, build scripts and reviewed documentation were copied. Original checkout and separate HFSS worktree remain untouched.
+## 8. 공개 파일과 로컬 자료
 
-The user approved implementation, public source publication, offline Master/Slave installers and CI pre-release `v0.2.0-rc1`. Existing PowerSI field tests are historical baseline evidence, not proof of this new mobile report path. Do not repeat those long tests.
+| 위치 | 취급 |
+|---|---|
+| `src/`, `scripts/`, `installer/`, `.github/`, 루트 문서 | 공개 소스·검사·빌드·운영 안내 |
+| `docs/history/` | 날짜가 있는 과거 공개 인계 기록. 현재 지시와 분리 |
+| `work/` | 무시된 로컬 검증 자료·시험 코드·다운로드. 새 clone에는 없음 |
+| `dist/`, `.cache/`, `bin/`, `obj/` | 무시된 빌드·설치 의존성·결과물. 공개 자료는 검증된 Release에서 받음 |
+| 사용자 로그·스크린샷·진단 ZIP·연결파일·설정 | 비공개. 외부 검토에 첨부하거나 커밋하지 않음 |
 
-## 2. Implemented path
+Master Output 이력은 `%LOCALAPPDATA%\RemoteMonitorMaster\state\powersi-output-history-v1.txt`에 길이·SHA256만 저장합니다. Slave 로컬 설정/인증정보와 `.rmpair` 연결파일을 보존합니다. 사용자의 Downloads나 기존 PowerSI/HFSS 시험 자료를 저장소 정리 명목으로 삭제하거나 복사하지 않습니다. `work/`에는 검증 근거가 있으므로 이번 정리에서 삭제하지 않았습니다.
 
-- Master: whole-body command observation -> authenticated status request -> report formatter -> fresh same-command proof -> immutable multipart messages -> exact one-use send per part. Uncertain sends stop the remainder.
-- Shared Link: bounded process inventory and versioned report contract, strict UTF-8/Base64 validation, per-target identity, time/source/state/code/excerpt and report partial/omitted counts.
-- PS3 transmits an identity-only process inventory (no window/CPU/RAM/age metrics); Slave observers retain the original local inventory. This also prevents Pending metrics from leaving Slave.
-- Slave: `SlaveForm.ReadOutputBuffer` is shared by local collection and `CollectRemoteOutput`. Each target is fixed by PID, start time and session. `ResponsiveStep` checks responsiveness before and after collection stages; image inference checks again immediately before model calls.
-- Direct buffer and automatic copy are preferred. Independent OCR failure does not discard a valid copy. Pending overrides any earlier evidence and suppresses further collection.
-- Collection budget: 100 seconds, shared among remaining targets; response grace follows before the Master's 120-second request limit. Targets that were not reached remain explicit.
-- Slave controls use a scrollable client area on small desktops; the final Pending/status line remains reachable after resizing. This does not alter any PowerSI window.
+## 9. 정식 설치파일
 
-## 3. Product boundaries
+- [Master Setup 0.3.3](https://github.com/yunhyok/Messenger-Remote-Control/releases/download/v0.3.3/Messenger-Remote-Control-Master-Setup-0.3.3.exe) — SHA256 `37A6B14333D86D63A26C609B5A8F0AA214082EF5F30E8CB2B860AF97222278CF`
+- [Slave Setup 0.3.3](https://github.com/yunhyok/Messenger-Remote-Control/releases/download/v0.3.3/Messenger-Remote-Control-Slave-Setup-0.3.3.exe) — SHA256 `AE8C1577CE7A0326250ECC9B11A002410FAB769A7872660A2E60F48B434AEB45`
+- [정식 Release](https://github.com/yunhyok/Messenger-Remote-Control/releases/tag/v0.3.3) · [SHA256SUMS.txt](https://github.com/yunhyok/Messenger-Remote-Control/releases/download/v0.3.3/SHA256SUMS.txt)
 
-Windows 7 SP1 Master / Windows 11 Slave; .NET Framework 4.8; visible product/version.
-Existing user configuration and pairing locations remain stable.
-Installers are per-user under LocalApplicationData/Programs. Only a missing Master .NET prerequisite requests elevation; neither installer downloads runtime files during installation.
-Loopback LM Studio only; no cloud, automatic model loading or server launch.
-No target window resizing, restoring, moving, automated monitoring, simulation launch/termination or arbitrary commands.
-Pending is Windows nonresponse, not a general detector of PowerSI internal calculation waiting.
-
-## 4. Local data and report rules
-
-Images, full buffers, diagnostic ZIPs, pairing credentials and user configuration remain private and are excluded from Git/releases.
-First name mention is full plus PID; repeated long names abbreviate safely within the entire report.
-Pending target output contains only its name, PID and Pending.
-Normal excerpts: latest five lines, at most 600 characters. Report parts: at most 1,400 characters including report ID and part count.
-All target identities/statuses precede optional excerpts. CPU or elapsed time never implies completion.
-Local LLM text is labeled OCR and is not trusted as a command or a verified numerical measurement.
-
-## 5. Verification status
-
-Verified locally on 2026-09-16, Windows 10 Pro 22H2 build 19045, installed .NET release 533325:
-
-- Both Release builds: zero warnings and errors. Both actual EXE `--self-test` processes exited 0; stderr was empty.
-- Self-tests include report codec/identity rejection, Pending short-circuit and evidence removal, empty/trailing-blank Output, LLM error handling, remaining-time allocation, full Unicode names, report reset/ordering, whole-row command rejection, fresh proof, immutable multipart consent and failure cancellation.
-- Both Inno Setup 7.1.0 installers compiled. The Microsoft .NET Framework 4.8 offline redistributable was checked against SHA256 and a valid Microsoft signature before embedding. Exact release asset names/checksums and ZIP entry allowlists passed.
-- Actual Master setup: per-user install, same-version reinstall/repair into the same location, installed EXE self-test, product/file-version metadata, shortcut and uninstall registration, uninstall, and configuration-preservation checks passed. No reboot was requested. Private local evidence: `work/installer-smoke-fe075bc9cb624d0c93f4df958ac95288/`.
-- Setup and EXE file versions are 0.2.0.0. User-facing product version is 0.2.0.
-- No existing real Master configuration files were present on this test account; preservation evidence is the isolated sentinels plus the unchanged empty set of known real settings paths.
-
-CI verification passed on Windows Server 2025 build 26100: [run 35072841733](https://github.com/yunhyok/Messenger-Remote-Control/actions/runs/35072841733), source `abfc973d7493a5208f92564fdfd6dc4285763305`.
-Both Release builds and actual EXE self-tests passed. Both generated installers passed installation, same-version repair, installed EXE self-tests, metadata/shortcut/uninstall registration, removal and local-data preservation checks. This runner had no existing real settings; isolated sentinels and the unchanged empty set of known real settings paths were verified.
-CI also passed native owned-window foreground, bounded rejection, live copy/input and small-window scroll reachability checks. All four package checksums and ZIP entry allowlists passed. The release dispatch repeated these checks on the final release source and passed; delivery verification is recorded below.
-
-Not field-verified: actual Windows 7 SP1 Master, actual Windows 11 Slave, a clean PC missing .NET 4.8 (including prerequisite UAC/reboot behavior), physically disconnected installation, and the real KI-Messenger/PowerSI mobile path. The installer has no network-download operation and the Master runtime payload is embedded, but these structural checks do not substitute for a clean offline Win7 test. Same-version repair is not evidence of upgrading from a prior released installer; this is the first installer version.
-Local foreground-dependent input checks explicitly skipped when the test process lacked interactive foreground rights; the corresponding CI owned-window checks passed. These are not actual PowerSI/메신저 field passes. Do not repeat completed long PowerSI/HFSS trials.
-
-## 6. Delivery
-
-[v0.2.0-rc1 pre-release](https://github.com/yunhyok/Messenger-Remote-Control/releases/tag/v0.2.0-rc1) was published by [workflow_dispatch run 35073530837](https://github.com/yunhyok/Messenger-Remote-Control/actions/runs/35073530837). Both build and release jobs passed.
-The immutable tag and embedded EXE source version point to `68f0368d0583ad6795e655b18eeb030c58e6be73`. Later changes to this handoff/test-guide record are documentation only; the release assets are not replaced.
-The repository is Public with default branch main. All five expected assets were downloaded without authentication and verified: GitHub asset digests and sizes, four SHA256SUMS entries, exact ZIP entry allowlists, 0.2.0 setup/product versions, 0.2.0.0 EXE file versions and the embedded source commit. The Slave EXE is identical in both ZIPs.
-
-- [Master installer](https://github.com/yunhyok/Messenger-Remote-Control/releases/download/v0.2.0-rc1/Messenger-Remote-Control-Master-Setup-0.2.0.exe)
-- [Slave installer](https://github.com/yunhyok/Messenger-Remote-Control/releases/download/v0.2.0-rc1/Messenger-Remote-Control-Slave-Setup-0.2.0.exe)
-- [Slave-only ZIP](https://github.com/yunhyok/Messenger-Remote-Control/releases/download/v0.2.0-rc1/Messenger-Remote-Control-Slave-v0.2.0-win11-net48.zip), SHA256 `428897904F1BADFA243A466685C07A56A29105F4E194CAB552A08C3E22EB9FC7`
-- [Full ZIP](https://github.com/yunhyok/Messenger-Remote-Control/releases/download/v0.2.0-rc1/Messenger-Remote-Control-v0.2.0-win7-win11-net48.zip) and [SHA256SUMS.txt](https://github.com/yunhyok/Messenger-Remote-Control/releases/download/v0.2.0-rc1/SHA256SUMS.txt)
-
-Publish future versions as stable `v<source-version>` Releases through the same CI workflow; never overwrite verified tags or assets. Keep private evidence, configuration and company data out of releases.
-See [INSTALL.md](INSTALL.md), [SLAVE-TEST.md](SLAVE-TEST.md) and [WIN7-TEST.md](WIN7-TEST.md).
+2026-09-21에 Public 저장소의 최신 정식 태그와 소스 참조가 그대로임을 재확인했습니다. 바이너리 다운로드·설치 검증의 실행일은 2026-09-19이며 문서 수정으로 기존 배포물을 교체하지 않았습니다.

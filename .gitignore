@@ -19,3 +19,7 @@ identity.dat
 local-vision.json
 *.pfx
 *.p12
+
+# Machine-local Claude preferences; shared review guidance is CLAUDE.md.
+CLAUDE.local.md
+.claude/settings.local.json

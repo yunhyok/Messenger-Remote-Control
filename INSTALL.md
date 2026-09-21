@@ -38,7 +38,7 @@ Slave는 Windows에 설치된 .NET Framework 4.8 이상을 확인합니다. 이 
 
 ## 처음 연결
 
-Slave에서 통신 IP를 선택하고 Start한 뒤 연결파일을 내보냅니다. 사내 Master에서 이 파일을 열고 KI-Messenger 나와의 대화를 연결합니다. 사용자가 요청한 `pwrsi`만 한 번 수집하며, 다른 창으로 전환되거나 전송 확인이 불명확하면 회신을 중단합니다. 첫 조회는 수집된 전체 Output을 보내고, 다음 조회는 같은 대상 식별자에서 새로 추가된 내용만 보냅니다. Output이 변하지 않았다는 표시는 계산 중단 판정이 아닙니다.
+Slave에서 통신 IP를 선택하고 Start한 뒤 연결파일을 내보냅니다. 사내 Master에서 이 파일을 열고 KI-Messenger 나와의 대화를 연결합니다. 사용자가 요청한 `pwrsi`만 한 번 수집합니다. 대기 중 일반 창 뒤에 가려지는 것은 허용하며, 회신 입력 전에 선택한 대화를 앞으로 가져옵니다. 실제 입력 중 다른 창으로 전환되거나 전송 확인이 불명확하면 회신을 중단합니다. 첫 조회는 수집된 전체 Output을 보내고, 다음 조회는 같은 대상 식별자에서 새로 추가된 내용만 보냅니다. Output이 변하지 않았다는 표시는 계산 중단 판정이 아닙니다.
 
 원문 수집으로 상태를 알 수 있으면 그 결과를 사용합니다. 화면 판독이 필요한 경우 Slave의 LM Studio 로컬 서버를 실행하고 이미지 모델을 로드해 두세요. 앱은 서버 실행·모델 로드·클라우드 대체를 자동으로 하지 않습니다.
 
@@ -53,6 +53,6 @@ powershell -ExecutionPolicy Bypass -File scripts/check-release-assets.ps1
 
 빌드 PC는 .NET SDK와 Windows 빌드 환경이 필요합니다. Windows 10 개발 PC에서 설치 검사를 실행할 때는 `test-installers.ps1 -Role Master`로 Master만 검사합니다. Slave의 Windows 11 설치 조건을 우회하지 않습니다. 인스톨러 빌드는 Inno Setup 7.1.0과 Microsoft 런타임 배포본을 공식 경로에서 받아 SHA256과 서명을 확인해 캐시합니다. 다운로드만 준비하려면 `build-installers.ps1 -DependenciesOnly`를 사용합니다. 이후 설치 파일 자체는 오프라인에서 동작합니다.
 
-CI의 `workflow_dispatch`에 `release_tag=v0.3.3`을 지정하면 일치하는 소스 버전의 새 태그와 정식 Release를 만들고 Latest로 표시합니다. 설치 EXE가 기본 배포물이고 ZIP은 선택 사항입니다. 이미 존재하는 태그를 덮어쓰지 않으며, 다음 배포는 소스 버전을 올려 새 태그를 사용합니다. CI는 Windows Server 2025에서 두 역할을 검사하며, 실제 Windows 7 SP1·Windows 11 또는 현장 PowerSI/메신저 확인을 대신하지 않습니다. 실제 검증 결과는 [HANDOFF.md](HANDOFF.md)에 기록합니다.
+CI의 `workflow_dispatch`에 새 소스 버전과 일치하는 미사용 `release_tag=v<version>`을 지정하면 새 태그와 정식 Release를 만들고 Latest로 표시합니다. 이미 배포된 `v0.3.3`은 재사용하지 않습니다. 설치 EXE가 기본 배포물이고 ZIP은 선택 사항입니다. 기존 태그·자산은 덮어쓰지 않습니다. CI는 Windows Server 2025에서 두 역할을 검사하며, 실제 Windows 7 SP1·Windows 11 또는 현장 PowerSI/메신저 확인을 대신하지 않습니다. 실제 검증 결과는 [HANDOFF.md](HANDOFF.md)에 기록합니다.
 
 참조: [Inno Setup 공식 지원 환경](https://jrsoftware.org/ishelp/topic_whatisinnosetup.htm), [Microsoft .NET Framework 배포 지침](https://learn.microsoft.com/en-us/dotnet/framework/deployment/deployment-guide-for-developers).

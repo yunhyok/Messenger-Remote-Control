@@ -59,6 +59,8 @@ powershell -ExecutionPolicy Bypass -File scripts/build-package.ps1
 powershell -ExecutionPolicy Bypass -File scripts/build-installers.ps1
 ```
 
-[HANDOFF.md](HANDOFF.md)는 현재 검증 상태, [SLAVE-TEST.md](SLAVE-TEST.md)와 [WIN7-TEST.md](WIN7-TEST.md)는 새 모바일 보고 경로의 짧은 현장 확인 안내입니다.
+[HANDOFF.md](HANDOFF.md)는 현재 구조·검증 상태·점검 우선순위의 진입점입니다. Claude 점검은 저장소의 [CLAUDE.md](https://github.com/yunhyok/Messenger-Remote-Control/blob/main/CLAUDE.md)에서 시작합니다. 과거 버전별 기록은 [docs/history](https://github.com/yunhyok/Messenger-Remote-Control/tree/main/docs/history)에 분리했으며 현재 구현 지시가 아닙니다.
+
+[SLAVE-TEST.md](SLAVE-TEST.md)와 [WIN7-TEST.md](WIN7-TEST.md)는 새 모바일 보고 경로의 짧은 현장 확인 안내입니다. 빌드 산출물·검증 자료·개인 설정은 Git에서 제외합니다. 문서만 정리한 커밋은 앱 버전이나 기존 Release 설치파일을 바꾸지 않습니다.
 
 출발 소스: [Remote-Control-App v0.1.58](https://github.com/yunhyok/Remote-Control-App/tree/1365e2c249d00b2a73634c77cd7bc82247f82405). 이 저장소는 해당 커밋의 공개 가능한 소스와 빌드 파일을 독립적으로 복사했습니다. 기존 저장소 및 HFSS 작업은 변경하지 않습니다.
