@@ -33,6 +33,12 @@ namespace RemoteMonitorLink
         private const uint SmtoErrorOnExit = 0x0020;
         private const uint ResponsivenessMilliseconds = 750;
         private const int ForegroundWaitMilliseconds = 1000;
+        // Parent caps must strictly exceed the worker's own bounded waits, or a slow but responsive target is
+        // killed as SC_TIMEOUT. Prepare: 4x750 responsiveness + 1000 foreground wait = 4000. Read: 4x750 = 3000.
+        // Responsive probe: 1x750.
+        private const int PrepareTimeoutMilliseconds = 8000;
+        private const int CaptureTimeoutMilliseconds = 6000;
+        private const int ResponsiveTimeoutMilliseconds = 4000;
         private const int MaxPngBytes = 8 * 1024 * 1024;
         private const int MaxWireChars = ((MaxPngBytes + 2) / 3) * 4 + 64;
         private static readonly string[] Errors = { "SC_IDENTITY", "SC_NOT_RUNNING", "SC_WINDOW_UNAVAILABLE",
@@ -85,7 +91,7 @@ namespace RemoteMonitorLink
                 {
                     cancellation.ThrowIfCancellationRequested();
                     worker.Start();
-                    diagnostics = ReadBounded(worker.StandardError, 4096);
+                    diagnostics = ReadBounded(worker.StandardError, 4096, true);
                     if (workerArgument == PrepareWorkerArgument)
                     {
                         cancellation.ThrowIfCancellationRequested();
@@ -103,12 +109,17 @@ namespace RemoteMonitorLink
                         worker.StandardInput.Close();
                     }
                     var reading = ReadBounded(worker.StandardOutput);
+                    var timeout = workerArgument == PrepareWorkerArgument ? PrepareTimeoutMilliseconds :
+                        workerArgument == ResponsiveWorkerArgument ? ResponsiveTimeoutMilliseconds : CaptureTimeoutMilliseconds;
                     var clock = Stopwatch.StartNew();
                     while (!worker.HasExited || !reading.IsCompleted || !diagnostics.IsCompleted)
                     {
                         cancellation.ThrowIfCancellationRequested();
                         if (reading.IsFaulted) await reading.ConfigureAwait(false);
-                        if (clock.ElapsedMilliseconds >= 4000) throw Failure("SC_TIMEOUT");
+                        // Observe a faulted stderr drain so it never stays an unobserved task exception. The drain
+                        // itself drops excess instead of failing, so the child is not blocked on a full pipe.
+                        if (diagnostics.IsFaulted && diagnostics.Exception != null) { }
+                        if (clock.ElapsedMilliseconds >= timeout) throw Failure("SC_TIMEOUT");
                         await Task.Delay(25, cancellation).ConfigureAwait(false);
                     }
                     cancellation.ThrowIfCancellationRequested();
@@ -136,15 +147,21 @@ namespace RemoteMonitorLink
             }
         }
 
-        private static async Task<string> ReadBounded(StreamReader reader, int maximum = MaxWireChars)
+        // dropExcess keeps draining the pipe past the bound instead of failing: an over-long diagnostic stream
+        // must never block the child on a full stderr pipe until SC_TIMEOUT. The retained head stays bounded.
+        private static async Task<string> ReadBounded(StreamReader reader, int maximum = MaxWireChars, bool dropExcess = false)
         {
             var text = new StringBuilder(); var buffer = new char[8192];
             while (true)
             {
                 var count = await reader.ReadAsync(buffer, 0, buffer.Length).ConfigureAwait(false);
                 if (count == 0) return text.ToString();
-                if (text.Length + count > maximum) throw Failure("SC_SIZE");
-                text.Append(buffer, 0, count);
+                if (text.Length + count > maximum)
+                {
+                    if (!dropExcess) throw Failure("SC_SIZE");
+                    count = maximum - text.Length;
+                }
+                if (count > 0) text.Append(buffer, 0, count);
             }
         }
 

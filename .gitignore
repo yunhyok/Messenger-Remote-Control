@@ -8,6 +8,14 @@ diagnostics/
 work/
 *.log
 *.zip
+*.7z
+# Screenshots and exported images stay local: a tracked script can save a PNG of the
+# Slave comparison dialog to a caller-chosen directory.
+*.png
+*.jpg
+*.jpeg
+*.bmp
+*.gif
 *.user
 *.suo
 seen-tokens.txt

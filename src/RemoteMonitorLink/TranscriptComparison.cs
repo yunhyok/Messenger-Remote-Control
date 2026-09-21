@@ -137,8 +137,8 @@ namespace RemoteMonitorLink
             if (limit < 0) return -1;
             int extra = Math.Abs(Math.Max(0, left.Length - MaxComparedLength) - Math.Max(0, right.Length - MaxComparedLength));
             if (extra > limit) return -1;
-            if (left.Length > MaxComparedLength) left = left.Substring(0, MaxComparedLength);
-            if (right.Length > MaxComparedLength) right = right.Substring(0, MaxComparedLength);
+            if (left.Length > MaxComparedLength) left = left.Substring(0, SafeCut(left, MaxComparedLength));
+            if (right.Length > MaxComparedLength) right = right.Substring(0, SafeCut(right, MaxComparedLength));
             if (Math.Abs(left.Length - right.Length) + extra > limit) return -1;
             var previous = new int[right.Length + 1];
             var current = new int[right.Length + 1];
@@ -183,6 +183,8 @@ namespace RemoteMonitorLink
         {
             int position = 0;
             while (position < left.Length && position < right.Length && left[position] == right[position]) position++;
+            // The shared prefix can end between a surrogate pair; both sides hold the same char at position - 1.
+            if (position > 0 && char.IsHighSurrogate(left[position - 1])) position--;
             return "@" + position.ToString(CultureInfo.InvariantCulture) +
                 " [" + Fragment(left, position) + "] / [" + Fragment(right, position) + "]";
         }
@@ -191,8 +193,16 @@ namespace RemoteMonitorLink
         {
             if (position >= text.Length) return string.Empty;
             int length = text.Length - position;
-            if (length > MaxDiffFragment) length = MaxDiffFragment;
+            if (length > MaxDiffFragment) length = SafeCut(text, position + MaxDiffFragment) - position;
             return text.Substring(position, length);
+        }
+
+        // A cut between a high and a low surrogate would leave a lone surrogate in the rendered diff. Move it back
+        // one char so whole characters are compared and displayed.
+        private static int SafeCut(string text, int index)
+        {
+            return index > 0 && index < text.Length && char.IsHighSurrogate(text[index - 1]) &&
+                char.IsLowSurrogate(text[index]) ? index - 1 : index;
         }
 
         private static string[] SplitLines(string text)
@@ -340,6 +350,32 @@ namespace RemoteMonitorLink
                 "over-long lines are compared by a bounded prefix plus the untruncated length difference");
             Check(Compare(longLine, longLine + new string('y', 200)).Missing == 1,
                 "an over-long line never matches by its prefix alone");
+
+            var emoji = new StringBuilder();
+            for (int i = 0; i < 400; i++) emoji.Append("\U0001F600");
+            string surrogateLine = "x" + emoji.ToString();     // 801 chars: the 512-char cut falls inside a pair.
+            var leadingDiff = Compare(surrogateLine, "y" + emoji.ToString());
+            Check(leadingDiff.Near == 1 && leadingDiff.Lines[0].Diff != null && NoLoneSurrogate(leadingDiff.Render()),
+                "a truncated diff fragment never ends on a lone surrogate");
+            var innerDiff = Compare(surrogateLine, "x\U0001F603" + emoji.ToString().Substring(2));
+            Check(innerDiff.Near == 1 && innerDiff.Lines[0].Diff != null && NoLoneSurrogate(innerDiff.Render()),
+                "a diff starting inside a surrogate pair never renders a lone surrogate");
+            Check(NoLoneSurrogate(Compare(surrogateLine, surrogateLine).Render()) &&
+                !NoLoneSurrogate("\uD83D"), "the lone-surrogate check itself is meaningful");
+        }
+
+        private static bool NoLoneSurrogate(string text)
+        {
+            for (int i = 0; i < text.Length; i++)
+            {
+                if (char.IsHighSurrogate(text[i]))
+                {
+                    if (i + 1 >= text.Length || !char.IsLowSurrogate(text[i + 1])) return false;
+                    i++;
+                }
+                else if (char.IsLowSurrogate(text[i])) return false;
+            }
+            return true;
         }
     }
 }

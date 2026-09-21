@@ -109,105 +109,118 @@ namespace RemoteMonitorLink
                 }
 
                 await Task.Delay(500, cancellation).ConfigureAwait(false);
-                foreach (Candidate candidate in candidates)
+                // ponytail: one shared second snapshot instead of a per-candidate Refresh(). Refresh() rescans every
+                // process, which made this pass quadratic against the 8s plain request budget.
+                Process[] refreshed = Process.GetProcesses();
+                try
                 {
-                    cancellation.ThrowIfCancellationRequested();
-                    var itemUnreadable = candidate.Unreadable;
-                    var state = new ProcessState
-                        { Pid = candidate.Pid, Name = candidate.Name, FullName = candidate.FullName };
+                    var current = new Dictionary<int, Process>(refreshed.Length);
+                    foreach (Process process in refreshed)
+                    {
+                        try { if (!current.ContainsKey(process.Id)) current.Add(process.Id, process); }
+                        catch { IncrementCount(ref unreadable); }
+                    }
+                    foreach (Candidate candidate in candidates)
+                    {
+                        cancellation.ThrowIfCancellationRequested();
+                        var itemUnreadable = candidate.Unreadable;
+                        var state = new ProcessState
+                            { Pid = candidate.Pid, Name = candidate.Name, FullName = candidate.FullName };
 
-                    try
-                    {
-                        // ponytail: net48 Refresh can rescan all processes; use two batched snapshots if capture nears the 8s request budget.
-                        candidate.Process.Refresh();
-                    }
-                    catch
-                    {
-                        IncrementCount(ref unreadable);
-                        states.Add(state);
-                        continue;
-                    }
+                        Process sample;
+                        if (!current.TryGetValue(candidate.Pid, out sample))
+                        {
+                            // Absent from the fresh snapshot: the process exited during the sampling delay.
+                            IncrementCount(ref unreadable);
+                            continue;
+                        }
 
-                    bool exited;
-                    try { exited = candidate.Process.HasExited; }
-                    catch
-                    {
-                        IncrementCount(ref unreadable);
-                        states.Add(state);
-                        continue;
-                    }
-                    if (exited)
-                    {
-                        IncrementCount(ref unreadable);
-                        continue;
-                    }
-
-                    try
-                    {
-                        string fullName = candidate.Process.ProcessName;
-                        if (candidate.Process.Id != candidate.Pid || candidate.Process.SessionId != sessionId ||
-                            !string.Equals(fullName, candidate.FullName, StringComparison.Ordinal) ||
-                            NormalizeName(fullName) != candidate.Name)
+                        bool exited;
+                        try { exited = sample.HasExited; }
+                        catch
+                        {
+                            IncrementCount(ref unreadable);
+                            states.Add(state);
+                            continue;
+                        }
+                        if (exited)
                         {
                             IncrementCount(ref unreadable);
                             continue;
                         }
-                    }
-                    catch
-                    {
-                        IncrementCount(ref unreadable);
-                        states.Add(state);
-                        continue;
-                    }
 
-                    long? recheckedStartUtcTicks = null;
-                    try { recheckedStartUtcTicks = candidate.Process.StartTime.ToUniversalTime().Ticks; }
-                    catch { itemUnreadable = true; }
-                    if (candidate.StartUtcTicks.HasValue && recheckedStartUtcTicks.HasValue &&
-                        candidate.StartUtcTicks.Value != recheckedStartUtcTicks.Value)
-                    {
-                        IncrementCount(ref unreadable);
-                        continue;
-                    }
-                    bool sameStartIdentity = SameStartIdentity(candidate.StartUtcTicks, recheckedStartUtcTicks);
-                    if (sameStartIdentity) state.StartUtcTicks = candidate.StartUtcTicks;
-                    if (!sameStartIdentity) itemUnreadable = true;
-
-                    try { state.HasWindow = candidate.Process.MainWindowHandle != IntPtr.Zero; }
-                    catch { itemUnreadable = true; }
-
-                    try
-                    {
-                        long bytes = candidate.Process.WorkingSet64;
-                        if (bytes < 0) itemUnreadable = true;
-                        else state.WorkingSetMiB = bytes / 1048576;
-                    }
-                    catch { itemUnreadable = true; }
-
-                    if (sameStartIdentity)
-                    {
-                        long nowTicks = DateTime.UtcNow.Ticks;
-                        long ageSeconds = nowTicks < candidate.StartUtcTicks.Value ? -1 :
-                            (nowTicks - candidate.StartUtcTicks.Value) / TimeSpan.TicksPerSecond;
-                        if (ageSeconds < 0 || ageSeconds > MaxAgeSeconds) itemUnreadable = true;
-                        else state.AgeSeconds = ageSeconds;
-                    }
-
-                    if (sameStartIdentity && candidate.CpuTicks.HasValue)
-                    {
                         try
                         {
-                            long cpuNow = candidate.Process.TotalProcessorTime.Ticks;
-                            long sampleNow = Stopwatch.GetTimestamp();
-                            state.CpuPermille = CalculateCpuPermille(candidate.CpuTicks.Value, cpuNow,
-                                sampleNow - candidate.CpuTimestamp, Stopwatch.Frequency, Environment.ProcessorCount);
-                            if (!state.CpuPermille.HasValue) itemUnreadable = true;
+                            string fullName = sample.ProcessName;
+                            if (sample.Id != candidate.Pid || sample.SessionId != sessionId ||
+                                !string.Equals(fullName, candidate.FullName, StringComparison.Ordinal) ||
+                                NormalizeName(fullName) != candidate.Name)
+                            {
+                                IncrementCount(ref unreadable);
+                                continue;
+                            }
+                        }
+                        catch
+                        {
+                            IncrementCount(ref unreadable);
+                            states.Add(state);
+                            continue;
+                        }
+
+                        long? recheckedStartUtcTicks = null;
+                        try { recheckedStartUtcTicks = sample.StartTime.ToUniversalTime().Ticks; }
+                        catch { itemUnreadable = true; }
+                        if (candidate.StartUtcTicks.HasValue && recheckedStartUtcTicks.HasValue &&
+                            candidate.StartUtcTicks.Value != recheckedStartUtcTicks.Value)
+                        {
+                            IncrementCount(ref unreadable);
+                            continue;
+                        }
+                        bool sameStartIdentity = SameStartIdentity(candidate.StartUtcTicks, recheckedStartUtcTicks);
+                        if (sameStartIdentity) state.StartUtcTicks = candidate.StartUtcTicks;
+                        if (!sameStartIdentity) itemUnreadable = true;
+
+                        try { state.HasWindow = sample.MainWindowHandle != IntPtr.Zero; }
+                        catch { itemUnreadable = true; }
+
+                        try
+                        {
+                            long bytes = sample.WorkingSet64;
+                            if (bytes < 0) itemUnreadable = true;
+                            else state.WorkingSetMiB = bytes / 1048576;
                         }
                         catch { itemUnreadable = true; }
-                    }
 
-                    if (itemUnreadable) IncrementCount(ref unreadable);
-                    states.Add(state);
+                        if (sameStartIdentity)
+                        {
+                            long nowTicks = DateTime.UtcNow.Ticks;
+                            long ageSeconds = nowTicks < candidate.StartUtcTicks.Value ? -1 :
+                                (nowTicks - candidate.StartUtcTicks.Value) / TimeSpan.TicksPerSecond;
+                            if (ageSeconds < 0 || ageSeconds > MaxAgeSeconds) itemUnreadable = true;
+                            else state.AgeSeconds = ageSeconds;
+                        }
+
+                        if (sameStartIdentity && candidate.CpuTicks.HasValue)
+                        {
+                            try
+                            {
+                                // The second reading comes from the fresh snapshot object; the permille formula is unchanged.
+                                long cpuNow = sample.TotalProcessorTime.Ticks;
+                                long sampleNow = Stopwatch.GetTimestamp();
+                                state.CpuPermille = CalculateCpuPermille(candidate.CpuTicks.Value, cpuNow,
+                                    sampleNow - candidate.CpuTimestamp, Stopwatch.Frequency, Environment.ProcessorCount);
+                                if (!state.CpuPermille.HasValue) itemUnreadable = true;
+                            }
+                            catch { itemUnreadable = true; }
+                        }
+
+                        if (itemUnreadable) IncrementCount(ref unreadable);
+                        states.Add(state);
+                    }
+                }
+                finally
+                {
+                    foreach (Process process in refreshed) process.Dispose();
                 }
             }
             finally
@@ -463,9 +476,13 @@ namespace RemoteMonitorLink
             Need(filtered.Items.Length == MaxItems && filtered.Omitted == 1 &&
                 filtered.Items.All(item => IsPowerSiName(item.Name)), "PROCESS_PWRSI_FILTER_BEFORE_CAP");
 
+            var liveClock = Stopwatch.StartNew();
             ProcessInventory live = CaptureAsync(CancellationToken.None).GetAwaiter().GetResult();
+            long liveMilliseconds = liveClock.ElapsedMilliseconds;
             live.Validate();
             Parse(live.Serialize());
+            // One 500 ms sampling delay plus two snapshots must stay well inside the 8 s plain request deadline.
+            Need(liveMilliseconds <= 5000, "PROCESS_LIVE_CAPTURE_WITHIN_5S");
             using (var cancellation = new CancellationTokenSource(50))
             {
                 try

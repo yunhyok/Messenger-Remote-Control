@@ -25,7 +25,6 @@ namespace RemoteMonitorLink
                 throw new InvalidDataException("SAVED_CROP_INVALID");
             if (savedFrame == null) inventory.Validate();
             if (settings == null || !settings.Enabled) return PowerSiObservation.VisionUnavailable("VISION_NOT_CONFIGURED");
-            settings = settings.Clone(); settings.Validate();
             if (savedFrame == null && inventory.Items.Length == 0) return PowerSiObservation.VisionUnavailable("NOT_OBSERVED");
             if (!await Reading.WaitAsync(0, cancellation).ConfigureAwait(false)) return PowerSiObservation.VisionUnavailable("VISION_BUSY");
             PowerSiFrame frame = savedFrame;
@@ -66,6 +65,8 @@ namespace RemoteMonitorLink
             }
             try
             {
+                // Inside the try so SETTINGS_INVALID maps to VISION_NOT_CONFIGURED like every other local failure.
+                settings = settings.Clone(); settings.Validate();
                 using (var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellation))
                 {
                     deadline.CancelAfter(100000);
@@ -215,6 +216,24 @@ namespace RemoteMonitorLink
             result.LocalElapsedMs = located.LocalElapsedMs;
             result.LocalLocateMs = located.LocalLocateMs;
             return result;
+        }
+
+        // Runs without a vision server, a screen capture or a model: the rejected settings fail before any I/O. Called from LinkSelfTest.Run.
+        internal static void SelfTest()
+        {
+            var inventory = new ProcessInventory
+            {
+                SessionId = 1,
+                Items = new[] { new ProcessState { Pid = 1, Name = "powersi", FullName = "PowerSI" } }
+            };
+            inventory.Validate();
+            var settings = new LocalVisionSettings { Enabled = true, Port = 0 };
+            PowerSiObservation rejected = CaptureAsync(inventory, settings, CancellationToken.None)
+                .GetAwaiter().GetResult();
+            if (rejected == null || rejected.Code != "VISION_NOT_CONFIGURED" ||
+                rejected.LocalFailure != "CAPTURE_SETTINGS_INVALID")
+                throw new InvalidOperationException("PowerSI vision self-test: an out-of-range port must map to " +
+                    "VISION_NOT_CONFIGURED, not an unmapped failure.");
         }
 
         private static string Box(Rectangle rect)

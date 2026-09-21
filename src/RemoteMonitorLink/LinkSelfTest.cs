@@ -24,6 +24,7 @@ namespace RemoteMonitorLink
             OutputPaneImage.SelfTest();
             TranscriptComparison.SelfTest();
             LocalVisionClient.SelfTest();
+            PowerSiVision.SelfTest();
             TestMalformedParsing();
 
             string directory = Path.Combine(Path.GetTempPath(), "RemoteMonitorLink-" + Guid.NewGuid().ToString("N"));
@@ -50,6 +51,7 @@ namespace RemoteMonitorLink
                         throw new InvalidOperationException("Identity persistence failed.");
                     TestLoopback(identity);
                     TestReportLoopback(identity);
+                    TestCollectFailureIsolation(identity);
                     TestLargeReportTls(identity);
                     TestActiveCancellation(identity);
                     TestDeadline(identity);
@@ -185,6 +187,53 @@ namespace RemoteMonitorLink
             }
         }
 
+        // D4: a failing PowerSI collection callback ends that one connection; the accept loop must survive.
+        private static void TestCollectFailureIsolation(SlaveIdentity identity)
+        {
+            var calls = 0;
+            Func<ProcessInventory, CancellationToken, Task<PowerSiReport>> collect = delegate(
+                ProcessInventory inventory, CancellationToken cancellation)
+            {
+                if (Interlocked.Increment(ref calls) == 1) throw new InvalidOperationException("collect boom");
+                throw new InvalidOperationException("Unexpected second PowerSI collection.");
+            };
+
+            int collectFailed = 0, rejected = 0, stopped = 0;
+            var server = new StatusServer(identity, IPAddress.Loopback, 0, null, collect);
+            server.Activity += delegate(string code)
+            {
+                if (code == "COLLECT_FAILED") Interlocked.Increment(ref collectFailed);
+                if (code == "CLIENT_REJECTED") Interlocked.Increment(ref rejected);
+                if (code == "STOPPED") Interlocked.Increment(ref stopped);
+            };
+            try
+            {
+                server.Start();
+                SlaveEndpoint endpoint = SlaveEndpoint.Parse(identity.CreatePairing(IPAddress.Loopback, server.Port));
+                try
+                {
+                    StatusClient.QueryAsync(endpoint, CancellationToken.None, true).GetAwaiter().GetResult();
+                    throw new InvalidOperationException("A failed PowerSI collection returned a report.");
+                }
+                catch (IOException) { }
+                catch (TimeoutException) { }
+                if (!SpinWait.SpinUntil(() => Volatile.Read(ref rejected) == 1, 2000) ||
+                    Volatile.Read(ref collectFailed) != 1 || Volatile.Read(ref stopped) != 0 ||
+                    server.Completion.IsCompleted)
+                    throw new InvalidOperationException("A failed PowerSI collection stopped the status server.");
+                // The plain request never reaches the callback; success proves the accept loop is still serving.
+                StatusClient.QueryAsync(endpoint, CancellationToken.None).GetAwaiter().GetResult().Validate();
+                if (Volatile.Read(ref calls) != 1 || Volatile.Read(ref stopped) != 0)
+                    throw new InvalidOperationException("The accept loop did not survive a failed PowerSI collection.");
+            }
+            finally
+            {
+                server.Dispose();
+                if (!server.Completion.Wait(2000))
+                    throw new InvalidOperationException("Collection-failure status server did not stop promptly.");
+            }
+        }
+
         private static void TestActiveCancellation(SlaveIdentity identity)
         {
             var stalled = new TcpListener(IPAddress.Loopback, 0);
@@ -307,7 +356,7 @@ namespace RemoteMonitorLink
             }
         }
 
-        private static void TestMalformedParsing()
+        internal static void TestMalformedParsing()
         {
             const string pin = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
             const string token = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";

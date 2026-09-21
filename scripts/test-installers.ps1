@@ -32,7 +32,9 @@ function Invoke-Setup {
     $arguments = "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /RESTARTEXITCODE=3010 /LOG=`"$log`""
     if ($InstallDirectory) { $arguments += " /DIR=`"$InstallDirectory`"" }
     $process = Start-Process -FilePath $Path -ArgumentList $arguments -Wait -PassThru -WindowStyle Hidden
-    if ($process.ExitCode -ne 0) { throw "Installer exited $($process.ExitCode): $Path (log: $log)" }
+    # /RESTARTEXITCODE=3010 asks Setup to report a pending restart instead of restarting this PC.
+    if (@(0, 3010) -notcontains $process.ExitCode) { throw "Installer exited $($process.ExitCode): $Path (log: $log)" }
+    return [int]$process.ExitCode
 }
 
 function Find-Shortcut {
@@ -102,6 +104,7 @@ $roles = @(
     }
 )
 if ($Role -cne 'Both') { $roles = @($roles | Where-Object Name -CEQ $Role) }
+$restartRequired = $false
 
 try {
     foreach ($roleSpec in $roles) {
@@ -131,7 +134,11 @@ try {
         }
         foreach ($path in $preserved.Keys) { Set-Content -LiteralPath $path -Value $preserved[$path] -NoNewline -Encoding UTF8 }
 
-        Invoke-Setup -Path $roleSpec.Installer -InstallDirectory $installDirectory
+        if ((Invoke-Setup -Path $roleSpec.Installer -InstallDirectory $installDirectory) -eq 3010) {
+            Write-Host "$($roleSpec.Product): the installer reported exit 3010 (restart required) - reboot, then re-run this script. The upgrade and uninstall checks were not run."
+            $restartRequired = $true
+            break
+        }
         Assert-PreservedFiles -Expected $preserved
         Assert-RealConfigUnchanged -DataDirectoryName $roleSpec.Data -Expected $realConfig
         $installedExe = Join-Path $installDirectory $roleSpec.Exe
@@ -161,7 +168,11 @@ try {
             [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell)
         }
 
-        Invoke-Setup -Path $roleSpec.Installer -InstallDirectory $null
+        if ((Invoke-Setup -Path $roleSpec.Installer -InstallDirectory $null) -eq 3010) {
+            Write-Host "$($roleSpec.Product): the same-version reinstall reported exit 3010 (restart required) - reboot, then re-run this script. The upgrade and uninstall checks were not run."
+            $restartRequired = $true
+            break
+        }
         Assert-PreservedFiles -Expected $preserved
         Assert-RealConfigUnchanged -DataDirectoryName $roleSpec.Data -Expected $realConfig
         $entries = @(Get-UninstallEntries -RegistryKey $roleSpec.RegistryKey)
@@ -192,7 +203,11 @@ try {
         if (@(Get-UninstallEntries -RegistryKey $roleSpec.RegistryKey).Count -ne 0) { throw "Uninstaller left registration for $($roleSpec.Product)." }
         Write-Host "$($roleSpec.Product): install, upgrade, uninstall, metadata, shortcut, and local-data checks passed."
     }
-    Set-Content -LiteralPath (Join-Path $workRoot 'result.txt') -Value "Installer smoke checks passed for v$version." -Encoding ASCII
+    if ($restartRequired) {
+        Write-Host "Installer smoke checks stopped early for v${version}: a restart is required before the remaining checks can run."
+    } else {
+        Set-Content -LiteralPath (Join-Path $workRoot 'result.txt') -Value "Installer smoke checks passed for v$version." -Encoding ASCII
+    }
 } finally {
     $env:LOCALAPPDATA = $originalLocalAppData
     foreach ($roleSpec in $roles) {

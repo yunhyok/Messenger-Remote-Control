@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
+using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
@@ -73,13 +74,14 @@ namespace RemoteMonitorSlave
         private readonly ComboBox model = new ComboBox { DropDownStyle = ComboBoxStyle.DropDown };
         private readonly TextBox token = new TextBox { UseSystemPasswordChar = true };
         private readonly Label message = new Label();
+        private readonly Font dialogFont = new Font("Segoe UI", 9F);
         private readonly CancellationTokenSource closing = new CancellationTokenSource();
         internal LocalVisionSettings Result { get; private set; }
 
         internal LocalVisionSettingsForm(LocalVisionSettings settings)
         {
-            Text = Program.Title + " — LM Studio 설정"; Font = new Font("Segoe UI", 9F);
-            ClientSize = new Size(640, 490); FormBorderStyle = FormBorderStyle.FixedDialog;
+            Text = Program.Title + " — LM Studio 설정"; Font = dialogFont;
+            ClientSize = new Size(640, 516); FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false; MinimizeBox = false; StartPosition = FormStartPosition.CenterParent;
             Controls.Add(new Label { Text = "같은 PC의 127.0.0.1에만 연결합니다. 화면/판독 원문은 Master에 보내지 않습니다.\r\nLM Studio에서 이미지 지원 모델을 로드하고 Developer → Start server를 켜세요.",
                 Bounds = new Rectangle(18, 16, 604, 46) });
@@ -97,13 +99,14 @@ namespace RemoteMonitorSlave
             token.SetBounds(18, 280, 604, 28); token.Text = settings.ApiToken;
             Controls.Add(new Label { Text = "thinking OFF를 요청하지만 실제 적용 여부는 확인할 수 없습니다.\r\n모델별 비교 전에 LM Studio에서도 thinking을 끄고 저장한 같은 화면을 재판독하세요.",
                 Bounds = new Rectangle(18, 318, 604, 42), AccessibleName = "thinking 비활성화 요청과 실제 적용 여부 구분" });
-            message.SetBounds(18, 364, 604, 62);
+            message.SetBounds(18, 364, 604, 88);
             message.Text = "모델은 자동 다운로드/교체하지 않습니다. 선택한 모델이 없거나 이미지 입력을 지원하지 않으면 확인 불가로 표시합니다.\r\n" +
-                "자동 복사는 창 크기를 바꾸지 않고 각 Output을 찾아 검증합니다. 응답 없는 창은 건너뛰며 클립보드는 바뀝니다.";
-            var save = new Button { Text = "저장", Bounds = new Rectangle(404, 439, 100, 34) };
-            var cancel = new Button { Text = "취소", DialogResult = DialogResult.Cancel, Bounds = new Rectangle(516, 439, 106, 34) };
+                "자동 복사는 창 크기를 바꾸지 않고 각 Output을 찾아 검증합니다. 응답 없는 창은 건너뛰며 클립보드는 바뀝니다.\r\n" +
+                "자동 복사 중에는 Slave 창이 잠시 최소화됐다가 원래 상태로 돌아옵니다.";
+            var save = new Button { Text = "저장", Bounds = new Rectangle(404, 465, 100, 34) };
+            var cancel = new Button { Text = "취소", DialogResult = DialogResult.Cancel, Bounds = new Rectangle(516, 465, 106, 34) };
             Controls.AddRange(new Control[] { enabled, autoCopy, port, timeout, model, discover, token, message, save, cancel });
-            CancelButton = cancel;
+            CancelButton = cancel; AcceptButton = save;
             discover.Click += async delegate
             {
                 discover.Enabled = false; message.Text = "127.0.0.1의 로드된 이미지 모델 목록을 확인 중…";
@@ -123,7 +126,10 @@ namespace RemoteMonitorSlave
             };
             save.Click += delegate
             {
-                try { Result = Current(); Result.Validate(); DialogResult = DialogResult.OK; Close(); }
+                var candidate = Current();
+                var problem = Problem(candidate);
+                if (problem != null) { message.Text = problem; return; }
+                try { Result = candidate; Result.Validate(); DialogResult = DialogResult.OK; Close(); }
                 catch { message.Text = "포트·모델 ID·토큰·시간 제한을 확인하세요."; }
             };
             FormClosing += delegate { closing.Cancel(); };
@@ -132,6 +138,31 @@ namespace RemoteMonitorSlave
         {
             return new LocalVisionSettings { Enabled = enabled.Checked, Port = (int)port.Value, ModelId = model.Text.Trim(),
                 ApiToken = token.Text.Trim(), TimeoutSeconds = (int)timeout.Value, AutoCopyEnabled = autoCopy.Checked };
+        }
+
+        // Same rules as LocalVisionSettings.Validate, only to name the field that has to change. Anything this
+        // does not recognize still falls back to the generic sentence above.
+        private static string Problem(LocalVisionSettings candidate)
+        {
+            if (candidate.Port < 1 || candidate.Port > 65535) return "LM Studio 포트를 1~65535 범위로 입력하세요.";
+            if (candidate.TimeoutSeconds < 15 || candidate.TimeoutSeconds > 90) return "단계별 제한을 15~90초로 입력하세요.";
+            if (candidate.ModelId == null || candidate.ModelId.Length > 256 || candidate.ModelId.Any(char.IsControl))
+                return "모델 ID를 확인하세요 — 256자 이하, 제어문자 없이 입력하거나 로드된 모델 확인 목록에서 선택하세요.";
+            if (candidate.ApiToken == null || candidate.ApiToken.Length > 4096 || candidate.ApiToken.Any(c => c < 0x21 || c > 0x7e))
+                return "API token을 확인하세요 — 공백·한글 없이 LM Studio에 설정한 값(4096자 이하)만 붙여넣으세요.";
+            return null;
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                // Cancel before disposing: a model list still in flight checks IsCancellationRequested, not Token.
+                try { closing.Cancel(); } catch (ObjectDisposedException) { }
+                closing.Dispose();
+            }
+            base.Dispose(disposing);
+            if (disposing) dialogFont.Dispose(); // Only after the controls that draw with it are gone.
         }
     }
 }

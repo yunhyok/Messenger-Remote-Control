@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: 'New stable release tag matching the source version, e.g. v0.3.3'
+        description: 'New stable release tag matching the source version, e.g. v0.3.4'
         required: true
         type: string
 
@@ -113,15 +113,17 @@ jobs:
           gh api --method POST "repos/$env:GITHUB_REPOSITORY/git/refs" -f "ref=refs/tags/$env:RELEASE_TAG" -f "sha=$env:GITHUB_SHA" --silent
           if ($LASTEXITCODE -ne 0) { throw 'Unable to create a new release tag at the workflow commit.' }
           $notes = @(
-            "PowerSI on-demand messenger reports and offline Master/Slave installers, built from commit $env:GITHUB_SHA.",
+            "PowerSI on-demand messenger reports and offline Master/Slave installers, built from commit $env:GITHUB_SHA (source version $version, protocol 0.3.0).",
             '',
             'Commands: help, total status, pwrsi. Pending targets return only their name, PID and Pending. The first acquired Output for each Slave certificate/session/PID/start-time/source-family identity is sent in full; later queries send only newly appended Output. Each multipart message is at most 1,400 characters.',
             '',
-            'A private v0.3.1 field record stopped after six of ten parts, before the seventh at RECEIVE_READY_BOUNDARY_CHANGED. It did not establish the exact Ready-label or UI-structure mutation, an idle timeout, or a crash. v0.3.3 treats the old Ready display body as historical evidence only when revalidating an accepted request. Initial binding and new-command admission remain strict; the whole accepted command, current enabled state, same identity and ancestry, every history-row identity and order, two fresh snapshots, first-observation time, one-use sends, uncertain-send aborts, and history commits only after all parts remain required. No history pruning or rebase support was added; v0.3.2 speed improvements remain. Start binds the selected chat with one click within five seconds, normal covered windows remain readable, and only the selected minimized window is restored to its original bounds. Before Ready, busy, and every part, Master waits for at least one second of quiet PC input, rechecks the original process/start/HWND/UIA root, then calls SetForegroundWindow once immediately before the fresh reply proofs. It never moves/resizes other windows or uses AttachThreadInput or Alt tricks. Activation rejection stops before writing with TARGET_ACTIVATION_REJECTED and no automatic retry; lock, session changes, and suspend also cancel without resume. Upgrade only Master to v0.3.3; Slave v0.3.0/0.3.1/0.3.2 remains compatible with protocol 0.3.0.',
+            "This version applies the 2026-09-21 independent source review of v0.3.3 (see docs/REVIEW-2026-09-21-v0.3.3.md and HANDOFF.md at this tag). Acceptance, fresh-send and output-history rules are unchanged. Master: unhandled exceptions end in an APP_FATAL safe stop; session failures keep their exception type; a Ready row that does not render gets its own 60-second bound (RECEIVE_READY_NOT_OBSERVED) instead of sharing one 15-second snapshot budget; an offscreen or disabled first command row is reported as COMMAND_NOT_VISIBLE while remaining pinned; the operator window explains every stop reason in Korean with the next action, shows a 5-second countdown and the selected window; Ready and processing notices are Korean with the leading Master Ready / Processing tokens kept; help is three lines. Slave: auto copy converts DPI-virtualized coordinates to physical ones before the cursor and click (identity at 100 % scaling); a Master pwrsi no longer fails with BUSY during a local refresh; one failed collection no longer stops the listener; total status uses one second process snapshot; IP list refresh, pairing-file credential warning and last-request summary were added.",
+            '',
+            "Upgrade only Master to v$version if desired; Slave v0.3.0 through v$version remain compatible with protocol 0.3.0. Pairing files, settings and output history are preserved. Display scaling of 100 % is recommended on the Slave.",
             '',
             "Download the installer for each role; portable ZIPs are optional. The Master installer embeds Microsoft .NET Framework 4.8. See [installation and operation](https://github.com/$env:GITHUB_REPOSITORY/blob/$env:RELEASE_TAG/INSTALL.md) and SHA256SUMS.txt.",
             '',
-            'This release workflow passed both Release builds, actual EXE self-tests, package checks and both installer install/repair/uninstall/settings-preservation checks. CI does not substitute for actual Win7/Win11 or a clean offline PC missing .NET 4.8. Real Win7 KI-Messenger background/restore/activation behavior remains field-unverified. The only requested field check is a natural multipart reply followed later by a normal request; do not restart PowerSI or HFSS tests or reset output history.'
+            'This release workflow passed both Release builds, actual EXE self-tests, package checks and both installer install/repair/uninstall/settings-preservation checks on a GitHub Windows Server runner. CI does not substitute for actual Win7/Win11, non-100 % display scaling or a clean offline PC missing .NET 4.8. Real Win7 KI-Messenger behavior of this version remains field-unverified; see WIN7-TEST.md and SLAVE-TEST.md for the short field checks.'
           )
           $notes | Set-Content -LiteralPath release-notes.md -Encoding UTF8
           gh release create $env:RELEASE_TAG --verify-tag --latest --target $env:GITHUB_SHA --title "Messenger Remote Control $env:RELEASE_TAG" --notes-file release-notes.md @files

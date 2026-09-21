@@ -56,6 +56,9 @@ namespace RemoteMonitorSlave
     //   * The cursor position is saved before the click and restored best effort at the end of the worker, success or not.
     //   * Two clicks and one Ctrl+A/C; cancellation or input interference skips further input, including cleanup.
     //   * Every stored coordinate is re-verified live (window identity, client size, body search, hit test, foreground).
+    //   * Anchors, bodies and captures live in the window's logical (DPI-virtualized) client space, because this
+    //     process is DPI unaware; the cursor, hit test and click are physical. LogicalToPhysicalPoint and
+    //     PhysicalToLogicalPoint convert at that boundary, and are the identity at 100 % display scaling.
     //   * The live part of SelfTest() replaces the current clipboard content with its own sample text and does not save
     //     or restore the previous content; it is skipped when no interactive foreground window can be obtained.
     internal sealed class OutputAnchor
@@ -173,7 +176,10 @@ namespace RemoteMonitorSlave
                 var identity = inventory.Items.SingleOrDefault(p => p.Pid == (int)pid);
                 if (identity == null || !identity.StartUtcTicks.HasValue || identity.StartUtcTicks.Value < 1) return "ANCHOR_NONE|IDENTITY";
                 NativePoint cursor;
-                if (!GetPhysicalCursorPos(out cursor) || !ScreenToClient(root, ref cursor)) return "ANCHOR_NONE|CURSOR";
+                // The cursor is sampled in physical pixels; ScreenToClient and GetClientRect below answer in the
+                // DPI-virtualized (logical) space of this DPI-unaware process, so convert before leaving physical.
+                if (!GetPhysicalCursorPos(out cursor) || !PhysicalToLogicalPoint(root, ref cursor) ||
+                    !ScreenToClient(root, ref cursor)) return "ANCHOR_NONE|CURSOR";
                 NativeRect client;
                 if (!GetClientRect(root, out client)) return "ANCHOR_NONE|CLIENT";
                 if (client.Right < 1 || client.Bottom < 1 || client.Right > OutputAnchor.MaxClientSide ||
@@ -364,7 +370,10 @@ namespace RemoteMonitorSlave
             if (PowerSiScreenCapture.ResolveWindow(targetArgs) != root) throw Failure("AUTO_COPY_WINDOW_CHANGED", null);
             CheckTarget(root, inventory, anchor);
             var target = new NativePoint { X = clickClient.X, Y = clickClient.Y };
-            if (!ClientToScreen(root, ref target)) throw Failure("AUTO_COPY_WINDOW_CHANGED", null);
+            // One coordinate space at the boundary: ClientToScreen answers logical (this process is DPI unaware),
+            // while the cursor, hit test and injected click below are physical. At 100 % scaling this is identity.
+            if (!ClientToScreen(root, ref target) || !LogicalToPhysicalPoint(root, ref target))
+                throw Failure("AUTO_COPY_WINDOW_CHANGED", null);
             CheckOccluder(root, target);
             RequireIdleInput();
             var swapped = GetSystemMetrics(SwapButtonMetric) != 0;
@@ -446,7 +455,9 @@ namespace RemoteMonitorSlave
             cancellation.ThrowIfCancellationRequested();
             CheckTarget(root, inventory, anchor);
             var currentTarget = new NativePoint { X = click.X, Y = click.Y };
-            if (!ClientToScreen(root, ref currentTarget) || currentTarget.X != expected.X || currentTarget.Y != expected.Y)
+            // Recomputed exactly like the click point in Run, so a physical expectation meets a physical value.
+            if (!ClientToScreen(root, ref currentTarget) || !LogicalToPhysicalPoint(root, ref currentTarget) ||
+                currentTarget.X != expected.X || currentTarget.Y != expected.Y)
                 throw Failure("AUTO_COPY_WINDOW_CHANGED", null);
             NativePoint current;
             if (!GetPhysicalCursorPos(out current) || current.X != expected.X || current.Y != expected.Y)
@@ -679,6 +690,7 @@ namespace RemoteMonitorSlave
             DetailSelfTest();
             LayoutSelfTest();
             PreflightSelfTest();
+            Console.WriteLine(CoordinateTest());
             Console.WriteLine(LiveTest());
         }
 
@@ -938,6 +950,8 @@ namespace RemoteMonitorSlave
                 if (box == null || !Pump(1000, () => GetForegroundWindow() == form.Handle)) return Skip;
                 var target = new NativePoint { X = box.ClientSize.Width / 2, Y = box.ClientSize.Height / 2 };
                 if (box.ClientSize.Width < 8 || box.ClientSize.Height < 8 || !ClientToScreen(box.Handle, ref target)) return Skip;
+                var logical = target; // Kept so a wrong click point can be told apart from a dead desktop below.
+                if (!LogicalToPhysicalPoint(box.Handle, ref target)) return Skip;
                 NativePoint saved;
                 var savedCursor = GetPhysicalCursorPos(out saved);
                 try
@@ -946,7 +960,14 @@ namespace RemoteMonitorSlave
                     if (!SetPhysicalCursorPos(target.X, target.Y)) return Skip;
                     NativePoint current;
                     if (!GetPhysicalCursorPos(out current) || current.X != target.X || current.Y != target.Y) return Skip;
-                    if (RootOf(WindowFromPhysicalPoint(current)) != form.Handle) return Skip;
+                    if (RootOf(WindowFromPhysicalPoint(current)) != form.Handle)
+                    {
+                        // A logical point that still hits our window means the converted physical point is wrong,
+                        // which is the very defect this conversion exists for: fail rather than skip silently.
+                        Need(RootOf(WindowFromPoint(logical)) != form.Handle,
+                            "physical click point stays inside the test window");
+                        return Skip;
+                    }
                     ClickOnce(form.Handle, GetSystemMetrics(SwapButtonMetric) != 0);
                     Pump(ForegroundWaitMilliseconds, () => false);
                     Need(GetForegroundWindow() == form.Handle, "live test window stayed foreground");
@@ -996,6 +1017,34 @@ namespace RemoteMonitorSlave
                 if (form != null) { try { form.Dispose(); } catch { } }
                 try { System.Windows.Forms.Application.DoEvents(); } catch { }
             }
+        }
+
+        // Pure coordinate check: no input is injected. A point of the test window converted to physical space and
+        // back must return unchanged (±1 px for the scaling rounding). Skipped, never failed, when no window can be
+        // created or the Vista+ entry points are unavailable.
+        private static string CoordinateTest()
+        {
+            const string Skip = "SKIP: logical/physical coordinate round trip (no window or API)";
+            System.Windows.Forms.Form form = null;
+            var logical = new NativePoint();
+            var back = new NativePoint();
+            try
+            {
+                form = new System.Windows.Forms.Form { Text = "Remote Monitor coordinate self-test", Width = 320, Height = 200,
+                    ShowInTaskbar = false, StartPosition = System.Windows.Forms.FormStartPosition.CenterScreen };
+                var handle = form.Handle;
+                logical = new NativePoint { X = 4, Y = 4 };
+                if (!ClientToScreen(handle, ref logical)) return Skip;
+                var physical = logical;
+                if (!LogicalToPhysicalPoint(handle, ref physical)) return Skip;
+                back = physical;
+                if (!PhysicalToLogicalPoint(handle, ref back)) return Skip;
+            }
+            catch { return Skip; }
+            finally { if (form != null) { try { form.Dispose(); } catch { } } }
+            Need(Math.Abs(back.X - logical.X) <= 1 && Math.Abs(back.Y - logical.Y) <= 1,
+                "logical/physical round trip of a client point");
+            return "PASS: logical/physical coordinate round trip (auto copy click space)";
         }
 
         // The self-test owns the only message loop these controls get, so every wait has to pump it.
@@ -1055,6 +1104,17 @@ namespace RemoteMonitorSlave
         private static extern uint SendInput(uint count, [In] Input[] inputs, int size);
         [DllImport("user32.dll", ExactSpelling = true)]
         private static extern IntPtr WindowFromPhysicalPoint(NativePoint point);
+        // Logical (DPI-virtualized) hit test, used only by the self-test to diagnose a coordinate mismatch.
+        [DllImport("user32.dll", ExactSpelling = true)]
+        private static extern IntPtr WindowFromPoint(NativePoint point);
+        // https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-logicaltophysicalpoint (Vista+).
+        // The only bridge between the virtualized coordinates this process reads and the physical cursor/hit test.
+        [DllImport("user32.dll", ExactSpelling = true, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool LogicalToPhysicalPoint(IntPtr window, ref NativePoint point);
+        [DllImport("user32.dll", ExactSpelling = true, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool PhysicalToLogicalPoint(IntPtr window, ref NativePoint point);
         // https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setphysicalcursorpos (Vista+)
         [DllImport("user32.dll", ExactSpelling = true, SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]

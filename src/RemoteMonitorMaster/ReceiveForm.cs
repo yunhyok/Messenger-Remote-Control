@@ -27,6 +27,7 @@ namespace RemoteMonitorMaster
         private readonly string secondMarker;
         private readonly string secondReply;
         private readonly Timer countdown = new Timer { Interval = 5000 };
+        private readonly Timer countdownDisplay = new Timer { Interval = 1000 }; // 남은 초 표시 전용. 네이티브·UIA 호출 없음.
         private readonly Label status = new Label();
         private readonly TextBox code = new TextBox();
         private readonly Label replyCode = new Label();
@@ -43,6 +44,11 @@ namespace RemoteMonitorMaster
         private int environmentRevision, approvedEnvironmentRevision, disposed;
         private bool environmentReady;
         private string environmentReason;
+        private DateTime countdownStartedUtc;
+        private string countdownMessage = "";
+
+        private const string RestartAdvice =
+            "다시 시작하려면 이 창을 닫고 Master 시작 화면에서 운용 버튼을 다시 누르세요. 프로그램을 종료할 필요는 없습니다.";
 
         internal ReceiveForm(AuditLog log, bool roundTrip = false)
             : this(log, roundTrip, false) { }
@@ -80,7 +86,7 @@ namespace RemoteMonitorMaster
             Font = new Font("Segoe UI", 9F);
             StartPosition = FormStartPosition.CenterScreen;
             ClientSize = new Size(860, roundTrip ? (plainCommands ? 660 : 630) : 590);
-            MinimumSize = Size;
+            MinimumSize = new Size(700, 500); // 기본 크기는 그대로 두고 축소·스크롤만 허용합니다.
             Controls.Add(new Label { Text = Text, AutoEllipsis = true, Font = new Font(Font, FontStyle.Bold),
                 Location = new Point(18, 16), Size = new Size(824, 30) });
             status.SetBounds(18, 47, 824, 30);
@@ -90,7 +96,7 @@ namespace RemoteMonitorMaster
             {
                 Text = roundTrip
                     ? "1. PC 메신저에는 아무것도 입력하지 않습니다. 개별 자기 대화창의 입력란을 비워 두세요.\r\n" +
-                        "2. 확인란 → Start (5s) → 5초 안에 KI 제목 표시줄을 클릭합니다. 초록색 READY를 기다리세요.\r\n" +
+                        "2. 확인란 → Start (5초) → 5초 안에 KI 제목 표시줄을 클릭합니다. 초록색 READY를 기다리세요.\r\n" +
                         (operating ? (plainCommands
                             ? "3. READY 뒤 휴대폰에서 명령을 보냅니다. 마우스 오버는 불필요하며 대화창이 뒤에 있어도 대기합니다. 발송할 때 선택한 창을 앞으로 가져옵니다."
                             : "3. 첫 READY의 M을 휴대폰에서 한 번 전송합니다. 이후 답장 NEXT 숫자 앞에 M을 붙여 Stop 전까지 반복하며, LOG READY 후 로그를 첨부합니다.")
@@ -104,6 +110,7 @@ namespace RemoteMonitorMaster
             code.SetBounds(18, 157, 182, 46);
             code.Text = "WAIT";
             code.ReadOnly = true;
+            code.TabStop = false;
             code.Font = new Font("Consolas", 22F, FontStyle.Bold);
             code.TextAlign = HorizontalAlignment.Center;
             code.AccessibleName = plainCommands ? "휴대폰 고정 소문자 읽기 전용 명령어 준비 상태" :
@@ -151,11 +158,15 @@ namespace RemoteMonitorMaster
                     "커서 이동·D 입력·Send 클릭(120 ms)을 각각 최대 2회 허용합니다. 본문과 첨부 이름은 구별되지 않습니다.\r\n" +
                     "최대 3분의 제한 시험이며 일반 원격 명령·무인 제어가 아닙니다. 휴대폰에서는 현재 M만 보내겠습니다."
                 : "This is my separate self-chat, not the combined people-list window. I authorize read-only diagnosis.";
-            confirmation.SetBounds(18, 222, 824, roundTrip ? (plainCommands ? 82 : 62) : 30);
+            confirmation.Font = Font; // 측정과 표시에 같은 글꼴을 사용합니다.
+            var consentHeight = roundTrip ? (plainCommands ? 82 : 62) : 30;
+            var consentExtra = Math.Max(0, TextRenderer.MeasureText(confirmation.Text, confirmation.Font,
+                new Size(824 - 24, int.MaxValue), TextFormatFlags.WordBreak).Height + 8 - consentHeight);
+            confirmation.SetBounds(18, 222, 824, consentHeight + consentExtra);
             confirmation.CheckedChanged += delegate { UpdateButtons(); };
             Controls.Add(confirmation);
-            start.Text = "Start (5s)";
-            var offset = roundTrip ? (plainCommands ? 60 : 40) : 0;
+            start.Text = "Start (5초)";
+            var offset = (roundTrip ? (plainCommands ? 60 : 40) : 0) + consentExtra;
             start.SetBounds(18, 266 + offset, 210, 36);
             start.Click += delegate { Begin(); };
             stop.Text = "Stop";
@@ -165,13 +176,14 @@ namespace RemoteMonitorMaster
             details.SetBounds(18, 322 + offset, 824, 155);
             details.Multiline = true;
             details.ReadOnly = true;
+            details.TabStop = false;
             details.ScrollBars = ScrollBars.Vertical;
             details.Text = operating
                 ? (plainCommands
                     ? "pwrsi 한 번은 Slave에서 요청 시점의 PowerSI 보고서를 한 번 수집하고, 1,400자 이하 PART 답장을 순서대로 전송합니다.\r\n" +
                         "help help, help total status도 인식하는 고정 읽기 전용 명령어입니다. 목록 밖의 명령은 승인하거나 실행하지 않으며, 메시지 본문 인증을 주장하지 않습니다.\r\n" +
-                        "모든 대상이 표시되며 Pending 대상은 이름·PID·Pending만 보냅니다. 나머지는 출처·수집 시각·설명·수집된 Output 전체 또는 이전 전송 이후 추가분를 보내고 진행률·완료를 추측하지 않습니다.\r\n" +
-                        "보고서 수집은 최대100초, 전체 조회는 최대120초입니다. 한 PART라도 전송 결과가 불확실하면 남은 PART를 보내지 않습니다. Stop 뒤 현재 호출이 끝나야 LOG READY가 표시됩니다."
+                        "모든 대상이 표시되며 Pending 대상은 이름·PID·Pending만 보냅니다. 나머지는 출처·수집 시각·설명·수집된 Output 전체 또는 이전 전송 이후 추가분을 보내고 진행률·완료를 추측하지 않습니다.\r\n" +
+                        "보고서 수집은 최대 100초, 전체 조회는 최대 120초입니다. 한 PART라도 전송 결과가 불확실하면 남은 PART를 보내지 않습니다. Stop 뒤 현재 호출이 끝나야 LOG READY가 표시됩니다."
                     : "반복 통합 확인: 첫 휴대폰 M코드 수신 → " + (slave == null ? "이 PC" : "선택한 Slave PC") + " 읽기 전용 상태 조회 → " + ReportPrefix + " 답장 → 다음 NEXT 숫자 앞에 M을 붙여 반복합니다.\r\n" +
                         "첫 초록 READY의 M만 한 번 보내세요. 이후 답장을 본 뒤 답장 NEXT 숫자 앞에 M을 붙여 바로 휴대폰에서 보낼 수 있습니다.\r\n" +
                         (slave == null ? "" : "휴대폰 목록은 현재 Slave 세션에서 CPU 사용률 우선, 창 있음·RAM 순 최대 8개입니다. PROGRESS n/a는 진행률 미제공입니다.\r\n") +
@@ -194,24 +206,36 @@ namespace RemoteMonitorMaster
                     "The test ends automatically. Candidate detection is NOT authenticated command recognition; no PONG is sent.\r\n" +
                     "If preparation makes no progress for 45 seconds, or a phone send gives no result for 90 seconds, Stop and collect the log.";
             Controls.Add(details);
-            var path = new TextBox { Text = log.FilePath, ReadOnly = true };
+            var path = new TextBox { Text = log.FilePath, ReadOnly = true, TabStop = false };
             path.SetBounds(18, 494 + offset, 679, 24);
-            var open = new Button { Text = "Open Log Folder" };
+            var open = new Button { Text = "로그 폴더 열기" };
             open.SetBounds(707, 489 + offset, 135, 32);
             open.Click += delegate
             {
-                try { Process.Start("explorer.exe", log.FolderPath); }
-                catch { MessageBox.Show("Open this log folder manually:\r\n" + log.FolderPath, AppInfo.Title); }
+                try { using (Process.Start("explorer.exe", "\"" + log.FolderPath + "\"")) { } }
+                catch { MessageBox.Show(this, "로그 폴더를 직접 여세요:\r\n" + log.FolderPath, AppInfo.Title); }
             };
             Controls.AddRange(new Control[] { path, open });
             Controls.Add(new Label
             {
-                Text = "Privacy: message text, filenames and the test code are not logged. Control metadata and process paths may remain.",
+                Text = "개인정보: 메시지 본문·파일명·시험 코드는 기록하지 않습니다. 컨트롤 메타데이터와 프로세스 경로는 남을 수 있습니다.",
                 Location = new Point(18, 552 + offset), Size = new Size(824, 30)
             });
+            if (consentExtra > 0) ClientSize = new Size(ClientSize.Width, ClientSize.Height + consentExtra);
+            AutoScroll = true;
+            AutoScrollMinSize = ClientSize;
             countdown.Tick += Tick;
+            countdownDisplay.Tick += CountdownDisplayTick;
             FormClosing += delegate(object sender, FormClosingEventArgs args)
             {
+                // 사용자가 직접 닫을 때만 확인합니다. 프로그램 Close(CloseReason.None)는 기존 동작 그대로입니다.
+                if (busy && args.CloseReason == CloseReason.UserClosing &&
+                    MessageBox.Show(this, "회신 전송이 진행 중입니다. 지금 닫으면 남은 PART를 보내지 않고 중단합니다.\r\n\r\n중단하고 닫을까요?",
+                        Text, MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes)
+                {
+                    args.Cancel = true;
+                    return;
+                }
                 closing = true;
                 Stop(roundTrip ? "CLOSING - waiting for the current call" : "CLOSING - waiting for the current read");
                 if (busy) args.Cancel = true;
@@ -319,21 +343,43 @@ namespace RemoteMonitorMaster
                     AuditLog.Field("operating_status", operating),
                     AuditLog.Field("plain_commands", plainCommands),
                     AuditLog.Field("maximum_replies", operating ? (object)"UNTIL_STOP" : roundTrip ? ReplyCount : 0));
-                SetStatus(roundTrip ? (operating ? (plainCommands ? "5초 안에 KI 제목 표시줄을 클릭하세요. 첫 READY 전에는 명령어를 보내지 마세요."
+                countdownMessage = roundTrip ? (operating ? (plainCommands ? "5초 안에 KI 제목 표시줄을 클릭하세요. 첫 READY 전에는 명령어를 보내지 마세요."
                     : "5초 안에 KI 제목 표시줄을 클릭하세요. 첫 READY 전에는 보내지 마세요.")
                     : "5초 안에 KI 제목 표시줄을 클릭하세요. 휴대폰 전송은 아직 하지 마세요.") :
-                    "5 SECONDS - activate the KI chat; do not send from the phone yet", false);
+                    "5 SECONDS - activate the KI chat; do not send from the phone yet";
+                SetStatus(CountdownText(5), false);
                 SetInteractionNotice(plainCommands ? "처음에 대화창을 한 번 선택하세요. READY 뒤 마우스 오버·앞면 유지는 필요 없습니다." :
                     "KI 창 선택 후에는 마스터 LOG READY까지 PC 조작을 멈춰 주세요.");
                 if (stopped || EnvironmentChanged(approvedEnvironmentRevision)) { Stop("ENVIRONMENT_CHANGED - " + environmentReason); return; }
                 countdown.Start();
+                countdownStartedUtc = DateTime.UtcNow;
+                countdownDisplay.Start();
             }
-            catch { Stop("AUDIT UNAVAILABLE"); }
+            catch (Exception ex)
+            {
+                try { log.WriteException("RECEIVE_BEGIN_FAILED", ex); } catch { }
+                Stop((ex as MonitorException)?.ReasonCode ?? "RECEIVE_BEGIN_FAILED");
+            }
             UpdateButtons();
+        }
+
+        private string CountdownText(int remaining)
+        {
+            return remaining + "초 남음 — " + countdownMessage;
+        }
+
+        // 라벨만 갱신합니다. 5초 선택 판정은 countdown Timer의 Tick이 그대로 담당합니다.
+        private void CountdownDisplayTick(object sender, EventArgs args)
+        {
+            if (!countdown.Enabled || stopped || busy || closing) { countdownDisplay.Stop(); return; }
+            var remaining = 5 - (int)(DateTime.UtcNow - countdownStartedUtc).TotalSeconds;
+            if (remaining < 1) { countdownDisplay.Stop(); return; }
+            SetStatus(CountdownText(remaining), false);
         }
 
         private async void Tick(object sender, EventArgs args)
         {
+            countdownDisplay.Stop();
             if (!countdown.Enabled || busy || closing) { countdown.Stop(); return; }
             if (EnvironmentChanged(approvedEnvironmentRevision)) { Stop("ENVIRONMENT_CHANGED - " + environmentReason); return; }
             if (stopped) { countdown.Stop(); return; }
@@ -349,6 +395,7 @@ namespace RemoteMonitorMaster
                 var window = NativeMethods.GetForegroundWindow();
                 if (window == IntPtr.Zero || window == Handle)
                     throw new MonitorException("RECEIVE_NO_TARGET", "Activate the separate KI chat during countdown.");
+                ShowSelectedWindowNotice(window);
                 SetStatus(roundTrip ? (operating ? (plainCommands ? "명령어 통합 확인 준비 중 — 첫 READY까지 기다리세요."
                     : "반복 상태 확인 준비 중 — 첫 READY까지 기다리세요.")
                     : "기존 대화 확인 중 — 초록색 READY까지 기다리세요. 아직 보내지 마세요.") :
@@ -381,6 +428,20 @@ namespace RemoteMonitorMaster
                 UpdateButtons();
                 if (closing) BeginInvoke(new Action(Close));
             }
+        }
+
+        // 참고 표시 전용: 프로세스 이름·PID만 읽습니다. KI-Messenger 판정은 작업자 스레드의 PROBE_NOT_KI_MESSENGER가 담당합니다.
+        private void ShowSelectedWindowNotice(IntPtr window)
+        {
+            uint pid;
+            if (NativeMethods.GetWindowThreadProcessId(window, out pid) == 0 || pid == 0) return;
+            string name = null;
+            try { using (var process = Process.GetProcessById((int)pid)) name = process.ProcessName; }
+            catch { return; } // 참고 정보일 뿐이므로 실패해도 세션을 중단하지 않습니다.
+            if (string.IsNullOrEmpty(name)) return;
+            SetInteractionNotice("선택한 창: " + name + " (PID " + pid + ") — 이 창으로만 주고받습니다.");
+            try { log.Write("INFO", "RECEIVE_TARGET_SELECTED", AuditLog.Field("process_name", name), AuditLog.Field("pid", pid)); }
+            catch { }
         }
 
         private void Publish(string phase, int runGeneration)
@@ -438,7 +499,7 @@ namespace RemoteMonitorMaster
             else if (phase == "SLAVE_QUERYING" || phase == "PC_STATUS_QUERYING")
             {
                 code.Text = "WAIT";
-                SetStatus(count + (phase == "SLAVE_QUERYING" ? " Slave 조회 중 — 일반 상태 약8초 / PowerSI 전체 최대120초, Stop 가능…" : " 이 PC 상태 조회 중…"), false);
+                SetStatus(count + (phase == "SLAVE_QUERYING" ? " Slave 조회 중 — 일반 상태 약 8초 / PowerSI 전체 최대 120초, Stop 가능…" : " 이 PC 상태 조회 중…"), false);
                 SetInteractionNotice("조회 중 — 상태 조회 완료는 메신저 시험 종료가 아닙니다.");
             }
             else if (phase == "ROUNDTRIP_SENDING" || phase.StartsWith("ROUNDTRIP_SENDING:", StringComparison.Ordinal))
@@ -558,6 +619,13 @@ namespace RemoteMonitorMaster
                 SetStatus("새 메시지는 읽었지만 지원 명령과 불일치 — 소문자 pwrsi / total status를 확인하세요.", false);
                 SetInteractionNotice("앞뒤 공백은 허용 / 철자·대소문자·단어 사이 공백은 구분 / Stop으로 종료");
             }
+            else if (phase == "COMMAND_NOT_VISIBLE")
+            {
+                // 첫 명령 행은 고정되며 다른 행이 대신할 수 없습니다. 보이는 enabled 상태가 될 때까지 접수하지 않습니다.
+                code.Text = "READY";
+                SetStatus("명령 메시지를 읽었지만 화면 밖이거나 비활성 상태 — 대화 기록을 맨 아래로 스크롤해 명령이 보이게 하세요.", false);
+                SetInteractionNotice("첫 명령 행이 보이는 enabled 상태여야 접수 / 이후 보낸 메시지는 대신 접수되지 않음 / Stop으로 종료");
+            }
             else if (phase == "SLAVE_QUERYING" || phase == "PC_STATUS_QUERYING")
             {
                 code.Text = "WAIT";
@@ -622,9 +690,11 @@ namespace RemoteMonitorMaster
         {
             if (roundTrip && (result.Contains(SupervisedSendTest.MouseReleaseWarning) ||
                 ActivePendingWrite)) closing = false;
-            details.Text = result + "\r\n" + OutcomeAdvice();
+            var explanation = Explain(result); // 작업자 결과 본문은 매핑되지 않으므로 사유 코드일 때만 설명이 붙습니다.
+            details.Text = (string.IsNullOrEmpty(explanation) ? result : result + " — " + explanation) + "\r\n" + OutcomeAdvice();
             if (EnvironmentChanged(approvedEnvironmentRevision))
                 details.AppendText("\r\n환경 변경: " + environmentReason + " — 승인은 취소되었으며 자동 재개하지 않습니다.");
+            details.AppendText("\r\n" + RestartAdvice);
             if (roundTrip) code.Text = "WAIT";
             SetStatus((stopped || runGeneration != generation ? "STOPPED / RESULT READY" : "RESULT READY") +
                 (operating ? " — 연속 운용 종료 / 완료 " + CompletedRoundCount + "회 / 휴대폰 수신 확인 필요"
@@ -682,15 +752,19 @@ namespace RemoteMonitorMaster
             statusSession?.Cancel();
             generation++;
             countdown.Stop();
+            countdownDisplay.Stop();
             confirmation.Checked = false;
             if (roundTrip) code.Text = "WAIT";
-            SetStatus(reason, false);
+            SetStatus("중단됨 — " + reason, false);
             if (busy) SetInteractionNotice(operating ? "중단 요청 중 — 호출 종료 후 LOG READY" : "중단 요청 중 — 호출이 끝나고 마스터 LOG READY가 뜰 때까지 기다리세요.");
             details.Text = roundTrip
                 ? (busy ? "진행 중인 호출의 반환을 기다립니다. Stop은 이미 수행한 입력·클릭을 되돌리지 않습니다.\r\n" : "") + OutcomeAdvice()
                 : "READ ONLY: no PC input, mouse action or reply.\r\n" +
                     (busy ? "Waiting for the current accessibility read to return; Stop cannot forcibly abort it.\r\n" : "") +
                     "Collect the log. Do not send another phone message or repeat this session.";
+            var explanation = Explain(reason);
+            if (!string.IsNullOrEmpty(explanation)) details.AppendText("\r\n" + reason + " — " + explanation);
+            details.AppendText("\r\n" + RestartAdvice);
             try { log.Write("INFO", "RECEIVE_UI_STOP", AuditLog.Field("busy", busy), AuditLog.Field("read_only", !roundTrip),
                 AuditLog.Field("environment_changed", EnvironmentChanged(approvedEnvironmentRevision)),
                 AuditLog.Field("environment_reason", environmentReason),
@@ -702,18 +776,72 @@ namespace RemoteMonitorMaster
             UpdateButtons();
         }
 
+        // 사유 코드는 그대로 두고 다음 행동만 덧붙입니다. 모르는 코드는 null이며 코드만 표시합니다.
+        private static string Explain(string reason)
+        {
+            if (string.IsNullOrEmpty(reason)) return null;
+            switch (reason)
+            {
+                case "RECEIVE_NO_TARGET":
+                    return "5초 안에 KI-Messenger의 나와의 대화 창을 클릭하지 않았습니다. 이 창을 닫고 다시 연 뒤 Start를 누르고 5초 안에 대화 창 제목 표시줄을 한 번 클릭하세요.";
+                case "PROBE_NOT_KI_MESSENGER":
+                    return "선택한 창이 KI-Messenger가 아닙니다. 새 세션에서 나와의 대화 창을 클릭하세요.";
+                case "TARGET_INITIAL_FOREGROUND_REQUIRED":
+                    return "선택 직후 다른 창이 앞으로 나와 세션을 시작하지 못했습니다. 알림·팝업을 닫고 새 세션을 시작하세요.";
+                case "TARGET_ACTIVATION_REJECTED":
+                case "TARGET_RESTORE_REJECTED":
+                    return "Windows가 대화창을 앞으로 가져오거나 복원하는 것을 거부했습니다. 전체 화면 프로그램·설치 마법사·UAC 창을 닫고 새 세션을 시작하세요. 자동 재시도는 하지 않습니다.";
+                case "TARGET_FOREGROUND_INTERFERED":
+                case "TARGET_FOREGROUND_NOT_ACQUIRED":
+                case "TARGET_INPUT_CHANGED":
+                    return "회신 입력 직전에 다른 창이 앞으로 나오거나 PC 입력이 감지됐습니다. PC 조작을 멈춘 뒤 새 세션을 시작하세요.";
+                case "TARGET_INPUT_DESKTOP_UNAVAILABLE":
+                case "TARGET_INPUT_DESKTOP_INSECURE":
+                    return "잠금 화면·보안 데스크톱 상태여서 입력할 수 없습니다. 잠금을 해제한 뒤 새 세션을 시작하세요. 자동 재개는 하지 않습니다.";
+                case "RECEIVE_READY_BOUNDARY_CHANGED":
+                    return "메신저 화면의 Master Ready 표시가 접수 당시와 달라져 회신을 중단했습니다. 남은 부분은 보내지 않았습니다.";
+                case "RECEIVE_READY_NOT_OBSERVED":
+                case "RECEIVE_READY_NOT_APPENDED":
+                    return "보낸 Master Ready가 대화 기록의 마지막 줄로 확인되지 않았습니다. 메신저 연결 상태를 확인한 뒤 새 세션을 시작하세요.";
+                case "RECEIVE_WAIT_TIME_LIMIT":
+                    return "60초 안에 새 메시지가 도착하지 않았습니다. READY 뒤 휴대폰에서 한 번 보낸 다음 새 세션을 시작하세요.";
+                case "RECEIVE_PHASE_TIME_LIMIT":
+                    return "화면 읽기 한 단계가 15초를 넘었습니다. 대화 기록이 매우 길면 새 대화를 사용하세요.";
+                case "STATUS_REQUEST_STOPPED":
+                    return "이번 요청이 중단되어 다음 요청을 시작하지 않았습니다.";
+                case "STATUS_TARGET_CHANGED":
+                case "STATUS_WINDOW_MOVED":
+                case "STATUS_PROCESS_CHANGED":
+                case "TARGET_WINDOW_MOVED":
+                case "TARGET_WINDOW_OR_PID_CHANGED":
+                case "TARGET_PROCESS_IDENTITY_CHANGED":
+                    return "선택한 대화창이 닫히거나 이동·변경되었습니다. 창을 움직이지 말고 새 세션을 시작하세요.";
+                case "STATUS_SESSION_FAILED":
+                case "RECEIVE_FAILED":
+                case "RECEIVE_BEGIN_FAILED":
+                    return "예상하지 못한 오류로 중단했습니다. 로그 폴더의 최신 로그를 첨부해 문의하세요.";
+            }
+            if (reason.StartsWith("TARGET_ROOT_", StringComparison.Ordinal))
+                return "선택한 대화창이 닫히거나 이동·변경되었습니다. 창을 움직이지 말고 새 세션을 시작하세요.";
+            if (reason.StartsWith("RECEIVE_HISTORY_", StringComparison.Ordinal))
+                return "대화 기록의 구조가 바뀌어 안전을 위해 중단했습니다. 메시지 삭제·재정렬이 없었는지 확인하고 새 세션을 시작하세요.";
+            if (reason.StartsWith("ENVIRONMENT_CHANGED", StringComparison.Ordinal))
+                return "잠금·세션 전환·절전이 감지되어 중단했습니다. 자동으로 다시 시작하지 않습니다.";
+            return null;
+        }
+
         private void SetStatus(string message, bool ready)
         {
-            status.Text = "State: " + message;
-            status.ForeColor = ready ? Color.DarkGreen : SystemColors.ControlText;
+            status.Text = "상태: " + message;
+            status.ForeColor = ready && !SystemInformation.HighContrast ? Color.DarkGreen : SystemColors.ControlText;
         }
 
         private void SetInteractionNotice(string message, bool finished = false)
         {
             if (!roundTrip) return;
             replyCode.Text = message;
-            replyCode.ForeColor = finished ? Color.DarkBlue : Color.DarkRed;
-            replyCode.BackColor = finished ? SystemColors.Control : Color.LightYellow;
+            replyCode.ForeColor = SystemInformation.HighContrast ? SystemColors.WindowText : finished ? Color.DarkBlue : Color.DarkRed;
+            replyCode.BackColor = finished ? SystemColors.Control : SystemInformation.HighContrast ? SystemColors.Window : Color.LightYellow;
         }
 
         private void UpdateButtons()
@@ -734,6 +862,7 @@ namespace RemoteMonitorMaster
                 Threading.Volatile.Read(ref statusSession)?.Cancel();
                 DetachEnvironmentEvents();
                 countdown.Dispose();
+                countdownDisplay.Dispose();
             }
             base.Dispose(disposing);
         }

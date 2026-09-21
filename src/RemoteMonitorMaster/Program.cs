@@ -22,13 +22,15 @@ namespace RemoteMonitorMaster
             {
                 if (!ownsInstance)
                 {
-                    MessageBox.Show(AppInfo.Title + " is already running in this Windows session.",
+                    MessageBox.Show("이미 이 Windows 세션에서 실행 중입니다.",
                         AppInfo.Title, MessageBoxButtons.OK, MessageBoxIcon.Information);
                     return;
                 }
 
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
+                // UI-thread failures must reach the safe-stop handler below instead of the WinForms error dialog.
+                Application.SetUnhandledExceptionMode(UnhandledExceptionMode.ThrowException);
 
                 AuditLog log;
                 try
@@ -38,8 +40,8 @@ namespace RemoteMonitorMaster
                 catch (Exception ex)
                 {
                     MessageBox.Show(
-                        AppInfo.Title + " stopped safely.\r\n\r\nReason: " + ex.GetType().Name +
-                        "\r\nLog unavailable.",
+                        "안전하게 중단했습니다.\r\n\r\n원인: " + ex.GetType().Name +
+                        "\r\n로그를 사용할 수 없습니다.",
                         AppInfo.Title,
                         MessageBoxButtons.OK,
                         MessageBoxIcon.Error);
@@ -48,6 +50,16 @@ namespace RemoteMonitorMaster
 
                 using (log)
                 {
+                    // Non-UI threads never reach the catch below; record APP_FATAL before the process ends.
+                    AppDomain.CurrentDomain.UnhandledException += (sender, fatal) =>
+                    {
+                        try
+                        {
+                            log.WriteException("APP_FATAL", fatal.ExceptionObject as Exception ??
+                                new MonitorException("APP_FATAL", "A non-Exception object terminated the process."));
+                        }
+                        catch { }
+                    };
                     try
                     {
                         log.Write("INFO", "APP_START",
@@ -73,7 +85,7 @@ namespace RemoteMonitorMaster
                         Application.Run(new MasterHubForm(log));
                         // An attachment reader may deny writes after the completed log was released.
                         try { log.Write("INFO", "APP_EXIT"); }
-                        catch (System.IO.IOException) { } // Optional shutdown entry; do not report a false application failure.
+                        catch { } // Optional shutdown entry; do not report a false application failure.
                     }
                     catch (Exception ex)
                     {
@@ -87,8 +99,8 @@ namespace RemoteMonitorMaster
                         }
 
                         MessageBox.Show(
-                            AppInfo.Title + " stopped safely.\r\n\r\nReason: " + ex.GetType().Name +
-                            "\r\nLog: " + log.FilePath,
+                            "안전하게 중단했습니다.\r\n\r\n원인: " + ex.GetType().Name +
+                            "\r\n로그: " + log.FilePath,
                             AppInfo.Title,
                             MessageBoxButtons.OK,
                             MessageBoxIcon.Error);

@@ -35,8 +35,21 @@ namespace RemoteMonitorSlave
                 if (!owns) { MessageBox.Show("Slave가 이미 실행 중입니다.", Title); return; }
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
-                try { Application.Run(new SlaveForm()); }
-                catch (Exception ex) { MessageBox.Show("Slave 시작 실패: " + ex.GetType().Name, Title); }
+                // Without this, a UI-thread exception opens the WinForms error dialog and keeps running instead of
+                // reaching the catch below, so a broken Slave would look like a working one.
+                Application.SetUnhandledExceptionMode(UnhandledExceptionMode.ThrowException);
+                var shown = false;
+                try
+                {
+                    var form = new SlaveForm();
+                    form.Shown += delegate { shown = true; };
+                    Application.Run(form);
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show((shown ? "Slave가 안전하게 중단되었습니다: " : "Slave 시작 실패: ") +
+                        ex.GetType().Name + "\r\n로그 폴더의 최신 로그를 확인하세요.", Title);
+                }
             }
         }
     }
@@ -48,8 +61,12 @@ namespace RemoteMonitorSlave
         internal SlaveLog(string directory)
         {
             Directory.CreateDirectory(directory);
-            Path = System.IO.Path.Combine(directory, "remote-monitor-slave-" + DateTime.UtcNow.ToString("yyyyMMdd-HHmmss") +
-                "-pid" + System.Diagnostics.Process.GetCurrentProcess().Id + ".log");
+            int pid;
+            using (var current = System.Diagnostics.Process.GetCurrentProcess()) pid = current.Id;
+            // A non-Gregorian user calendar would otherwise rename every log file (and break their ordering).
+            Path = System.IO.Path.Combine(directory, "remote-monitor-slave-" +
+                DateTime.UtcNow.ToString("yyyyMMdd-HHmmss", System.Globalization.CultureInfo.InvariantCulture) +
+                "-pid" + pid.ToString(System.Globalization.CultureInfo.InvariantCulture) + ".log");
             Write("APP_START");
         }
         internal void Write(string code)

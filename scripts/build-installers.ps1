@@ -160,8 +160,9 @@ if (-not $SkipReleaseChecksums) {
         "$((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash)  $([IO.Path]::GetFileName($path))"
     }
     Set-Content -LiteralPath (Join-Path $dist 'SHA256SUMS.txt') -Value $sums -Encoding ASCII
-    & (Join-Path $PSScriptRoot 'check-release-assets.ps1') -AssetDirectory $dist
-    if ($LASTEXITCODE -ne 0) { throw 'Release asset validation failed.' }
+    # check-release-assets.ps1 reports failures by throwing, so $LASTEXITCODE never reflects its result.
+    try { & (Join-Path $PSScriptRoot 'check-release-assets.ps1') -AssetDirectory $dist }
+    catch { throw "Release asset validation failed: $($_.Exception.Message)" }
 }
 
 Write-Host "Inno Setup: $iscc"

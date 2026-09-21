@@ -25,7 +25,7 @@ namespace RemoteMonitorLink
 
     internal static class LinkVersion
     {
-        internal const string AppValue = "0.3.3";
+        internal const string AppValue = "0.3.4";
         internal const string Value = "0.3.0";
     }
 
@@ -206,7 +206,6 @@ namespace RemoteMonitorLink
             if (!string.Equals(parts[6], LinkVersion.Value, StringComparison.Ordinal))
                 throw new LinkVersionMismatchException(parts[6]);
 
-            PowerSiReport report = null;
             PowerSiObservation observation = null;
             if (powerSiOnly)
             {
@@ -222,14 +221,12 @@ namespace RemoteMonitorLink
                 Version = parts[6],
                 Processes = ProcessInventory.Parse(parts[7]),
                 PowerSiOnly = powerSiOnly,
-                PowerSi = observation,
-                PowerSiReport = report
+                PowerSi = observation
             };
             status.Validate();
             if (powerSiOnly && !IsPowerSiInventory(status.Processes))
                 throw new InvalidDataException("Invalid PowerSI status response.");
-            if (powerSiOnly && status.PowerSiReport != null)
-                ValidatePowerSiReportInventory(status.Processes, status.PowerSiReport);
+            // The framed report itself is attached and checked against this inventory by StatusClient.QueryAsync.
             return status;
         }
 

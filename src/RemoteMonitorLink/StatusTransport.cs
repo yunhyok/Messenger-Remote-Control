@@ -11,6 +11,13 @@ using System.Threading.Tasks;
 
 namespace RemoteMonitorLink
 {
+    // A fault raised while serving one client (the PowerSI collection callback or this client's response
+    // preparation) ends that connection only. Accept-loop and listener faults still stop the server.
+    internal sealed class ClientRequestFailedException : IOException
+    {
+        internal ClientRequestFailedException(string message, Exception inner) : base(message, inner) { }
+    }
+
     internal sealed class StatusServer : IDisposable
     {
         private const int ClientDeadlineMilliseconds = 8000;
@@ -197,11 +204,19 @@ namespace RemoteMonitorLink
                         powerSi = await PowerSiVision.CaptureAsync(processes, vision, deadline.Token).ConfigureAwait(false);
                     else
                     {
-                        // The callback reserves its first 100 seconds for collection; the request token leaves response grace.
-                        powerSiReport = await collectPowerSi(processes, deadline.Token).ConfigureAwait(false);
-                        if (powerSiReport == null) throw new InvalidDataException("PowerSI report is missing.");
-                        powerSiReport = powerSiReport.ForTransportCapacity();
-                        powerSiReport.Validate();
+                        try
+                        {
+                            // The callback reserves its first 100 seconds for collection; the request token leaves response grace.
+                            powerSiReport = await collectPowerSi(processes, deadline.Token).ConfigureAwait(false);
+                            if (powerSiReport == null) throw new InvalidDataException("PowerSI report is missing.");
+                            powerSiReport = powerSiReport.ForTransportCapacity();
+                            powerSiReport.Validate();
+                        }
+                        catch (Exception failure) when (!(failure is OperationCanceledException))
+                        {
+                            Notify("COLLECT_FAILED");
+                            throw new ClientRequestFailedException("PowerSI collection failed.", failure);
+                        }
                     }
                     deadline.Token.ThrowIfCancellationRequested();
                 }
@@ -210,12 +225,20 @@ namespace RemoteMonitorLink
                 status.PowerSi = powerSi;
                 status.PowerSiReport = powerSiReport;
                 string response;
-                if (powerSiReport == null) response = LinkProtocol.FormatStatus(status, powerSiOnly);
-                else
+                try
                 {
-                    status.Processes = processes.IdentityOnly();
-                    try { response = LinkProtocol.FormatStatus(status, true); }
-                    finally { status.Processes = processes; }
+                    if (powerSiReport == null) response = LinkProtocol.FormatStatus(status, powerSiOnly);
+                    else
+                    {
+                        status.Processes = processes.IdentityOnly();
+                        try { response = LinkProtocol.FormatStatus(status, true); }
+                        finally { status.Processes = processes; }
+                    }
+                }
+                catch (Exception failure) when (!(failure is OperationCanceledException) && !IsClientFailure(failure))
+                {
+                    Notify("RESPONSE_FAILED");
+                    throw new ClientRequestFailedException("Status response could not be prepared.", failure);
                 }
                 var captured = StatusCaptured;
                 if (captured != null)
