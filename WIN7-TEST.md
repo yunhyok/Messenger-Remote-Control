@@ -1,6 +1,8 @@
 # Master 현장 확인: 자연 발생 분할 회신
 
-**0.3.6 확인(Master를 v0.3.6으로 설치한 뒤):** 0.3.6은 회신 속도만 바꿉니다. 평소처럼 `pwrsi`를 한 번 보내고, 로그에서 다음 네 가지만 확인해 주세요. ① `READ_ONLY_PROBE_RESULT`의 `elapsed_ms`와 새로 추가된 `guard_ms`/`cache_ms`/`name_ms`/`content_ms`/`nav_ms` 값(0.3.5에서 같은 스냅샷이 5.6~6.8초였으므로 0.3.6의 `elapsed_ms`를 함께 적어 주세요). ② `PROCESS_IDENTITY`의 `signature_cached`가 첫 회 이후 true인지. ③ 답장 부분 사이에 `WAITING_FOR_PC_IDLE:INPUT_RECENT`가 더 이상 나오지 않는지(`OPERATIONAL_TARGET_IDLE_WAIT`의 `own_input` 포함). ④ 폴링 대기마다 1행씩 남는 `RECEIVE_CHANGE_TRIGGER`의 `reason`이 실제 메시지에서 `TAIL_CHANGED`인지. `PROBE_FAILED`가 매번 `samples=1`로 나오면 요소 식별자·경로가 불안정한 것이고, `samples=0`이면 기록된 구조가 탐색 한도를 넘은 것이며 두 경우 모두 0.3.5와 같은 주기로 동작합니다(기능 이상 아님). 명령을 보낸 뒤 `Master Ready`부터 처리 시작 안내까지 걸린 시간과 마지막 `N/N`까지 걸린 시간도 적어 주세요. 요청이 없으면 원문 로그·스크린샷은 올리지 말고 위 값만 알려 주세요.
+**0.3.7 확인(Master를 v0.3.7로 설치한 뒤):** 0.3.7은 대화창을 읽는 방식만 바꿉니다. 평소처럼 `pwrsi`를 한 번 보내고, 로그에서 다음 세 가지만 확인해 주세요. ① `READ_ONLY_PROBE_RESULT`의 `elapsed_ms`와 새로 추가된 `children_ms`·`children_queries`, 그리고 같은 행의 `nodes`(0.3.6에서는 같은 스냅샷이 593~632 노드에 6.3~7.7초였으므로 세 값을 함께 적어 주세요). 같은 행의 `read_failures`가 0이 아니거나 `complete=false`이면 그 값도 알려 주세요. ② 폴링 대기마다 1행씩 남는 `RECEIVE_CHANGE_TRIGGER`의 `reason` 분포(`TAIL_CHANGED`/`PERIODIC`/`NOT_IDLE`). ③ 명령을 보낸 뒤 `Master Ready`부터 처리 시작 안내까지 걸린 시간과 답장 부분 하나에 걸린 시간(0.3.6에서는 부분당 약 14초, 인식은 도착 후 스냅샷 약 2.5회였습니다). 요청이 없으면 원문 로그·스크린샷은 올리지 말고 위 값만 알려 주세요.
+
+**0.3.6 결과(참고):** 0.3.6 첫 로그에서 서명 검증 캐시(`PROCESS_IDENTITY signature_cached`), 자기 클릭을 뺀 입력 대기(부분 사이 `WAITING_FOR_PC_IDLE` 기록 없음), 명령 대기 중 구조 표본(`RECEIVE_CHANGE_TRIGGER`)은 의도대로 동작했고 답장 부분이 약 17.7초에서 약 14.1초가 되었습니다. 화면을 한 번 읽는 시간은 줄지 않았고, 그 원인(형제 요소 이동)이 0.3.7의 변경입니다. 같은 로그의 ERROR 2건은 운용자 Stop이며 결함이 아닙니다.
 
 **0.3.5 확인(Master를 v0.3.5로 설치한 뒤):** Start 후 창 선택 뒤 상태 표시가 "PC 입력이 끝나기를 기다리고 있습니다"에서 넘어가지 않으면 2초 뒤 표시되는 원인 문구(입력 계속 감지 / 키·버튼 눌림 / 앞 창 메뉴·끌기 / 활성 창 없음)를 그대로 기록하고, 60초 뒤 `TARGET_PC_NOT_IDLE`로 멈추면 로그의 `OPERATIONAL_TARGET_IDLE_WAIT` 행만 보내 주세요. Ready가 정상 발송되면 아래 0.3.4 항목을 이어서 확인합니다.
 

@@ -43,7 +43,6 @@ namespace RemoteMonitorMaster
 
             const int depthLimit = 32;
             var clock = Stopwatch.StartNew();
-            var walker = TreeWalker.RawViewWalker;
             var nodes = 0;
             var failures = 0;
             var skipped = 0;
@@ -52,9 +51,10 @@ namespace RemoteMonitorMaster
             var truncatedTextReads = 0;
             var pointerHits = 0;
             var pointerInvokes = 0;
+            var childrenQueries = 0;
             var reads = new int[3];
             // Per-category provider time only; no node, no property value and no content ever reaches these totals.
-            long guardTicks = 0, cacheTicks = 0, nameTicks = 0, contentTicks = 0, navTicks = 0;
+            long guardTicks = 0, cacheTicks = 0, nameTicks = 0, contentTicks = 0, navTicks = 0, childrenTicks = 0;
             var exact = new int[3];
             var contains = new int[3];
             var observed = new List<ProbeNode>();
@@ -80,8 +80,9 @@ namespace RemoteMonitorMaster
                     case "TextPattern":
                     case "ValuePattern":
                     case "value_read_only": contentTicks += ticks; break;
-                    case "first_child":
-                    case "next_sibling":
+                    case "children": childrenTicks += ticks; break;
+                    // Remaining element-returning navigation reads (the root handle lookup); kept so the field set
+                    // stays stable now that per-sibling walker hops are gone.
                     case "root": navTicks += ticks; break;
                 }
             }
@@ -191,7 +192,9 @@ namespace RemoteMonitorMaster
                 return false;
             }
 
-            void Visit(AutomationElement element, int parent, int depth, int document)
+            // cachedByParent: this element came from its parent's children query in this same snapshot and already
+            // carries that query's batch, so its guard runs on those values instead of a second round trip.
+            void Visit(AutomationElement element, int parent, int depth, int document, bool cachedByParent = false)
             {
                 if (!Continue()) return;
                 if (nodes == MaxNodes)
@@ -210,7 +213,12 @@ namespace RemoteMonitorMaster
                 if (!Read(node, "metadata_cache", () =>
                     {
                         ProbeElementCache batch;
-                        ProbeElementCache.TryCapture(element, process.ProcessId, pointer.HasValue, out batch, out batchRejection);
+                        if (cachedByParent)
+                            // No second GetUpdatedCache: the parent's query cached these values milliseconds ago in
+                            // this snapshot. A missing cached value throws here and is handled as a batch failure.
+                            ProbeElementCache.TryFromCached(element, process.ProcessId, pointer.HasValue, out batch, out batchRejection);
+                        else
+                            ProbeElementCache.TryCapture(element, process.ProcessId, pointer.HasValue, out batch, out batchRejection);
                         return batch;
                     }, out cached))
                     return; // No per-property fallback after an unknown batch result.
@@ -343,23 +351,35 @@ namespace RemoteMonitorMaster
                     }
                 }
 
-                // ponytail: bounded raw traversal, not FindAll; the budget cannot interrupt an individual blocked UIA call.
-                // Navigation is not a content read: first_child/next_sibling return elements, never content, and each
-                // child re-runs the batch guard in its own Visit before anything about it is used.
-                AutomationElement child;
-                if (!Read(node, "first_child", () => walker.GetFirstChild(element), out child)) return;
-                if (child != null && depth == depthLimit)
+                // ponytail: one bounded children query per parent, TreeScope.Children only - never Subtree or
+                // Descendants - so a single call is bounded by this parent's own child count, and the same
+                // MaxNodes, depth and cooperative-time checks still run per visited node. As before, the budget
+                // cannot interrupt an individual blocked UIA call.
+                // Navigation is not a content read: the query returns elements, never content, and every child
+                // re-runs the batch guard in its own Visit - on the values this query cached - before anything
+                // about it is used.
+                AutomationElementCollection children;
+                if (!Read(node, "children", () =>
+                    {
+                        // Freshness: the request is built here, inside this node's own visit, so every value the
+                        // children carry comes from this snapshot's query milliseconds earlier. No element cache is
+                        // ever reused across snapshots or across reply parts. Keep it that way.
+                        // TrueCondition keeps the raw view (CacheRequest.TreeFilter defaults to the control view and
+                        // FindAll uses the active request's filter), so this enumerates what RawViewWalker did.
+                        childrenQueries++;
+                        using (ProbeElementCache.CreateRequest(pointer.HasValue).Activate())
+                            return element.FindAll(TreeScope.Children, Condition.TrueCondition);
+                    }, out children)) return;
+                var childCount = children == null ? 0 : children.Count;
+                if (childCount > 0 && depth == depthLimit)
                 {
                     stopReason = "DEPTH_LIMIT";
                     return;
                 }
-                while (child != null && Continue())
+                for (var index = 0; index < childCount; index++)
                 {
-                    Visit(child, node, depth + 1, document);
                     if (!Continue()) return;
-                    AutomationElement next;
-                    if (!Read(node, "next_sibling", () => walker.GetNextSibling(child), out next)) return;
-                    child = next;
+                    Visit(children[index], node, depth + 1, document, true);
                 }
             }
 
@@ -419,7 +439,9 @@ namespace RemoteMonitorMaster
                 AuditLog.Field("edit_candidates", edits), AuditLog.Field("invoke_candidates", invokes),
                 AuditLog.Field("guard_ms", Milliseconds(guardTicks)), AuditLog.Field("cache_ms", Milliseconds(cacheTicks)),
                 AuditLog.Field("name_ms", Milliseconds(nameTicks)), AuditLog.Field("content_ms", Milliseconds(contentTicks)),
-                AuditLog.Field("nav_ms", Milliseconds(navTicks)));
+                AuditLog.Field("nav_ms", Milliseconds(navTicks)),
+                AuditLog.Field("children_ms", Milliseconds(childrenTicks)),
+                AuditLog.Field("children_queries", childrenQueries));
 
             var summary = stage + " probe: nodes=" + nodes + "; complete=" + complete + Environment.NewLine +
                 "PID=" + process.ProcessId + "; HWND=0x" + window.ToInt64().ToString("X", CultureInfo.InvariantCulture) + Environment.NewLine +
