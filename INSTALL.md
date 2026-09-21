@@ -1,6 +1,6 @@
 # 설치·업그레이드·운영 안내 — v0.3.5
 
-v0.3.5는 Ready 발송 전 PC 입력 대기가 끝나지 않던 Win7 현장 결함의 수정판입니다(마우스 버튼·수정 키만 검사, 대기 원인 표시, 60초 한도). v0.3.4는 2026-09-21 독립 검토 반영판이며 정식 Release로 배포되었습니다. 0.3.4 Master는 기존 Slave v0.3.0~0.3.3과 호환되며(프로토콜 0.3.0), 연결파일·설정·송부 이력을 유지합니다. 0.3.4의 사용자 관점 변화: 운용 창의 중단 사유 설명과 다음 행동 표시, 5초 선택 카운트다운과 선택한 창 표시, 한국어 `Master Ready`/`Processing …` 안내(선두 토큰 유지), 세 줄 `help`, Slave IP 목록 새로고침과 연결파일 저장 경고, 자동 복사 좌표의 디스플레이 배율 보정. Slave 디스플레이 배율은 100%를 권장합니다.
+v0.3.5는 Ready 발송 전 PC 입력 대기가 끝나지 않던 Win7 현장 결함의 수정판입니다(마우스 버튼·수정 키만 검사, 대기 원인 표시, 60초 한도). v0.3.4는 2026-09-21 독립 검토 반영판이며 정식 Release로 배포되었습니다. 0.3.5 Master는 기존 Slave v0.3.0~0.3.4와 호환되며(프로토콜 0.3.0), 연결파일·설정·송부 이력을 유지합니다. 0.3.4의 사용자 관점 변화: 운용 창의 중단 사유 설명과 다음 행동 표시, 5초 선택 카운트다운과 선택한 창 표시, 한국어 `Master Ready`/`Processing …` 안내(선두 토큰 유지), 세 줄 `help`, Slave IP 목록 새로고침과 연결파일 저장 경고, 자동 복사 좌표의 디스플레이 배율 보정. Slave 디스플레이 배율은 100%를 권장합니다.
 
 v0.3.3은 분할 회신 중 접수한 명령을 다시 확인할 때 이전 Ready 문구를 과거 기록으로만 처리하는 Master 수정입니다. 새 명령의 처음 접수는 보이는 enabled 전체 메시지로 계속 엄격히 확인하며, 접수 명령·현재 enabled 상태·같은 대화와 요소·이력 행의 식별 또는 순서가 달라지면 회신을 중단합니다. 두 번의 최신 화면 확인, 첫 확인 시각, 한 번만 보내기, 불확실한 전송 중단, 모든 부분 완료 뒤 이력 갱신도 유지합니다. 이력 정리·rebase는 지원하지 않으며 v0.3.2의 화면 조회 속도 개선은 유지합니다. Master만 v0.3.3으로 교체하면 기존 Slave v0.3.0/0.3.1/0.3.2와 호환됩니다. 프로토콜은 0.3.0을 유지하며, 이전 0.2.x에서 업그레이드할 때에는 두 역할을 모두 교체해야 합니다. 기존 연결파일·사용자 설정·송부 이력은 유지됩니다.
 
@@ -14,10 +14,10 @@ v0.3.3은 분할 회신 중 접수한 명령을 다시 확인할 때 이전 Read
 
 | 파일 | 용도 |
 |---|---|
-| `Messenger-Remote-Control-Master-Setup-0.3.4.exe` | Windows 7 SP1 이상 Desktop Master 설치 (기본 권장) |
-| `Messenger-Remote-Control-Slave-Setup-0.3.4.exe` | Windows 11 Workstation Slave 설치 (기본 권장) |
-| `Messenger-Remote-Control-v0.3.4-win7-win11-net48.zip` | 선택 가능한 ZIP 실행 방식, 두 역할 포함 |
-| `Messenger-Remote-Control-Slave-v0.3.4-win11-net48.zip` | 선택 가능한 오프라인 Slave용 ZIP 실행 방식 |
+| `Messenger-Remote-Control-Master-Setup-0.3.5.exe` | Windows 7 SP1 이상 Desktop Master 설치 (기본 권장) |
+| `Messenger-Remote-Control-Slave-Setup-0.3.5.exe` | Windows 11 Workstation Slave 설치 (기본 권장) |
+| `Messenger-Remote-Control-v0.3.5-win7-win11-net48.zip` | 선택 가능한 ZIP 실행 방식, 두 역할 포함 |
+| `Messenger-Remote-Control-Slave-v0.3.5-win11-net48.zip` | 선택 가능한 오프라인 Slave용 ZIP 실행 방식 |
 | `SHA256SUMS.txt` | 위 네 파일의 SHA256 |
 
 [공개 Releases](https://github.com/yunhyok/Messenger-Remote-Control/releases)에서 다운로드합니다. 오프라인 Slave에는 Slave 설치 파일 하나를 옮기면 됩니다. ZIP은 압축을 풀어 해당 역할 EXE를 실행합니다.
@@ -26,7 +26,7 @@ v0.3.3은 분할 회신 중 접수한 명령을 다시 확인할 때 이전 Read
 
 1. 해당 역할의 기존 Remote Monitor 프로그램만 종료합니다. PowerSI와 HFSS를 종료할 필요는 없습니다.
 2. 설치 파일을 실행하고 설치 위치를 확인합니다. 기본 위치는 현재 사용자의 `%LOCALAPPDATA%\Programs\Messenger Remote Control\Master` 또는 `Slave`입니다. 프로그램 설치는 일반 사용자로 진행하며, Master에 필요한 .NET 런타임이 없는 경우에만 Microsoft 런타임 설치에 관리자 승인이 필요합니다.
-3. 시작 메뉴의 **Messenger Remote Control Master** 또는 **Messenger Remote Control Slave**를 실행합니다. 창 제목에서 **v0.3.4**를 확인합니다. Master 허브 화면의 "Slave 통신 규약"은 앱 버전이 아니라 프로토콜(0.3.0)입니다.
+3. 시작 메뉴의 **Messenger Remote Control Master** 또는 **Messenger Remote Control Slave**를 실행합니다. 창 제목에서 **v0.3.5**를 확인합니다. Master 허브 화면의 "Slave 통신 규약"은 앱 버전이 아니라 프로토콜(0.3.0)입니다.
 
 Master 설치 파일에는 Microsoft 공식 .NET Framework **4.8** 오프라인 설치본이 들어 있습니다. 런타임이 이미 있으면 설치를 건너뛰며, 없으면 포함된 설치본을 실행합니다. 재부팅이 필요하면 안내한 뒤 사용자가 재부팅하고 Master 설치를 다시 실행합니다. 강제로 재부팅하지 않습니다.
 
@@ -55,6 +55,6 @@ powershell -ExecutionPolicy Bypass -File scripts/check-release-assets.ps1
 
 빌드 PC는 .NET SDK와 Windows 빌드 환경이 필요합니다. Windows 10 개발 PC에서 설치 검사를 실행할 때는 `test-installers.ps1 -Role Master`로 Master만 검사합니다. Slave의 Windows 11 설치 조건을 우회하지 않습니다. 인스톨러 빌드는 Inno Setup 7.1.0과 Microsoft 런타임 배포본을 공식 경로에서 받아 SHA256과 서명을 확인해 캐시합니다. 다운로드만 준비하려면 `build-installers.ps1 -DependenciesOnly`를 사용합니다. 이후 설치 파일 자체는 오프라인에서 동작합니다.
 
-CI의 `workflow_dispatch`에 새 소스 버전과 일치하는 미사용 `release_tag=v<version>`을 지정하면 새 태그와 정식 Release를 만들고 Latest로 표시합니다. 이미 배포된 `v0.3.3`·`v0.3.4`는 재사용하지 않습니다. 설치 검사 스크립트는 설치파일 종료 코드 3010(재부팅 필요)을 "재부팅 후 다시 실행"으로 보고합니다. 설치 EXE가 기본 배포물이고 ZIP은 선택 사항입니다. 기존 태그·자산은 덮어쓰지 않습니다. CI는 Windows Server 2025에서 두 역할을 검사하며, 실제 Windows 7 SP1·Windows 11 또는 현장 PowerSI/메신저 확인을 대신하지 않습니다. 실제 검증 결과는 [HANDOFF.md](HANDOFF.md)에 기록합니다.
+CI의 `workflow_dispatch`에 새 소스 버전과 일치하는 미사용 `release_tag=v<version>`을 지정하면 새 태그와 정식 Release를 만들고 Latest로 표시합니다. 이미 배포된 `v0.3.3`·`v0.3.4`·`v0.3.5`는 재사용하지 않습니다. 설치 검사 스크립트는 설치파일 종료 코드 3010(재부팅 필요)을 "재부팅 후 다시 실행"으로 보고합니다. 설치 EXE가 기본 배포물이고 ZIP은 선택 사항입니다. 기존 태그·자산은 덮어쓰지 않습니다. CI는 Windows Server 2025에서 두 역할을 검사하며, 실제 Windows 7 SP1·Windows 11 또는 현장 PowerSI/메신저 확인을 대신하지 않습니다. 실제 검증 결과는 [HANDOFF.md](HANDOFF.md)에 기록합니다.
 
 참조: [Inno Setup 공식 지원 환경](https://jrsoftware.org/ishelp/topic_whatisinnosetup.htm), [Microsoft .NET Framework 배포 지침](https://learn.microsoft.com/en-us/dotnet/framework/deployment/deployment-guide-for-developers).

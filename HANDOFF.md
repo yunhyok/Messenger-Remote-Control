@@ -7,12 +7,11 @@
 | 항목 | 기준 |
 |---|---|
 | 저장소 | `yunhyok/Messenger-Remote-Control`, Public, 기본 브랜치 `main` |
-| 소스 앱 버전 | **v0.3.5** (Master와 Slave 동일). Win7 현장 로그로 확인된 Ready 전 PC 입력 대기 결함(G1) 수정분이며 **배포 절차 진행 중** |
-| 최신 정식 배포 | **v0.3.4**, Master와 Slave 모두 동일 버전. 2026-09-21 독립 검토의 수정분 |
-| 정식 배포 소스·태그 | `v0.3.4` → `932be45f293910ba4244c3c00a58e44343bdd704` (PR #1 병합 커밋). 설치파일은 §9 |
-| 이전 정식 배포 | v0.3.3 → `e31a67c68ca33986016be00cf4990d8d81f9d8ec` |
-| 통신 규약 | **0.3.0** — 앱 버전과 별개, 0.3.4에서도 변경 없음 |
-| 호환성 | Master 0.3.4 + Slave 0.3.0/0.3.1/0.3.2/0.3.3/0.3.4. 0.2.x에서는 두 역할 모두 갱신 |
+| 앱·설치파일 | **v0.3.5**, Master와 Slave 모두 동일 버전. Win7 현장 로그로 확인된 Ready 전 PC 입력 대기 결함(G1) 수정분 |
+| 정식 배포 소스·태그 | `v0.3.5` → `d27c2b8f57bd9b6078e4d8a085bd2bbe295d9f9a` (PR #3 병합 커밋). 설치파일은 §9 |
+| 이전 정식 배포 | v0.3.4 → `932be45f293910ba4244c3c00a58e44343bdd704`, v0.3.3 → `e31a67c68ca33986016be00cf4990d8d81f9d8ec` |
+| 통신 규약 | **0.3.0** — 앱 버전과 별개, 0.3.5에서도 변경 없음 |
+| 호환성 | Master 0.3.5 + Slave 0.3.0~0.3.5. 0.2.x에서는 두 역할 모두 갱신 |
 | 실행 환경 | Windows 7 SP1 Master / Windows 11 Slave, .NET Framework 4.8 |
 | 이번 인계 범위 | v0.3.3 독립 소스 검토 결과의 반영과 v0.3.4 정식 배포, 그 뒤 첫 Win7 현장 로그(G1)에 대한 0.3.5 수정. 검토 기록은 [docs/REVIEW-2026-09-21-v0.3.3.md](docs/REVIEW-2026-09-21-v0.3.3.md) |
 
@@ -93,7 +92,7 @@ Windows 활성화 거부, 대상 변경, 실제 입력 중 간섭 또는 불확�
 
 **v0.3.4 정식 배포(2026-09-21):** `main` 병합 커밋 `932be45`에서 [CI run 35561827064](https://github.com/yunhyok/Messenger-Remote-Control/actions/runs/35561827064)(`workflow_dispatch release_tag=v0.3.4`)가 두 Release 빌드·두 실제 EXE `--self-test`·설치파일 생성·자산 검사·두 역할 설치/재설치/제거/설정 보존 검사를 통과한 뒤 태그와 [정식 Release](https://github.com/yunhyok/Messenger-Remote-Control/releases/tag/v0.3.4)를 발행했습니다. 공개 자산 5개를 익명으로 내려받아 SHA256이 SHA256SUMS.txt 및 GitHub digest와 일치함, ZIP 항목이 허용 목록과 같음, 두 ZIP의 Slave 바이너리가 동일함을 확인했습니다(§9). CI 통과는 실제 Win7/Win11 설치·운용 확인이 아닙니다.
 
-**0.3.5 검증 수준:** Linux 컴파일 경고 0·오류 0, Mono 자체 검사 통과 목록 동일(`OperationalTarget`·`MouseClickInput` 자체 검사에 키 집합·사유 우선순위·입력 경과 규칙 검사 추가). Windows CI와 배포 결과는 §9와 PR에 기록합니다.
+**0.3.5 검증 수준:** Linux 컴파일 경고 0·오류 0, Mono 자체 검사 통과 목록 동일(`OperationalTarget`·`MouseClickInput` 자체 검사에 키 집합·사유 우선순위·입력 경과 규칙 검사 추가). PR #3 CI(run 35565043828)와 `main` 병합 커밋 `d27c2b8`의 [배포 실행 35565471150](https://github.com/yunhyok/Messenger-Remote-Control/actions/runs/35565471150)이 두 Release 빌드·두 실제 EXE `--self-test`·설치파일 생성·자산 검사·두 역할 설치/재설치/제거/설정 보존 검사를 통과하고 [Release v0.3.5](https://github.com/yunhyok/Messenger-Remote-Control/releases/tag/v0.3.5)를 발행했습니다. 공개 자산 5개를 익명으로 내려받아 SHA256이 SHA256SUMS.txt·GitHub digest와 일치함, 두 ZIP의 Slave 바이너리가 동일함을 확인했습니다(§9). 실제 Win7에서 0.3.5의 Ready 발송은 현장 확인 전입니다.
 
 **미확인:** 실제 Win7 KI-Messenger에서 0.3.5의 Ready 발송과 접수(0.3.4는 Ready 전 대기에서 멈춘 현장 로그 1건), 0.3.4의 한국어 Ready 안내·카운트다운·`COMMAND_NOT_VISIBLE`·Ready 대기 한도의 동작, Win11 Slave의 실제 디스플레이 배율에서 자동 복사(D1)와 캡처, .NET 4.8이 없는 깨끗한 오프라인 PC의 설치 경로. 2026-09-21 검토에는 새로운 현장 성공/실패 결과가 포함되지 않았습니다.
 
@@ -131,7 +130,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-installers.ps1 
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-release-assets.ps1
 ```
 
-정식 배포는 `.github/workflows/ci.yml`의 `workflow_dispatch release_tag`로 수행합니다. **v0.3.3과 v0.3.4는 이미 존재하므로 다시 지정하지 않습니다.** 향후 코드 수정 배포는 새 앱 버전과 일치하는 미사용 `v<version>` 태그를 사용하고 기존 태그·자산을 교체하지 않습니다.
+정식 배포는 `.github/workflows/ci.yml`의 `workflow_dispatch release_tag`로 수행합니다. **v0.3.3, v0.3.4, v0.3.5는 이미 존재하므로 다시 지정하지 않습니다.** 향후 코드 수정 배포는 새 앱 버전과 일치하는 미사용 `v<version>` 태그를 사용하고 기존 태그·자산을 교체하지 않습니다.
 
 ## 8. 공개 파일과 로컬 자료
 
@@ -147,6 +146,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-release-assets
 Master Output 이력은 `%LOCALAPPDATA%\RemoteMonitorMaster\state\powersi-output-history-v1.txt`에 길이·SHA256만 저장합니다. Slave 로컬 설정/인증정보와 `.rmpair` 연결파일을 보존합니다. 사용자의 Downloads나 기존 PowerSI/HFSS 시험 자료를 저장소 정리 명목으로 삭제하거나 복사하지 않습니다.
 
 ## 9. 정식 설치파일
+
+- [Master Setup 0.3.5](https://github.com/yunhyok/Messenger-Remote-Control/releases/download/v0.3.5/Messenger-Remote-Control-Master-Setup-0.3.5.exe) — SHA256 `53BB214C705ACFBCB1D030FE4B6EE8BF019903F94BADB365541896B3AA7D506B`
+- [Slave Setup 0.3.5](https://github.com/yunhyok/Messenger-Remote-Control/releases/download/v0.3.5/Messenger-Remote-Control-Slave-Setup-0.3.5.exe) — SHA256 `6C545A57FDF8464A3142CBD43C7EBCA5A185685F044999C677E288E14CC5A834`
+- 선택: [전체 ZIP](https://github.com/yunhyok/Messenger-Remote-Control/releases/download/v0.3.5/Messenger-Remote-Control-v0.3.5-win7-win11-net48.zip) `653C66AD34DCBFFFD4785E9203EA656ED3D74B27346C8B114291E696DE63EA7A`, [Slave ZIP](https://github.com/yunhyok/Messenger-Remote-Control/releases/download/v0.3.5/Messenger-Remote-Control-Slave-v0.3.5-win11-net48.zip) `514442533382D614DBADBB6C3D964652C3A8020BC684D593C485C97EBCD41FAF`
+- [정식 Release v0.3.5](https://github.com/yunhyok/Messenger-Remote-Control/releases/tag/v0.3.5) · [SHA256SUMS.txt](https://github.com/yunhyok/Messenger-Remote-Control/releases/download/v0.3.5/SHA256SUMS.txt)
+
+2026-09-21에 위 다섯 파일을 익명으로 내려받아 해시를 재확인했습니다. 이전 배포 v0.3.4:
 
 - [Master Setup 0.3.4](https://github.com/yunhyok/Messenger-Remote-Control/releases/download/v0.3.4/Messenger-Remote-Control-Master-Setup-0.3.4.exe) — SHA256 `496A8F90A31D8B7C99266CA8E9E0BAA559265807216743B68A7618BAE55157AB`
 - [Slave Setup 0.3.4](https://github.com/yunhyok/Messenger-Remote-Control/releases/download/v0.3.4/Messenger-Remote-Control-Slave-Setup-0.3.4.exe) — SHA256 `A56AFF65EDB3FA9F6D2EAED5C9316B1291ABC51403A7250D64A6A80E1A170F56`
