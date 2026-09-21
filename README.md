@@ -1,4 +1,4 @@
-# Messenger Remote Control v0.3.4 (소스) / 정식 배포 v0.3.3
+# Messenger Remote Control v0.3.4
 
 모바일 KI-Messenger의 나와의 대화에 명령을 보내면 Desktop의 **Master**가 Workstation의 **Slave**에 상태를 요청하고, PowerSI별 결과를 같은 대화로 회신합니다.
 
@@ -14,7 +14,7 @@ flowchart LR
 
 [공개 Releases](https://github.com/yunhyok/Messenger-Remote-Control/releases)에서 역할에 맞는 설치 파일을 받으세요. 오프라인 Slave에는 Slave 설치 파일 또는 Slave ZIP만 옮기면 됩니다. 자세한 설치·업그레이드 방법은 [INSTALL.md](INSTALL.md)에 있습니다.
 
-v0.3.4는 2026-09-21 독립 소스 검토([기록](docs/REVIEW-2026-09-21-v0.3.3.md))의 반영판입니다. 통신 규약은 0.3.0 그대로이고 접수·전송·이력 규칙도 바뀌지 않았습니다. 바뀐 점: Master 운용 창이 중단 사유 코드 옆에 한국어 설명과 다음 행동을 표시하고, 5초 선택의 남은 시간과 선택한 창(프로세스명·PID)을 보여 줍니다. 메신저로 보내는 `Master Ready`/`Processing …` 안내는 선두 토큰을 유지한 채 한국어가 되었고, `help` 답장은 세 줄로 나뉩니다. Ready 뒤 첫 명령이 화면 밖이거나 비활성이면 화면에 `COMMAND_NOT_VISIBLE` 안내가 표시되며(다른 메시지가 대신 접수되지는 않음), 보낸 Ready가 60초 안에 대화 기록에 나타나지 않으면 `RECEIVE_READY_NOT_OBSERVED`로 중단합니다. 처리되지 않은 예외는 `APP_FATAL` 로그와 함께 안전 중단합니다. Slave는 IP 목록 새로고침, 연결파일 저장 경고, 디스플레이 배율이 100%가 아닐 때의 자동 복사 좌표 보정, 한 요청의 수집 오류가 수신 대기를 멈추지 않도록 하는 격리가 추가되었습니다. 0.3.4 설치파일은 아직 배포되지 않았으며 [공개 Releases](https://github.com/yunhyok/Messenger-Remote-Control/releases)의 최신 정식 배포는 v0.3.3입니다.
+v0.3.4는 2026-09-21 독립 소스 검토([기록](docs/REVIEW-2026-09-21-v0.3.3.md))의 반영판입니다. 통신 규약은 0.3.0 그대로이고 접수·전송·이력 규칙도 바뀌지 않았습니다. 바뀐 점: Master 운용 창이 중단 사유 코드 옆에 한국어 설명과 다음 행동을 표시하고, 5초 선택의 남은 시간과 선택한 창(프로세스명·PID)을 보여 줍니다. 메신저로 보내는 `Master Ready`/`Processing …` 안내는 선두 토큰을 유지한 채 한국어가 되었고, `help` 답장은 세 줄로 나뉩니다. Ready 뒤 첫 명령이 화면 밖이거나 비활성이면 화면에 `COMMAND_NOT_VISIBLE` 안내가 표시되며(다른 메시지가 대신 접수되지는 않음), 보낸 Ready가 60초 안에 대화 기록에 나타나지 않으면 `RECEIVE_READY_NOT_OBSERVED`로 중단합니다. 처리되지 않은 예외는 `APP_FATAL` 로그와 함께 안전 중단합니다. Slave는 IP 목록 새로고침, 연결파일 저장 경고, 디스플레이 배율이 100%가 아닐 때의 자동 복사 좌표 보정, 한 요청의 수집 오류가 수신 대기를 멈추지 않도록 하는 격리가 추가되었습니다. v0.3.4 설치파일은 [공개 Releases](https://github.com/yunhyok/Messenger-Remote-Control/releases/tag/v0.3.4)에서 받을 수 있습니다.
 
 v0.3.3은 분할 회신 중 이미 접수한 명령을 다시 확인할 때, 화면에 남은 이전 Ready 문구를 과거 기록으로만 봅니다. 새 명령은 처음처럼 보이는 enabled 전체 메시지여야 하며, 접수한 명령·현재 enabled 상태·같은 대화와 요소·모든 이력 행의 식별과 순서가 달라지면 회신을 멈춥니다. 두 번의 최신 화면 확인, 첫 확인 시각, 한 번만 보내기, 불확실한 전송 중단, 모든 부분 완료 뒤 이력 갱신도 그대로입니다.
 

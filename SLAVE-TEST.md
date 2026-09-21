@@ -1,6 +1,6 @@
 # Slave 현장 확인
 
-**0.3.4 추가 확인(설치파일 배포 후, Slave를 0.3.4로 올린 경우에만):** Slave 시작 전 "IP·프로그램 목록 새로고침"으로 주소 목록이 갱신되는지, 연결파일 저장 시 인증정보 경고가 나오는지, 실제 디스플레이 배율(100%가 아니면 특히)에서 `RemoteMonitorSlave.exe --self-test`의 LiveTest가 `PASS:`인지 `SKIP:`인지, `PowerSI 전체 수집` 결과 코드가 `AUTO_COPY_READ`인지 `AUTO_COPY_OCCLUDED`인지만 기록합니다. Slave를 올리지 않으면 아래 절차만 적용됩니다.
+**0.3.4 추가 확인(Slave를 v0.3.4로 올린 경우에만):** Slave 시작 전 "IP·프로그램 목록 새로고침"으로 주소 목록이 갱신되는지, 연결파일 저장 시 인증정보 경고가 나오는지, 실제 디스플레이 배율(100%가 아니면 특히)에서 `RemoteMonitorSlave.exe --self-test`의 LiveTest가 `PASS:`인지 `SKIP:`인지, `PowerSI 전체 수집` 결과 코드가 `AUTO_COPY_READ`인지 `AUTO_COPY_OCCLUDED`인지만 기록합니다. Slave를 올리지 않으면 아래 절차만 적용됩니다.
 
 ## v0.3.3 기준 절차
 
