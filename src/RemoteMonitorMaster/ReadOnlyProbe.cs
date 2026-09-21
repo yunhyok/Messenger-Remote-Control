@@ -53,6 +53,8 @@ namespace RemoteMonitorMaster
             var pointerHits = 0;
             var pointerInvokes = 0;
             var reads = new int[3];
+            // Per-category provider time only; no node, no property value and no content ever reaches these totals.
+            long guardTicks = 0, cacheTicks = 0, nameTicks = 0, contentTicks = 0, navTicks = 0;
             var exact = new int[3];
             var contains = new int[3];
             var observed = new List<ProbeNode>();
@@ -68,18 +70,38 @@ namespace RemoteMonitorMaster
                 return stopReason == null;
             }
 
+            void AddReadTicks(string property, long ticks)
+            {
+                if (ticks < 0) ticks = 0;
+                switch (property)
+                {
+                    case "metadata_cache": cacheTicks += ticks; break;
+                    case "Name": nameTicks += ticks; break;
+                    case "TextPattern":
+                    case "ValuePattern":
+                    case "value_read_only": contentTicks += ticks; break;
+                    case "first_child":
+                    case "next_sibling":
+                    case "root": navTicks += ticks; break;
+                }
+            }
+
             bool Read<T>(int node, string property, Func<T> get, out T value)
             {
                 value = default(T);
                 if (!Continue()) return false;
+                var guardBefore = guardTicks;
+                var started = Stopwatch.GetTimestamp();
                 try
                 {
                     value = get();
+                    AddReadTicks(property, Stopwatch.GetTimestamp() - started - (guardTicks - guardBefore));
                     Continue();
                     return true;
                 }
                 catch (Exception ex)
                 {
+                    AddReadTicks(property, Stopwatch.GetTimestamp() - started - (guardTicks - guardBefore));
                     failures++;
                     log.WriteException("PROBE_READ_FAILED", ex, AuditLog.Field("stage", stage),
                         AuditLog.Field("node", node), AuditLog.Field("property", property));
@@ -128,13 +150,19 @@ namespace RemoteMonitorMaster
                 return match;
             }
 
-            // Recheck before each content read; a password/foreign element is never a content source.
+            // Live recheck immediately before each content read; a password/foreign element is never a content
+            // source. Its own provider time is billed to guard_ms, never to the read that follows it.
             void CheckContentAllowed(AutomationElement element)
             {
-                if (element.Current.ProcessId != process.ProcessId || element.Current.IsPassword)
+                var started = Stopwatch.GetTimestamp();
+                try
                 {
-                    throw new MonitorException("PROBE_CONTENT_BLOCKED", "The element is no longer a non-password KI-Messenger element.");
+                    if (element.Current.ProcessId != process.ProcessId || element.Current.IsPassword)
+                    {
+                        throw new MonitorException("PROBE_CONTENT_BLOCKED", "The element is no longer a non-password KI-Messenger element.");
+                    }
                 }
+                finally { guardTicks += Stopwatch.GetTimestamp() - started; }
             }
 
             void RecordMatch(int node, int sourceIndex, string source, string text)
@@ -173,22 +201,27 @@ namespace RemoteMonitorMaster
                 }
 
                 var node = ++nodes;
-                int pid;
-                bool password;
-                if (!Read(node, "process_id", () => element.Current.ProcessId, out pid) ||
-                    pid != process.ProcessId ||
-                    !Read(node, "is_password", () => element.Current.IsPassword, out password) || password)
+                // Guard order: this batch is the pre-content guard. It fetches ProcessId/IsPassword fresh from the
+                // provider and TryCapture rejects a foreign or password element before any batched value is used or
+                // logged and before the subtree is traversed; the one content read below (Name) still runs its own
+                // live CheckContentAllowed immediately before it.
+                ProbeElementCache cached;
+                string batchRejection = null;
+                if (!Read(node, "metadata_cache", () =>
+                    {
+                        ProbeElementCache batch;
+                        ProbeElementCache.TryCapture(element, process.ProcessId, pointer.HasValue, out batch, out batchRejection);
+                        return batch;
+                    }, out cached))
+                    return; // No per-property fallback after an unknown batch result.
+                if (batchRejection != null)
                 {
                     skipped++;
                     log.Write("INFO", "PROBE_NODE_SKIPPED", AuditLog.Field("stage", stage),
                         AuditLog.Field("node", node), AuditLog.Field("parent_node", parent), AuditLog.Field("depth", depth),
-                        AuditLog.Field("reason", pid != process.ProcessId ? "FOREIGN_OR_UNREADABLE_PID" : "PASSWORD_OR_UNREADABLE_GUARD"));
+                        AuditLog.Field("reason", batchRejection));
                     return; // Do not traverse an untrusted/password subtree either.
                 }
-
-                ProbeElementCache cached;
-                if (!Read(node, "metadata_cache", () => ProbeElementCache.Capture(element, process.ProcessId, pointer.HasValue), out cached))
-                    return; // No per-property fallback after an unknown batch result.
 
                 var fields = compactLog ? null : new List<AuditLog.LogField>();
                 void Detail(string key, object value)
@@ -196,7 +229,7 @@ namespace RemoteMonitorMaster
                     if (fields != null) fields.Add(AuditLog.Field(key, value));
                 }
                 Detail("stage", stage); Detail("node", node); Detail("parent_node", parent);
-                Detail("depth", depth); Detail("process_id", pid);
+                Detail("depth", depth); Detail("process_id", cached.ProcessId);
                 var type = cached.ControlType;
                 var typeRead = true;
                 if (type == ControlType.Document) document = node;
@@ -210,11 +243,14 @@ namespace RemoteMonitorMaster
                 Detail("offscreen", offscreen);
                 Detail("focused", cached.HasKeyboardFocus);
 
+                // One live guarded Name read per node, preceded by CheckContentAllowed, feeds the identity, the
+                // marker match, the shape hint, PROBE_NODE and ReadOnlyCommands. A failed read leaves no identity,
+                // records no match and observes a null name, exactly as two failed reads did.
                 ElementIdentity identity = null;
-                string identityName;
-                if (Read(node, "identity_name", () => { CheckContentAllowed(element); return element.Current.Name; }, out identityName))
+                string name;
+                if (Read(node, "Name", () => { CheckContentAllowed(element); return element.Current.Name; }, out name))
                 {
-                    identity = cached.CreateIdentity(identityName);
+                    identity = cached.CreateIdentity(name);
                     if (identity.ProcessId != process.ProcessId)
                     {
                         skipped++;
@@ -225,11 +261,6 @@ namespace RemoteMonitorMaster
                     }
                     if (!compactLog) identity.Log(log, "probe_node_" + node.ToString(CultureInfo.InvariantCulture));
                     Detail("runtime_id", identity.RuntimeId);
-                }
-
-                string name;
-                if (Read(node, "Name", () => { CheckContentAllowed(element); return element.Current.Name; }, out name))
-                {
                     RecordMatch(node, 0, "Name", name);
                     if (fields != null)
                     {
@@ -289,8 +320,8 @@ namespace RemoteMonitorMaster
                 observed.Add(new ProbeNode { Node = node, Parent = parent, Document = document, NativeHwnd = nativeHandle,
                     Identity = identity, Enabled = enabled, Visible = !offscreen, ValueWritable = valueWritable,
                     Invoke = invokeRead && invoke, PointerInside = pointerInside, DraftExact = draftExact,
-                    NameShape = identity != null && TokenStore.Hash(name ?? string.Empty) == identity.NameHash
-                        ? NameShape(name, null) : "UNAVAILABLE" });
+                    // The identity hash is built from this very name, so the shape always describes the hashed name.
+                    NameShape = identity != null ? NameShape(name, null) : "UNAVAILABLE" });
                 ReadOnlyCommands.ObserveName(observed[observed.Count - 1], name);
                 if (requestedRuntimeId != null && identity != null && identity.RuntimeId == requestedRuntimeId) matchedElement = element;
                 if (requestedSendRuntimeId != null && identity != null && identity.RuntimeId == requestedSendRuntimeId) matchedSend = element;
@@ -313,8 +344,10 @@ namespace RemoteMonitorMaster
                 }
 
                 // ponytail: bounded raw traversal, not FindAll; the budget cannot interrupt an individual blocked UIA call.
+                // Navigation is not a content read: first_child/next_sibling return elements, never content, and each
+                // child re-runs the batch guard in its own Visit before anything about it is used.
                 AutomationElement child;
-                if (!Read(node, "first_child", () => { CheckContentAllowed(element); return walker.GetFirstChild(element); }, out child)) return;
+                if (!Read(node, "first_child", () => walker.GetFirstChild(element), out child)) return;
                 if (child != null && depth == depthLimit)
                 {
                     stopReason = "DEPTH_LIMIT";
@@ -370,6 +403,7 @@ namespace RemoteMonitorMaster
             if (stopReason == null && !rootNameStable) stopReason = "ROOT_NAME_UNVERIFIED_OR_CHANGED";
             var complete = rootVerified && nativeVerified && finalProcessVerified && finalRootVerified &&
                 failures == 0 && skipped == 0 && truncatedTextReads == 0 && stopReason == null;
+            long Milliseconds(long ticks) { return ticks * 1000L / Stopwatch.Frequency; }
             log.Write("INFO", "READ_ONLY_PROBE_RESULT", AuditLog.Field("stage", stage), AuditLog.Field("complete", complete),
                 AuditLog.Field("nodes", nodes), AuditLog.Field("read_failures", failures), AuditLog.Field("skipped_subtrees", skipped),
                 AuditLog.Field("truncated_text_reads", truncatedTextReads),
@@ -382,7 +416,10 @@ namespace RemoteMonitorMaster
                 AuditLog.Field("name_reads", reads[0]), AuditLog.Field("text_reads", reads[1]), AuditLog.Field("value_reads", reads[2]),
                 AuditLog.Field("name_exact", exact[0]), AuditLog.Field("text_exact", exact[1]), AuditLog.Field("value_exact", exact[2]),
                 AuditLog.Field("name_contains", contains[0]), AuditLog.Field("text_contains", contains[1]), AuditLog.Field("value_contains", contains[2]),
-                AuditLog.Field("edit_candidates", edits), AuditLog.Field("invoke_candidates", invokes));
+                AuditLog.Field("edit_candidates", edits), AuditLog.Field("invoke_candidates", invokes),
+                AuditLog.Field("guard_ms", Milliseconds(guardTicks)), AuditLog.Field("cache_ms", Milliseconds(cacheTicks)),
+                AuditLog.Field("name_ms", Milliseconds(nameTicks)), AuditLog.Field("content_ms", Milliseconds(contentTicks)),
+                AuditLog.Field("nav_ms", Milliseconds(navTicks)));
 
             var summary = stage + " probe: nodes=" + nodes + "; complete=" + complete + Environment.NewLine +
                 "PID=" + process.ProcessId + "; HWND=0x" + window.ToInt64().ToString("X", CultureInfo.InvariantCulture) + Environment.NewLine +

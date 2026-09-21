@@ -131,6 +131,7 @@ namespace RemoteMonitorMaster
             internal string HeldKeys = string.Empty;
             internal uint InputAgeMilliseconds, ForegroundProcessId, GuiFlags;
             internal bool ForegroundIsTarget, GuiQuiet, GuiAvailable, GuiActiveMatches, GuiCapture, GuiMenu, GuiMoveSize;
+            internal bool OwnInput; // The last input tick is exactly the tick our own guarded click produced.
         }
 
         private void WaitForPcIdle()
@@ -145,8 +146,9 @@ namespace RemoteMonitorMaster
             {
                 Check();
                 uint lastInput;
-                Need(TryGetLastInputTick(out lastInput), "TARGET_LAST_INPUT_UNAVAILABLE");
-                var state = Diagnose(unchecked((uint)Environment.TickCount), lastInput);
+                Need(MouseClickInput.TryGetLastInputTick(out lastInput), "TARGET_LAST_INPUT_UNAVAILABLE");
+                // Our own injected click is read once per sample; a newer real input always carries a different tick.
+                var state = Diagnose(unchecked((uint)Environment.TickCount), lastInput, MouseClickInput.LastOwnInputTick);
                 if (state.Reason == "IDLE")
                 {
                     if (recorded)
@@ -176,9 +178,10 @@ namespace RemoteMonitorMaster
             }
         }
 
-        private IdleDiagnosis Diagnose(uint now, uint lastInput)
+        private IdleDiagnosis Diagnose(uint now, uint lastInput, uint? ownInputTick)
         {
             var state = new IdleDiagnosis { InputAgeMilliseconds = unchecked(now - lastInput) };
+            state.OwnInput = ownInputTick.HasValue && ownInputTick.Value == lastInput;
             state.HeldKeys = DescribeHeldKeys(GetAsyncKeyState);
             bool activeMatches, capture, menu, moveSize, available;
             uint flags;
@@ -194,7 +197,7 @@ namespace RemoteMonitorMaster
             state.ForegroundIsTarget = foreground == window;
             uint pid;
             state.ForegroundProcessId = NativeMethods.GetWindowThreadProcessId(foreground, out pid) == 0 ? 0 : pid;
-            state.Reason = IdleWaitReason(IsInputRecent(now, lastInput), state.HeldKeys.Length != 0, state.GuiQuiet,
+            state.Reason = IdleWaitReason(IsInputRecent(now, lastInput, ownInputTick), state.HeldKeys.Length != 0, state.GuiQuiet,
                 foreground != IntPtr.Zero);
             return state;
         }
@@ -208,7 +211,8 @@ namespace RemoteMonitorMaster
                 AuditLog.Field("gui_available", state.GuiAvailable), AuditLog.Field("gui_active_matches", state.GuiActiveMatches),
                 AuditLog.Field("gui_capture", state.GuiCapture), AuditLog.Field("gui_menu", state.GuiMenu),
                 AuditLog.Field("gui_movesize", state.GuiMoveSize), AuditLog.Field("gui_flags", Hex(state.GuiFlags)),
-                AuditLog.Field("waited_ms", waitedMilliseconds), AuditLog.Field("final", final));
+                AuditLog.Field("waited_ms", waitedMilliseconds), AuditLog.Field("final", final),
+                AuditLog.Field("own_input", state.OwnInput));
         }
 
         private static string Hex(uint value)
@@ -307,8 +311,9 @@ namespace RemoteMonitorMaster
         {
             VerifyRootIdentity();
             uint lastInput;
-            Need(TryGetLastInputTick(out lastInput) && MouseClickInput.IsForegroundInputQuiet() &&
-                IsInputIdle(unchecked((uint)Environment.TickCount), lastInput, GetAsyncKeyState), "TARGET_INPUT_CHANGED");
+            Need(MouseClickInput.TryGetLastInputTick(out lastInput) && MouseClickInput.IsForegroundInputQuiet() &&
+                IsInputIdle(unchecked((uint)Environment.TickCount), lastInput, MouseClickInput.LastOwnInputTick, GetAsyncKeyState),
+                "TARGET_INPUT_CHANGED");
             Check();
             return true;
         }
@@ -376,6 +381,15 @@ namespace RemoteMonitorMaster
             return elapsed < 1000 || elapsed > int.MaxValue;
         }
 
+        // Live rule: the tick our own guarded click produced is not user input, so the gate never waits for it. The
+        // match is exact with no tolerance window; any other tick, including an asynchronously updated one, falls
+        // back to the unchanged 1-second rule. The stored tick is never cleared, because real input moves the tick.
+        internal static bool IsInputRecent(uint now, uint lastInput, uint? ownInputTick)
+        {
+            if (ownInputTick.HasValue && ownInputTick.Value == lastInput) return false;
+            return IsInputRecent(now, lastInput);
+        }
+
         // The high bit is physical key-down. Deliberately ignore the low toggle bit.
         // Only MouseClickInput.HeldKeys is swept: a held modifier or mouse button changes the meaning of the guarded
         // click/SetValue, while active typing is already covered by the 1-second input-age rule. A sweep over every
@@ -383,7 +397,13 @@ namespace RemoteMonitorMaster
         // Master forever. The click-time guard uses the same list, so the two checks cannot disagree.
         internal static bool IsInputIdle(uint now, uint lastInput, Func<int, short> getAsyncKeyState)
         {
-            if (getAsyncKeyState == null || IsInputRecent(now, lastInput)) return false;
+            return IsInputIdle(now, lastInput, null, getAsyncKeyState);
+        }
+
+        // Same sweep, with our own injected click recognized by its exact tick. Every other rule is unchanged.
+        internal static bool IsInputIdle(uint now, uint lastInput, uint? ownInputTick, Func<int, short> getAsyncKeyState)
+        {
+            if (getAsyncKeyState == null || IsInputRecent(now, lastInput, ownInputTick)) return false;
             foreach (var key in MouseClickInput.HeldKeys)
                 if ((((ushort)getAsyncKeyState(key)) & 0x8000) != 0) return false;
             return true;
@@ -403,6 +423,22 @@ namespace RemoteMonitorMaster
             Need(!IsInputIdle(1000, 2000, key => 0), "TARGET_FUTURE_INPUT_TICK_ACCEPTED");
             Need(!IsInputRecent(2000, 1000) && IsInputRecent(1000, 1) && IsInputRecent(1000, 2000) &&
                 !IsInputRecent(100, unchecked((uint)-1000)), "TARGET_INPUT_AGE_RULE_CHANGED");
+            // Our own injected click is recognized by its exact tick only; everything else keeps the 1-second rule.
+            Need(!IsInputRecent(1000, 1, 1u) && IsInputRecent(1000, 1, 2u) && IsInputRecent(1000, 1, null) &&
+                !IsInputRecent(2000, 1000, 999u) && !IsInputRecent(2000, 1000, null),
+                "TARGET_OWN_INPUT_RULE_CHANGED");
+            // The same wrap-around cases as TARGET_INPUT_AGE_RULE_CHANGED, with and without a matching own tick.
+            Need(!IsInputRecent(1000, 2000, 2000u) && IsInputRecent(1000, 2000, 1999u) &&
+                !IsInputRecent(100, unchecked((uint)-1000), unchecked((uint)-1000)) &&
+                !IsInputRecent(100, unchecked((uint)-1000), 7u) &&
+                IsInputRecent(100, unchecked((uint)-100), 7u) && !IsInputRecent(100, unchecked((uint)-100), unchecked((uint)-100)),
+                "TARGET_OWN_INPUT_WRAP_RULE_CHANGED");
+            // The own-input tick satisfies only the input-age rule; the guarded key sweep still holds the gate.
+            Need(IsInputIdle(1000, 1, 1u, key => 0) && !IsInputIdle(1000, 1, null, key => 0) &&
+                !IsInputIdle(1000, 1, 2u, key => 0) && !IsInputIdle(1000, 1, 1u, null) &&
+                !IsInputIdle(1000, 1, 1u, key => key == 0x11 ? unchecked((short)0x8000) : (short)1) &&
+                IsInputIdle(1000, 1, 1u, key => key == 0x15 ? unchecked((short)0x8000) : (short)1),
+                "TARGET_OWN_INPUT_IDLE_RULE_CHANGED");
             Need(IdleWaitReason(true, true, false, false) == "INPUT_RECENT" &&
                 IdleWaitReason(false, true, true, true) == "KEY_HELD" &&
                 IdleWaitReason(false, false, false, true) == "FOREGROUND_BUSY" &&
@@ -441,23 +477,11 @@ namespace RemoteMonitorMaster
             if (!condition) throw new MonitorException(code, "Operational target validation failed: " + code);
         }
 
-        [StructLayout(LayoutKind.Sequential)]
-        private struct LastInputInfo { public uint Size, Time; }
-
-        private static bool TryGetLastInputTick(out uint tick)
-        {
-            var info = new LastInputInfo { Size = (uint)Marshal.SizeOf(typeof(LastInputInfo)) };
-            tick = 0;
-            if (!GetLastInputInfo(ref info)) return false;
-            tick = info.Time;
-            return true;
-        }
-
+        // The last-input tick reader lives in MouseClickInput, next to the click that records its own tick.
         [DllImport("user32.dll", SetLastError = true)] private static extern bool IsIconic(IntPtr window);
         [DllImport("user32.dll", SetLastError = true)] private static extern bool ShowWindowAsync(IntPtr window, int command);
         [DllImport("user32.dll", SetLastError = true)] private static extern bool SetForegroundWindow(IntPtr window);
         [DllImport("user32.dll")] private static extern short GetAsyncKeyState(int key);
-        [DllImport("user32.dll", SetLastError = true)] private static extern bool GetLastInputInfo(ref LastInputInfo info);
         [DllImport("user32.dll", SetLastError = true)] private static extern IntPtr OpenInputDesktop(uint flags, bool inherit, uint access);
         [DllImport("user32.dll", SetLastError = true)] private static extern bool CloseDesktop(IntPtr desktop);
         [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]

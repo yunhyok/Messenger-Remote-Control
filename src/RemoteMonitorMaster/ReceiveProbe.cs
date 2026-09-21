@@ -458,6 +458,65 @@ namespace RemoteMonitorMaster
             return string.Join("/", parts);
         }
 
+        // ---- Cheap idle change trigger -------------------------------------------------------------------------
+        // These pick only WHEN the next full snapshot starts. They read no content, prove nothing and never take part
+        // in admission: a command still needs the same exact whole message in two distinct full snapshots.
+        internal const int TailDepthLimit = 32;
+        private const int TailPathStepLimit = 128; // Raw-walker hops per sample; a wider recorded shape keeps today's cadence.
+        private static readonly TimeSpan TailWaitCap = TimeSpan.FromSeconds(3); // Idle full-snapshot cadence bound; a change the tail chain cannot see waits at most this long.
+
+        // Sibling indices from the snapshot root (node 1) down to the history container, in raw-walker order.
+        // Null when the recorded shape cannot be re-walked cheaply; the caller then captures unconditionally.
+        internal static int[] TailPath(ProbeSnapshot snapshot, ProbeNode history)
+        {
+            if (snapshot == null || snapshot.Nodes == null || history == null) return null;
+            var byNode = new Dictionary<int, ProbeNode>();
+            foreach (var node in snapshot.Nodes)
+            {
+                if (byNode.ContainsKey(node.Node)) return null;
+                byNode.Add(node.Node, node);
+            }
+            ProbeNode recorded;
+            if (!byNode.TryGetValue(history.Node, out recorded) || !ReferenceEquals(recorded, history)) return null;
+            var indices = new List<int>();
+            var steps = 0;
+            var cursor = history;
+            while (cursor.Parent != 0)
+            {
+                ProbeNode parent;
+                if (!byNode.TryGetValue(cursor.Parent, out parent)) return null;
+                var index = 0;
+                foreach (var sibling in snapshot.Nodes)
+                    if (sibling.Parent == cursor.Parent && sibling.Node < cursor.Node) index++;
+                indices.Add(index);
+                steps += index + 1;
+                if (indices.Count > TailDepthLimit || steps > TailPathStepLimit) return null; // Also breaks a cyclic parent chain.
+                cursor = parent;
+            }
+            if (cursor.Node != 1 || indices.Count == 0) return null;
+            indices.Reverse();
+            return indices.ToArray();
+        }
+
+        // Unknown (null) is never "same": an unreadable tail always starts the next full snapshot.
+        internal static bool SameTailChain(string[] previous, string[] current)
+        {
+            if (previous == null || current == null || previous.Length != current.Length) return false;
+            for (var i = 0; i < previous.Length; i++)
+                if (!string.Equals(previous[i], current[i], StringComparison.Ordinal)) return false;
+            return true;
+        }
+
+        // Pure decision for the change trigger. Null means "keep sampling"; every other value starts a full snapshot.
+        internal static string TriggerReason(bool idle, bool minimized, bool failed, bool changed, TimeSpan waited, TimeSpan cap)
+        {
+            if (!idle) return "NOT_IDLE";
+            if (minimized) return "MINIMIZED";
+            if (failed) return "PROBE_FAILED";
+            if (changed) return "TAIL_CHANGED";
+            return waited >= cap ? "PERIODIC" : null;
+        }
+
         public static string Run(IntPtr window, AuditLog log, string marker, Func<bool> stop, Action<string> progress)
         {
             return Observe(window, log, marker, stop, progress, new object(), true).Message;
@@ -542,6 +601,59 @@ namespace RemoteMonitorMaster
                     Need(rootRuntime != null && rootRuntime.Length > 0 && rootRuntime.Length <= 64 &&
                         UiaPointProbe.Format(rootRuntime) == snapshot.Nodes.Single(n => n.Node == 1).Identity.RuntimeId, "RECEIVE_ROOT_CHANGED");
                     Need(log.Fingerprint(Read(() => root.Current.Name)) == snapshot.RootNameFingerprint, "RECEIVE_ROOT_CHANGED");
+                }
+                // Cheap structural tail probe for the idle wait: raw-walker navigation plus runtime ids only.
+                // No Name/Value/TextPattern read, no window discovery, no focus or activation, no element kept
+                // between samples, and nothing it returns is ever admitted as evidence. Null means changed/unknown.
+                string[] SampleTailChain(int[] path, string historyRuntimeId, string rootRuntimeId)
+                {
+                    var walker = TreeWalker.RawViewWalker;
+                    AutomationElement Guarded(AutomationElement element)
+                    {
+                        if (element == null) return null;
+                        var elementPid = element.GetCurrentPropertyValue(AutomationElement.ProcessIdProperty, true);
+                        var password = element.GetCurrentPropertyValue(AutomationElement.IsPasswordProperty, true);
+                        return elementPid is int && (int)elementPid == process.ProcessId && password is bool && !(bool)password
+                            ? element : null;
+                    }
+                    string Runtime(AutomationElement element)
+                    {
+                        var id = element.GetRuntimeId();
+                        return id != null && id.Length > 0 && id.Length <= 64 ? UiaPointProbe.Format(id) : null;
+                    }
+                    try
+                    {
+                        Alive();
+                        var cursor = Guarded(AutomationElement.FromHandle(window));
+                        if (cursor == null || Runtime(cursor) != rootRuntimeId) return null;
+                        foreach (var index in path)
+                        {
+                            Alive();
+                            var child = Guarded(walker.GetFirstChild(cursor));
+                            for (var i = 0; child != null && i < index; i++) child = Guarded(walker.GetNextSibling(child));
+                            if (child == null) return null;
+                            cursor = child;
+                        }
+                        Alive();
+                        var history = Runtime(cursor);
+                        if (history == null || history != historyRuntimeId) return null;
+                        var chain = new List<string> { history };
+                        for (var depth = 0; depth < TailDepthLimit; depth++)
+                        {
+                            Alive();
+                            var last = walker.GetLastChild(cursor);
+                            if (last == null) break;
+                            cursor = Guarded(last);
+                            if (cursor == null) return null;
+                            var runtime = Runtime(cursor);
+                            if (runtime == null) return null;
+                            chain.Add(runtime);
+                        }
+                        Alive();
+                        return chain.ToArray();
+                    }
+                    catch (MonitorException) { throw; } // Cancellation, target and budget guards keep their own reason.
+                    catch (Exception) { return null; }  // An unavailable or foreign tail is treated as changed/unknown.
                 }
                 void CheckMetadataPath(AutomationElement element, ProbeNode expected, HistorySelection selection)
                 {
@@ -682,10 +794,51 @@ namespace RemoteMonitorMaster
                 receiving = Stopwatch.StartNew();
                 ProbeSnapshot previous = suppliedBaseline == null && !plainCommands ? null : firstSnapshot;
                 ProbeNode previousCandidate = firstCandidate;
+                // Structure-only state for the idle change trigger; never an element and never evidence.
+                int[] tailPath = null;
+                string tailHistoryRuntime = null, tailRootRuntime = null;
+                string[] previousChain = null;
                 while (true)
                 {
                     phaseClock.Restart(); // The inter-snapshot wait is not charged to the preceding snapshot's 15-second cap.
-                    for (var i = 0; i < (baseline.ReadyRow >= 0 ? 2 : 10); i++) { Alive(); Thread.Sleep(100); }
+                    var wait = Stopwatch.StartNew();
+                    // Idle waiting state only. Waiting for the repeat observation, a pinned not-yet-visible command row,
+                    // the first poll after Ready and every non-background flow keep the unconditional capture cadence.
+                    var idleWait = polls > 0 && previousCandidate == null && !commandBlocked && baseline.ReadyRow >= 0 &&
+                        continuousWait && plainCommands && !collectMetadata && acceptedProof == null;
+                    var samples = 0;
+                    var chainDepth = 0;
+                    var trigger = TriggerReason(idleWait, idleWait && OperationalTarget.IsMinimized(window),
+                        idleWait && tailPath == null, false, TimeSpan.Zero, TailWaitCap);
+                    if (trigger == null)
+                    {
+                        var reference = previousChain; // The tail as it stood when the last full snapshot was decided.
+                        while (trigger == null)
+                        {
+                            var sample = SampleTailChain(tailPath, tailHistoryRuntime, tailRootRuntime);
+                            samples++;
+                            previousChain = sample;
+                            if (sample == null)
+                            {
+                                trigger = TriggerReason(true, false, true, false, wait.Elapsed, TailWaitCap);
+                                break;
+                            }
+                            chainDepth = sample.Length;
+                            trigger = TriggerReason(true, false, false, reference != null && !SameTailChain(reference, sample),
+                                wait.Elapsed, TailWaitCap);
+                            if (reference == null) reference = sample;
+                            if (trigger != null) break;
+                            for (var i = 0; i < 5; i++) { Alive(); Thread.Sleep(50); }
+                        }
+                    }
+                    else previousChain = null; // Nothing was sampled, so the next wait starts from an unknown tail.
+                    // The probe never shortens the existing pause, so no full snapshot starts earlier than it does today.
+                    var minimumWait = baseline.ReadyRow >= 0 ? 200 : 1000;
+                    while (wait.ElapsedMilliseconds < minimumWait) { Alive(); Thread.Sleep(50); }
+                    // samples=0 with PROBE_FAILED means the recorded shape was unusable, not that navigation failed.
+                    log.Write("INFO", "RECEIVE_CHANGE_TRIGGER", AuditLog.Field("reason", trigger),
+                        AuditLog.Field("waited_ms", wait.ElapsedMilliseconds), AuditLog.Field("samples", samples),
+                        AuditLog.Field("chain_depth", chainDepth));
                     target?.PrepareRead();
                     SetPhase("POLLING");
                     var current = Capture();
@@ -715,6 +868,18 @@ namespace RemoteMonitorMaster
                     ReleaseLive(current);
                     previous = current;
                     previousCandidate = candidate;
+                    tailPath = null;
+                    tailHistoryRuntime = null;
+                    tailRootRuntime = null;
+                    try
+                    {
+                        // Structure only: the sibling path plus the two runtime ids the cheap probe re-verifies.
+                        var tail = SelectHistory(current);
+                        tailPath = TailPath(current, tail.History);
+                        tailHistoryRuntime = tail.History.Identity.RuntimeId;
+                        tailRootRuntime = tail.Root.Identity.RuntimeId;
+                    }
+                    catch (MonitorException) { tailPath = null; } // No cheap probe without a usable shape; the cadence stays as before.
                     if (candidate != null) progress("WAITING_FOR_REPEAT");
                     else if (commandBlocked)
                     {
@@ -843,6 +1008,86 @@ namespace RemoteMonitorMaster
             var wrongHash = new Baseline(baseline.Snapshot, baseline.Selection, marker, "invalid");
             Reject(() => AcceptSuppliedBaseline(wrongHash, first, marker, boundWindow));
             RunPlainCommandSelfTest();
+            RunChangeTriggerSelfTest();
+        }
+
+        // The change trigger decides only WHEN a full snapshot starts, so these cover the pure parts alone:
+        // path computation from the recorded Node/Parent graph, chain comparison and the decision itself.
+        private static void RunChangeTriggerSelfTest()
+        {
+            var cap = TimeSpan.FromSeconds(5);
+            var snapshot = CreateTestSnapshot();
+            var path = TailPath(snapshot, SelectHistory(snapshot).History);
+            Need(path != null && path.SequenceEqual(new[] { 0, 0, 1 }), "RECEIVE_SELF_TEST_TAIL_PATH");
+            var renumbered = CreateTestSnapshot();
+            foreach (var node in renumbered.Nodes)
+            {
+                if (node.Node > 1) node.Node += 100;
+                if (node.Parent > 1) node.Parent += 100;
+                if (node.Document > 0) node.Document += 100;
+            }
+            // Preorder ordinals are not identity: the same shape keeps the same sibling path.
+            Need(path.SequenceEqual(TailPath(renumbered, SelectHistory(renumbered).History)), "RECEIVE_SELF_TEST_TAIL_PATH_ORDINALS");
+            var inserted = CreateTestSnapshot();
+            var moved = inserted.Nodes.Single(n => n.Node == 50);
+            inserted.Nodes.Add(new ProbeNode { Node = 45, Parent = 3, Document = 2 });
+            Need(TailPath(inserted, moved).SequenceEqual(new[] { 0, 0, 2 }), "RECEIVE_SELF_TEST_TAIL_PATH_SIBLINGS");
+            var orphan = CreateTestSnapshot();
+            var orphanHistory = orphan.Nodes.Single(n => n.Node == 50);
+            orphan.Nodes.RemoveAll(n => n.Node == 3);
+            Need(TailPath(orphan, orphanHistory) == null, "RECEIVE_SELF_TEST_TAIL_PATH_BROKEN");
+            var detached = CreateTestSnapshot();
+            detached.Nodes.Single(n => n.Node == 2).Parent = 0;
+            Need(TailPath(detached, detached.Nodes.Single(n => n.Node == 50)) == null, "RECEIVE_SELF_TEST_TAIL_PATH_ROOTLESS");
+            var cycle = CreateTestSnapshot();
+            cycle.Nodes.Single(n => n.Node == 3).Parent = 50;
+            Need(TailPath(cycle, cycle.Nodes.Single(n => n.Node == 50)) == null, "RECEIVE_SELF_TEST_TAIL_PATH_CYCLE");
+            var wide = CreateTestSnapshot();
+            for (var i = 0; i < 200; i++) wide.Nodes.Add(new ProbeNode { Node = 1000 + i, Parent = 3, Document = 2 });
+            var far = new ProbeNode { Node = 2000, Parent = 3, Document = 2 };
+            wide.Nodes.Add(far);
+            Need(TailPath(wide, far) == null, "RECEIVE_SELF_TEST_TAIL_PATH_WIDTH"); // Too many hops to stay cheap.
+            var duplicated = CreateTestSnapshot();
+            duplicated.Nodes.Add(new ProbeNode { Node = 50, Parent = 3, Document = 2 });
+            Need(TailPath(duplicated, duplicated.Nodes.First(n => n.Node == 50)) == null, "RECEIVE_SELF_TEST_TAIL_PATH_DUPLICATE");
+            var chain = new[] { "7,1", "7,2", "7,3" };
+            Need(SameTailChain(chain, new[] { "7,1", "7,2", "7,3" }), "RECEIVE_SELF_TEST_TAIL_CHAIN_SAME");
+            Need(!SameTailChain(chain, new[] { "7,1", "7,2" }) && !SameTailChain(chain, new[] { "7,1", "7,2", "7,4" }) &&
+                !SameTailChain(chain, null) && !SameTailChain(null, chain) && !SameTailChain(null, null),
+                "RECEIVE_SELF_TEST_TAIL_CHAIN_DIFFERENT");
+            // Mirrors the live GetLastChild descent on the recorded graph: both appended-row and appended-Text
+            // (grouped consecutive messages inside the existing last row) change the tail chain.
+            string[] Descent(ProbeSnapshot source)
+            {
+                var walked = new List<string>();
+                var cursor = SelectHistory(source).History;
+                for (var depth = 0; depth <= TailDepthLimit; depth++)
+                {
+                    walked.Add(cursor.Identity.RuntimeId);
+                    var last = source.Nodes.Where(n => n.Parent == cursor.Node).OrderBy(n => n.Node).LastOrDefault();
+                    if (last == null) break;
+                    cursor = last;
+                }
+                return walked.ToArray();
+            }
+            var idle = Descent(CreateTestSnapshot());
+            Need(SameTailChain(idle, Descent(CreateTestSnapshot())), "RECEIVE_SELF_TEST_TAIL_IDLE");
+            var newRow = CreateTestSnapshot();
+            AppendTestHistoryText(newRow, "help");
+            Need(!SameTailChain(idle, Descent(newRow)), "RECEIVE_SELF_TEST_TAIL_NEW_ROW");
+            var grouped = CreateTestSnapshot();
+            AppendTestHistorySiblingText(grouped, grouped.Nodes.Single(n => n.Node == 54), "help");
+            Need(!SameTailChain(idle, Descent(grouped)), "RECEIVE_SELF_TEST_TAIL_GROUPED_TEXT");
+            Need(TriggerReason(false, false, false, true, TimeSpan.FromSeconds(9), cap) == "NOT_IDLE" &&
+                TriggerReason(true, true, true, true, TimeSpan.FromSeconds(9), cap) == "MINIMIZED" &&
+                TriggerReason(true, false, true, true, TimeSpan.Zero, cap) == "PROBE_FAILED" &&
+                TriggerReason(true, false, false, true, TimeSpan.Zero, cap) == "TAIL_CHANGED" &&
+                TriggerReason(true, false, false, false, cap, cap) == "PERIODIC" &&
+                TriggerReason(true, false, false, false, TimeSpan.FromSeconds(6), cap) == "PERIODIC" &&
+                TriggerReason(true, false, false, false, TimeSpan.FromSeconds(4.9), cap) == null,
+                "RECEIVE_SELF_TEST_TRIGGER_REASON");
+            // The cap stays below one field snapshot (5.6-6.8 s), so the worst-case cadence is not slower than before.
+            Need(TailWaitCap <= TimeSpan.FromSeconds(5) && TailDepthLimit == 32, "RECEIVE_SELF_TEST_TRIGGER_BOUNDS");
         }
 
         private static void RunPlainCommandSelfTest()
@@ -970,7 +1215,7 @@ namespace RemoteMonitorMaster
             }
             var tooLong = History(); AppendTestHistoryText(tooLong, new string(' ', 64) + "pwrsi");
             Need(Evaluate(baseline, tooLong) == null, "COMMAND_SELFTEST_NAME_BOUND");
-            ReadOnlyCommands.ObserveName(paddedNode, "pwrsi"); // Inconsistent second Name read cannot produce a canonical command.
+            ReadOnlyCommands.ObserveName(paddedNode, "pwrsi"); // A name that disagrees with the identity hash cannot produce a canonical command.
             string mismatched;
             Need(!ReadOnlyCommands.TryMatchNode(paddedNode, out mismatched), "COMMAND_SELFTEST_NAME_READ_CHANGED");
             ReadOnlyCommands.ObserveName(paddedNode, " help ");

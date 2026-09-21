@@ -1,5 +1,7 @@
 # Master 현장 확인: 자연 발생 분할 회신
 
+**0.3.6 확인(Master를 v0.3.6으로 설치한 뒤):** 0.3.6은 회신 속도만 바꿉니다. 평소처럼 `pwrsi`를 한 번 보내고, 로그에서 다음 네 가지만 확인해 주세요. ① `READ_ONLY_PROBE_RESULT`의 `elapsed_ms`와 새로 추가된 `guard_ms`/`cache_ms`/`name_ms`/`content_ms`/`nav_ms` 값(0.3.5에서 같은 스냅샷이 5.6~6.8초였으므로 0.3.6의 `elapsed_ms`를 함께 적어 주세요). ② `PROCESS_IDENTITY`의 `signature_cached`가 첫 회 이후 true인지. ③ 답장 부분 사이에 `WAITING_FOR_PC_IDLE:INPUT_RECENT`가 더 이상 나오지 않는지(`OPERATIONAL_TARGET_IDLE_WAIT`의 `own_input` 포함). ④ 폴링 대기마다 1행씩 남는 `RECEIVE_CHANGE_TRIGGER`의 `reason`이 실제 메시지에서 `TAIL_CHANGED`인지. `PROBE_FAILED`가 매번 `samples=1`로 나오면 요소 식별자·경로가 불안정한 것이고, `samples=0`이면 기록된 구조가 탐색 한도를 넘은 것이며 두 경우 모두 0.3.5와 같은 주기로 동작합니다(기능 이상 아님). 명령을 보낸 뒤 `Master Ready`부터 처리 시작 안내까지 걸린 시간과 마지막 `N/N`까지 걸린 시간도 적어 주세요. 요청이 없으면 원문 로그·스크린샷은 올리지 말고 위 값만 알려 주세요.
+
 **0.3.5 확인(Master를 v0.3.5로 설치한 뒤):** Start 후 창 선택 뒤 상태 표시가 "PC 입력이 끝나기를 기다리고 있습니다"에서 넘어가지 않으면 2초 뒤 표시되는 원인 문구(입력 계속 감지 / 키·버튼 눌림 / 앞 창 메뉴·끌기 / 활성 창 없음)를 그대로 기록하고, 60초 뒤 `TARGET_PC_NOT_IDLE`로 멈추면 로그의 `OPERATIONAL_TARGET_IDLE_WAIT` 행만 보내 주세요. Ready가 정상 발송되면 아래 0.3.4 항목을 이어서 확인합니다.
 
 **0.3.4 추가 확인(Master를 v0.3.4로 설치한 뒤):** Start 뒤 남은 초가 5→1로 표시되고 선택 직후 "선택한 창: KI-Messenger (PID …)"가 표시되는지, 메신저에 `Master Ready. help, total status, pwrsi 중 하나를 보내세요. [번호]`가 도착하는지, `help` 답장이 세 줄인지 확인합니다. 명령을 보낸 뒤 대화 기록을 위로 스크롤한 상태로 두면 화면에 "명령 메시지를 읽었지만 화면 밖…" 안내가 나오고, 다시 아래로 스크롤하면 접수되는지 한 번만 확인합니다(다른 명령을 추가로 보내지 마세요). 중단이 생기면 사유 코드 옆의 한국어 설명과 다음 행동 문구, 로그의 `OPERATIONAL_TARGET_DENIED`/`RECEIVE_READY_NOT_OBSERVED` 유무만 기록합니다.

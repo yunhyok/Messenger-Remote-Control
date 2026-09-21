@@ -535,6 +535,7 @@ namespace RemoteMonitorMaster
                 Require(!AutomationTarget.IsMessageEligible(2, true, false), "poll accepted a hidden second body");
                 TestElementIdentity();
                 ProbeElementCache.RunSelfTest();
+                ProcessIdentity.RunSelfTest();
                 TestReadOnlyGuards();
                 TestPointerAndShapeHints();
                 ReadOnlyPair.RunSelfTest();
