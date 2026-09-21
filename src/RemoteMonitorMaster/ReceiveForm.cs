@@ -574,7 +574,14 @@ namespace RemoteMonitorMaster
             activeRound = round;
             var completed = CompletedRoundCount;
             var count = "완료 " + completed + "회 / 명령 " + (round + 1) + "회";
-            if (phase == "WAITING_FOR_PC_IDLE" || phase == "ACTIVATING_TARGET" || phase == "RESTORING_TARGET")
+            if (phase.StartsWith("WAITING_FOR_PC_IDLE:", StringComparison.Ordinal))
+            {
+                // 같은 대기의 원인별 안내입니다. 기본 "WAITING_FOR_PC_IDLE" 문구는 아래 분기에서 그대로 유지합니다.
+                code.Text = "WAIT";
+                SetStatus(IdleWaitAdvice(phase.Substring("WAITING_FOR_PC_IDLE:".Length)), false);
+                SetInteractionNotice("60초 안에 조건이 충족되지 않으면 TARGET_PC_NOT_IDLE로 중단하고 로그에 원인을 남깁니다.");
+            }
+            else if (phase == "WAITING_FOR_PC_IDLE" || phase == "ACTIVATING_TARGET" || phase == "RESTORING_TARGET")
             {
                 code.Text = "WAIT";
                 SetStatus(phase == "WAITING_FOR_PC_IDLE" ? "PC 입력이 끝나기를 기다리고 있습니다. 요청은 유지됩니다." :
@@ -646,6 +653,23 @@ namespace RemoteMonitorMaster
                 SetStatus("명령 " + (round + 1) + "회 완료 — 휴대폰 답장을 확인하고 다음 고정 명령어를 보낼 수 있습니다. Stop으로 종료합니다.", false);
                 SetInteractionNotice("완료됨 — 명령어 통합 확인 중 / 종료하려면 Stop");
             }
+        }
+
+        // PC 입력 정지 대기를 막고 있는 원인 하나를 그대로 알려 줍니다. 모르는 코드는 기본 문구를 씁니다.
+        private static string IdleWaitAdvice(string reason)
+        {
+            switch (reason)
+            {
+                case "INPUT_RECENT":
+                    return "PC 입력이 계속 감지되어 기다리는 중입니다 (마지막 입력 1초 미만). 마우스·키보드에서 손을 떼세요. 마우스 흔들림 방지 프로그램이나 원격 제어 도구가 있으면 잠시 중지하세요.";
+                case "KEY_HELD":
+                    return "마우스 버튼 또는 Shift/Ctrl/Alt/Win 키가 눌려 있어 기다리는 중입니다. 키와 버튼에서 손을 떼세요.";
+                case "FOREGROUND_BUSY":
+                    return "앞에 있는 창이 메뉴·끌기·마우스 캡처 상태여서 기다리는 중입니다. 메뉴를 닫고 끌기를 끝내세요.";
+                case "NO_FOREGROUND":
+                    return "활성 창이 없어(잠금 화면 또는 전환 중) 기다리는 중입니다.";
+            }
+            return "PC 입력이 끝나기를 기다리고 있습니다. 요청은 유지됩니다.";
         }
 
         private void ApplyProgress(string phase, int runGeneration)
@@ -795,6 +819,8 @@ namespace RemoteMonitorMaster
                 case "TARGET_FOREGROUND_NOT_ACQUIRED":
                 case "TARGET_INPUT_CHANGED":
                     return "회신 입력 직전에 다른 창이 앞으로 나오거나 PC 입력이 감지됐습니다. PC 조작을 멈춘 뒤 새 세션을 시작하세요.";
+                case "TARGET_PC_NOT_IDLE":
+                    return "60초 동안 PC 입력 정지 조건이 충족되지 않았습니다. 로그의 OPERATIONAL_TARGET_IDLE_WAIT 항목(reason·input_age_ms·held_keys·gui_*)이 원인을 가리킵니다. 마우스 흔들림 방지 프로그램·원격 제어 도구·눌린 키를 확인한 뒤 새 세션을 시작하세요.";
                 case "TARGET_INPUT_DESKTOP_UNAVAILABLE":
                 case "TARGET_INPUT_DESKTOP_INSECURE":
                     return "잠금 화면·보안 데스크톱 상태여서 입력할 수 없습니다. 잠금을 해제한 뒤 새 세션을 시작하세요. 자동 재개는 하지 않습니다.";
