@@ -218,8 +218,7 @@ namespace RemoteMonitorLink
             return result;
         }
 
-        // Runs without a vision server, a screen capture or a model: the rejected settings fail before any I/O.
-        // Not yet wired into LinkSelfTest.Run (that file is owned elsewhere); add PowerSiVision.SelfTest() there.
+        // Runs without a vision server, a screen capture or a model: the rejected settings fail before any I/O. Called from LinkSelfTest.Run.
         internal static void SelfTest()
         {
             var inventory = new ProcessInventory

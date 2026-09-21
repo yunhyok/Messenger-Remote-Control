@@ -619,6 +619,13 @@ namespace RemoteMonitorMaster
                 SetStatus("새 메시지는 읽었지만 지원 명령과 불일치 — 소문자 pwrsi / total status를 확인하세요.", false);
                 SetInteractionNotice("앞뒤 공백은 허용 / 철자·대소문자·단어 사이 공백은 구분 / Stop으로 종료");
             }
+            else if (phase == "COMMAND_NOT_VISIBLE")
+            {
+                // 첫 명령 행은 고정되며 다른 행이 대신할 수 없습니다. 보이는 enabled 상태가 될 때까지 접수하지 않습니다.
+                code.Text = "READY";
+                SetStatus("명령 메시지를 읽었지만 화면 밖이거나 비활성 상태 — 대화 기록을 맨 아래로 스크롤해 명령이 보이게 하세요.", false);
+                SetInteractionNotice("첫 명령 행이 보이는 enabled 상태여야 접수 / 이후 보낸 메시지는 대신 접수되지 않음 / Stop으로 종료");
+            }
             else if (phase == "SLAVE_QUERYING" || phase == "PC_STATUS_QUERYING")
             {
                 code.Text = "WAIT";
