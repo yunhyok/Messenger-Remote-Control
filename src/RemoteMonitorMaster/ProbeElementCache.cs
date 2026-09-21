@@ -89,14 +89,18 @@ namespace RemoteMonitorMaster
             patternNames = string.Join(",", names.ToArray());
         }
 
-        private static AutomationElement CaptureUpdated(AutomationElement element, int expectedProcessId,
-            bool includeBoundingRectangle)
+        // The single request shape this probe uses, for GetUpdatedCache on one element and for a parent's bounded
+        // children query alike. Bulk properties/patterns avoid GetSupportedPatterns' documented per-pattern provider
+        // queries. TreeFilter must stay Condition.TrueCondition: CacheRequest.TreeFilter defaults to the control
+        // view, and a find that runs under an active request uses that request's filter, so only TrueCondition
+        // enumerates the same raw view TreeWalker.RawViewWalker returns (its condition, Automation.RawViewCondition,
+        // is the always-true condition, so the filtered set is identical). AutomationElementMode.Full keeps every
+        // returned element a live reference, so Current.* reads and GetRuntimeId still work on it.
+        // https://learn.microsoft.com/en-us/dotnet/framework/ui-automation/caching-in-ui-automation-clients
+        // https://learn.microsoft.com/en-us/dotnet/api/system.windows.automation.cacherequest.treefilter
+        // https://learn.microsoft.com/en-us/dotnet/api/system.windows.automation.automationelement.findall
+        internal static CacheRequest CreateRequest(bool includeBoundingRectangle)
         {
-            if (element == null) throw new ArgumentNullException(nameof(element));
-            if (expectedProcessId <= 0) throw new ArgumentOutOfRangeException(nameof(expectedProcessId));
-
-            // Bulk properties/patterns avoid GetSupportedPatterns' documented per-pattern provider queries.
-            // https://learn.microsoft.com/en-us/dotnet/framework/ui-automation/caching-in-ui-automation-clients
             var request = new CacheRequest {
                 TreeScope = TreeScope.Element,
                 TreeFilter = Condition.TrueCondition,
@@ -117,8 +121,16 @@ namespace RemoteMonitorMaster
             }) request.Add(property);
             if (includeBoundingRectangle) request.Add(AutomationElement.BoundingRectangleProperty);
             foreach (var pattern in Patterns) request.Add(pattern);
+            return request;
+        }
 
-            var cached = element.GetUpdatedCache(request);
+        private static AutomationElement CaptureUpdated(AutomationElement element, int expectedProcessId,
+            bool includeBoundingRectangle)
+        {
+            if (element == null) throw new ArgumentNullException(nameof(element));
+            if (expectedProcessId <= 0) throw new ArgumentOutOfRangeException(nameof(expectedProcessId));
+
+            var cached = element.GetUpdatedCache(CreateRequest(includeBoundingRectangle));
             if (cached == null)
                 throw new MonitorException("PROBE_CACHE_UNAVAILABLE", "The UI Automation element cache is unavailable.");
             return cached;
@@ -142,6 +154,29 @@ namespace RemoteMonitorMaster
             rejection = SecurityRejection(
                 cached.GetCachedPropertyValue(AutomationElement.ProcessIdProperty, true),
                 // Match Current.IsPassword's documented false default, exactly as the constructor does.
+                cached.GetCachedPropertyValue(AutomationElement.IsPasswordProperty, false),
+                expectedProcessId);
+            if (rejection != null) return false;
+            cache = new ProbeElementCache(cached, expectedProcessId, includeBoundingRectangle);
+            return true;
+        }
+
+        // Same checks, same defaults and the same construction as TryCapture, but on an element a parent's own
+        // children query already cached in this very snapshot, so no second provider round trip is spent on it.
+        // Nothing is ever filled in from a live read: if a required cached value is missing (the element did not
+        // come from an active request) GetCachedPropertyValue throws and the caller must treat it exactly like
+        // today's unknown batch failure. The batch is still the pre-content guard - no batched value is used,
+        // logged or traversed before this method returns true.
+        internal static bool TryFromCached(AutomationElement cached, int expectedProcessId,
+            bool includeBoundingRectangle, out ProbeElementCache cache, out string rejection)
+        {
+            cache = null;
+            rejection = null;
+            if (cached == null) throw new ArgumentNullException(nameof(cached));
+            if (expectedProcessId <= 0) throw new ArgumentOutOfRangeException(nameof(expectedProcessId));
+            rejection = SecurityRejection(
+                cached.GetCachedPropertyValue(AutomationElement.ProcessIdProperty, true),
+                // Match Current.IsPassword's documented false default, exactly as TryCapture does.
                 cached.GetCachedPropertyValue(AutomationElement.IsPasswordProperty, false),
                 expectedProcessId);
             if (rejection != null) return false;
@@ -301,6 +336,39 @@ namespace RemoteMonitorMaster
                                 ElementIdentity.Capture(AutomationElement.FromHandle(handles[2])).ProcessId)
                             .TryGetPattern(InvokePattern.Pattern, out pattern) && pattern is InvokePattern,
                             "PROBE_CACHE_INVOKE_PATTERN_MISSING");
+
+                        // The fixture's children exactly as the probe obtains them: one bounded children query
+                        // under the same activated request shape. TryFromCached must accept them without any
+                        // further round trip and rebuild the same identity the live capture produces.
+                        var form = AutomationElement.FromHandle(handles[0]);
+                        var formProcessId = ElementIdentity.Capture(form).ProcessId;
+                        AutomationElementCollection children;
+                        using (CreateRequest(true).Activate())
+                            children = form.FindAll(TreeScope.Children, Condition.TrueCondition);
+                        Need(children != null && children.Count > 0, "PROBE_CACHE_CHILDREN_QUERY_EMPTY");
+                        foreach (AutomationElement child in children)
+                        {
+                            ProbeElementCache fromCached;
+                            string childRejection;
+                            Need(TryFromCached(child, formProcessId, true, out fromCached, out childRejection) &&
+                                childRejection == null && fromCached != null,
+                                "PROBE_CACHE_FROM_CACHED_REJECTED");
+                            var childCurrent = child.Current;
+                            Need(fromCached.CreateIdentity(childCurrent.Name).Equals(ElementIdentity.Capture(child)),
+                                "PROBE_CACHE_FROM_CACHED_IDENTITY_MISMATCH");
+                            Need(fromCached.ProcessId == childCurrent.ProcessId &&
+                                fromCached.ControlType == childCurrent.ControlType &&
+                                fromCached.NativeWindowHandle == childCurrent.NativeWindowHandle &&
+                                fromCached.IsEnabled == childCurrent.IsEnabled &&
+                                fromCached.IsOffscreen == childCurrent.IsOffscreen &&
+                                fromCached.HasKeyboardFocus == childCurrent.HasKeyboardFocus &&
+                                fromCached.BoundingRectangle == childCurrent.BoundingRectangle,
+                                "PROBE_CACHE_FROM_CACHED_METADATA_MISMATCH");
+                            ProbeElementCache foreignChild;
+                            Need(!TryFromCached(child, formProcessId + 1, true, out foreignChild, out childRejection) &&
+                                foreignChild == null && childRejection == ForeignProcessRejection,
+                                "PROBE_CACHE_FROM_CACHED_FOREIGN_ACCEPTED");
+                        }
                     }
                     catch (Exception ex) { comparisonFailure = ex; }
                 });
