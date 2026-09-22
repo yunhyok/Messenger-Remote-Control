@@ -18,6 +18,8 @@ namespace RemoteMonitorMaster
         private SupervisedSendTest.Consent active;
         private SupervisedSendTest.Consent activeNotice;
         private int cancelled, claimed, completedRounds, attempts;
+        // Consecutive rounds that ended without a clean completion and without any input; the third one ends the session.
+        internal const int AbortResumeLimit = 3;
 
         internal StatusSession(string firstMarker, bool confirmed, SlaveEndpoint slave)
             : this(firstMarker, confirmed, slave, false) { }
@@ -84,6 +86,38 @@ namespace RemoteMonitorMaster
             }
         }
 
+        // Unknown counts as attempted: any committed move/write/click of this round, or a send outcome that reports one.
+        // A round that never reached a send keeps Flags(consent) == 0 and either no send outcome or one with
+        // InputAttempted false, which is the only case the caller may resume from.
+        private static bool InputAttempted(SupervisedSendTest.Consent consent, RoundTripTest.Outcome outcome)
+        {
+            return Flags(consent) != 0 || outcome == null || (outcome.Send != null && outcome.Send.InputAttempted);
+        }
+
+        // Pure rule for a round that did not complete cleanly. Uncertain delivery always wins: an attempted send is
+        // never retried or resumed, only reported. Cancellation stops as well; only an untouched round may resume.
+        internal static string DecideAfterAbort(bool cancelled, bool inputAttempted, int consecutiveAborts, int limit)
+        {
+            if (inputAttempted) return "STATUS_REQUEST_STOPPED";
+            if (cancelled) return "STATUS_SESSION_CANCELLED";
+            if (consecutiveAborts >= limit) return "STATUS_REQUEST_ABORT_LIMIT";
+            return "RESUME";
+        }
+
+        // Retires an aborted round without completing it: no completed round, no cancellation, no consent reuse.
+        // The round's attempt bits are folded into the session before the consent is dropped.
+        private bool TryReleaseAbortedRequest(SupervisedSendTest.Consent consent, RoundTripTest.Outcome outcome)
+        {
+            lock (sync)
+            {
+                if (Cancelled || !ReferenceEquals(active, consent) || outcome == null || outcome.CleanCompletion ||
+                    InputAttempted(consent, outcome)) return false;
+                attempts |= Flags(consent);
+                Volatile.Write(ref active, null);
+                return true;
+            }
+        }
+
         internal string Run(IntPtr window, AuditLog log, Func<bool> stop, Action<int, string, string> progress)
         {
             var clock = Stopwatch.StartNew();
@@ -125,6 +159,8 @@ namespace RemoteMonitorMaster
                 var marker = Allocate(store, allocated, firstMarker);
                 reported = marker;
                 ReceiveProbe.Baseline original = null, baseline = null;
+                var consecutiveAborts = 0;
+                var resumedBaselineCheck = false; // A resumed round re-proves reply absence for its new code.
                 void SendReady(string requestMarker)
                 {
                     Alive();
@@ -182,6 +218,12 @@ namespace RemoteMonitorMaster
                                 RequireReplyAbsent(snapshot, marker);
                             }
                             else ReceiveProbe.ValidateContinuity(original, snapshot);
+                            if (resumedBaselineCheck && phase == "BASELINE")
+                            {
+                                // Same guard a completed round applies to its next code, on the resumed round's baseline.
+                                resumedBaselineCheck = false;
+                                RequireReplyAbsent(snapshot, marker);
+                            }
                             if (phase == "HANDOFF")
                             {
                                 // Capture BEFORE sending. A fast following request is compared to this earlier snapshot.
@@ -191,10 +233,40 @@ namespace RemoteMonitorMaster
                             Alive();
                         }, baseline, true, target);
                     last = outcome.Message;
+                    if (outcome == null || !outcome.CleanCompletion)
+                    {
+                        // Nothing typed or clicked: re-arm receiving with a new code and a new Ready. Never a resend.
+                        var inputAttempted = InputAttempted(consent, outcome);
+                        var abortReason = outcome?.Send?.Reason ?? "UNKNOWN";
+                        consecutiveAborts++;
+                        var decision = DecideAfterAbort(Cancelled || stop(), inputAttempted, consecutiveAborts, AbortResumeLimit);
+                        var resumed = decision == "RESUME" && TryReleaseAbortedRequest(consent, outcome);
+                        log.Write("INFO", "STATUS_REQUEST_ABORTED", AuditLog.Field("reason", abortReason),
+                            AuditLog.Field("input_attempted", inputAttempted), AuditLog.Field("consecutive", consecutiveAborts),
+                            AuditLog.Field("resumed", resumed), AuditLog.Field("round_index", round),
+                            AuditLog.Field("delivery_verified", false));
+                        if (!resumed)
+                        {
+                            FinishRequest(consent, outcome, nextBaseline); // Cancels; keeps the attempts/draft visible.
+                            throw new MonitorException(decision == "RESUME" ? "STATUS_REQUEST_STOPPED" : decision,
+                                "No next request will run.");
+                        }
+                        Alive();
+                        progress(round, "REQUEST_RESUMED:" + abortReason, marker);
+                        Alive();
+                        // A fresh code, and a baseline rebuilt by the new Ready; the aborted proof/marker is never reused.
+                        marker = Allocate(store, allocated, "M" + Protocol.CreateDiagnosticDigits());
+                        reported = marker;
+                        baseline = null;
+                        resumedBaselineCheck = !plainCommands;
+                        if (plainCommands) SendReady(marker);
+                        continue;
+                    }
                     if (!FinishRequest(consent, outcome, nextBaseline))
                         throw new MonitorException("STATUS_REQUEST_STOPPED", "No next request will run.");
                     log.Write("INFO", "STATUS_REQUEST_COMPLETE", AuditLog.Field("completed_rounds", CompletedRounds),
                         AuditLog.Field("delivery_verified", false));
+                    consecutiveAborts = 0;
                     Alive();
                     progress(round, "ROUND_COMPLETE", marker);
                     Alive();
@@ -243,6 +315,18 @@ namespace RemoteMonitorMaster
 
         internal static void RunSelfTest(string directory)
         {
+            // Pure abort decision table first: an attempted send never resumes, cancellation never resumes,
+            // the third consecutive untouched abort ends the session, and only the earlier ones re-arm receiving.
+            Need(DecideAfterAbort(false, false, 1, AbortResumeLimit) == "RESUME" &&
+                DecideAfterAbort(false, false, AbortResumeLimit - 1, AbortResumeLimit) == "RESUME" &&
+                DecideAfterAbort(false, false, AbortResumeLimit, AbortResumeLimit) == "STATUS_REQUEST_ABORT_LIMIT" &&
+                DecideAfterAbort(false, false, AbortResumeLimit + 1, AbortResumeLimit) == "STATUS_REQUEST_ABORT_LIMIT" &&
+                DecideAfterAbort(false, true, 1, AbortResumeLimit) == "STATUS_REQUEST_STOPPED" &&
+                DecideAfterAbort(true, true, 1, AbortResumeLimit) == "STATUS_REQUEST_STOPPED" &&
+                DecideAfterAbort(true, true, AbortResumeLimit, AbortResumeLimit) == "STATUS_REQUEST_STOPPED" &&
+                DecideAfterAbort(true, false, 1, AbortResumeLimit) == "STATUS_SESSION_CANCELLED" &&
+                DecideAfterAbort(true, false, AbortResumeLimit, AbortResumeLimit) == "STATUS_SESSION_CANCELLED",
+                "STATUS_SELFTEST_ABORT_DECISION");
             var path = Path.Combine(directory, "status-session-tokens.txt");
             void Reject(Action action)
             {
@@ -303,10 +387,26 @@ namespace RemoteMonitorMaster
                     baseline = future;
                 }
                 Need(operation.CompletedRounds == 2 && operation.SendAttempted, "STATUS_SELFTEST_TWO_REQUESTS");
+                var aborted = operation.StartRequest("M456789", "M567892");
+                Need(aborted.TryClaimRoundTrip(), "STATUS_SELFTEST_ABORT_CLAIM");
+                aborted.Cancel(); // The real RoundTripTest always retires the consent on return.
+                var rejectedSend = new RoundTripTest.Outcome("aborted", new SupervisedSendTest.Outcome("REJECTED",
+                    "ROUNDTRIP_PROOF_EXPIRED_OR_WINDOW_CHANGED", "test", false, false), false);
+                Need(!operation.TryReleaseAbortedRequest(aborted, new RoundTripTest.Outcome("clean",
+                    new SupervisedSendTest.Outcome("ACTION_RETURNED", "NONE", "test", true))) &&
+                    !operation.TryReleaseAbortedRequest(aborted, new RoundTripTest.Outcome("unknown send",
+                        new SupervisedSendTest.Outcome("UNKNOWN", "SEND_TIME_LIMIT", "test", false))),
+                    "STATUS_SELFTEST_ABORT_ONLY_UNTOUCHED");
+                Need(operation.TryReleaseAbortedRequest(aborted, rejectedSend) && !operation.Cancelled &&
+                    operation.CompletedRounds == 2 && !operation.PendingWrite && !aborted.TryCommit(),
+                    "STATUS_SELFTEST_ABORT_RESUME");
+                Need(!operation.TryReleaseAbortedRequest(aborted, rejectedSend), "STATUS_SELFTEST_ABORT_RESUME_ONCE");
                 var failed = operation.StartRequest("M456789", "M567892");
                 Need(failed.TryClaimRoundTrip(), "STATUS_SELFTEST_FAILED_APPROVAL");
                 var pending = failed.PrepareReply();
                 Need(failed.TryConsume(pending) && failed.TryCommitMove() && failed.TryCommitWrite(), "STATUS_SELFTEST_DRAFT");
+                Need(!operation.TryReleaseAbortedRequest(failed, new RoundTripTest.Outcome("uncertain")) &&
+                    !operation.Cancelled, "STATUS_SELFTEST_ABORT_INPUT_ATTEMPTED");
                 Need(!operation.FinishRequest(failed, new RoundTripTest.Outcome("uncertain"), baseline) &&
                     operation.Cancelled && operation.PendingWrite && operation.CompletedRounds == 2, "STATUS_SELFTEST_FAIL_STOP");
                 Reject(() => operation.StartRequest("M567892", "M678923"));
@@ -374,11 +474,21 @@ namespace RemoteMonitorMaster
                     baseline = future;
                 }
                 Need(operation.CompletedRounds == 2 && operation.SendAttempted, "COMMAND_SESSION_SELFTEST_TWO_REQUESTS");
+                var untouched = operation.StartRequest(codes[2], codes[3]);
+                Need(untouched.TryClaimRoundTrip(), "COMMAND_SESSION_SELFTEST_ABORT_CLAIM");
+                untouched.BindCommand("pwrsi");
+                untouched.Cancel();
+                Need(operation.TryReleaseAbortedRequest(untouched, new RoundTripTest.Outcome("aborted",
+                        new SupervisedSendTest.Outcome("REJECTED", "ROUNDTRIP_PROOF_EXPIRED_OR_WINDOW_CHANGED", "test", false, false), false)) &&
+                    !operation.Cancelled && operation.CompletedRounds == 2 && !operation.PendingWrite,
+                    "COMMAND_SESSION_SELFTEST_ABORT_RESUME");
                 var pending = operation.StartRequest(codes[2], codes[3]);
                 Need(pending.TryClaimRoundTrip(), "COMMAND_SESSION_SELFTEST_PENDING_CLAIM");
                 pending.BindCommand("help");
                 var draft = pending.PrepareReply();
                 Need(pending.TryConsume(draft) && pending.TryCommitMove() && pending.TryCommitWrite(), "COMMAND_SESSION_SELFTEST_PENDING_WRITE");
+                Need(!operation.TryReleaseAbortedRequest(pending, new RoundTripTest.Outcome("uncertain")) &&
+                    !operation.Cancelled, "COMMAND_SESSION_SELFTEST_ABORT_INPUT_ATTEMPTED");
                 Need(!operation.FinishRequest(pending, new RoundTripTest.Outcome("uncertain"), baseline) &&
                     operation.Cancelled && operation.PendingWrite && operation.CompletedRounds == 2 && !pending.TryCommit(),
                     "COMMAND_SESSION_SELFTEST_UNCERTAIN_STOP");

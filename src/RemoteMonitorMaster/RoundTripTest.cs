@@ -10,6 +10,16 @@ namespace RemoteMonitorMaster
     // Locally pre-authorized fixed-output experiment. A displayed M label is a start condition, not an authenticated command.
     internal static class RoundTripTest
     {
+        // ReceiveProbe caps one cooperative capture phase at 15 s (RECEIVE_PHASE_TIME_LIMIT); it owns that literal.
+        internal static readonly TimeSpan ReceivePhaseTimeLimit = TimeSpan.FromSeconds(15);
+        // A send proof is by design at least two distinct bounded snapshots old: the reobservation's first capture
+        // starts the clock and the sender's fresh snapshot follows, each allowed up to ReceivePhaseTimeLimit, plus the
+        // candidate/identity comparisons between them. 2 x 15 s + 5 s keeps the age bound consistent with that cap
+        // instead of expiring deterministically on a long conversation. The first capture's age is still preserved and
+        // still checked at every site; only the bound changes.
+        internal static readonly TimeSpan ProofAgeLimit =
+            TimeSpan.FromTicks(2 * ReceivePhaseTimeLimit.Ticks) + TimeSpan.FromSeconds(5);
+
         internal sealed class Outcome
         {
             internal readonly string Message;
@@ -200,9 +210,11 @@ namespace RemoteMonitorMaster
                     }
                 }
                 catch { }
+                // Carry the last send outcome so the caller can tell a pre-input rejection from an uncertain send.
+                // A null Send after the send stage was entered stays unknown and must be treated as attempted.
                 return new Outcome((sendStageEntered ? "UNKNOWN" : "REJECTED") + " - " + reason +
                     ". This one-run confirmation is consumed. Do not retry; inspect the result and collect the log." +
-                    (sent == null ? "" : Environment.NewLine + sent.Message));
+                    (sent == null ? "" : Environment.NewLine + sent.Message), sent, false);
             }
             finally
             {
@@ -223,7 +235,7 @@ namespace RemoteMonitorMaster
             Need(stop != null && !stop(), "ROUNDTRIP_CANCELLED");
             Need(proof != null && owner != null && ReferenceEquals(proof.Owner, owner), "ROUNDTRIP_PROOF_OWNER_MISMATCH");
             Need(proof.TryConsume(), "ROUNDTRIP_PROOF_USED");
-            Need(window != IntPtr.Zero && proof.Window == window && proof.Elapsed < TimeSpan.FromSeconds(15),
+            Need(window != IntPtr.Zero && proof.Window == window && proof.Elapsed < ProofAgeLimit,
                 "ROUNDTRIP_PROOF_EXPIRED_OR_WINDOW_CHANGED");
             Need(proof.Baseline != null && proof.Previous != null && proof.Final != null &&
                 proof.Baseline.Snapshot.Process.WindowHandle == window.ToInt64(), "ROUNDTRIP_PROOF_INCOMPLETE");
@@ -265,7 +277,7 @@ namespace RemoteMonitorMaster
                 catch (Exception ex) { throw new MonitorException("ROUNDTRIP_STATE_FAILED", "Diagnostic reservation check failed.", ex); }
             }
             Need(!stop(), "ROUNDTRIP_CANCELLED");
-            Need(proof.Elapsed < TimeSpan.FromSeconds(15), "ROUNDTRIP_PROOF_EXPIRED_OR_WINDOW_CHANGED");
+            Need(proof.Elapsed < ProofAgeLimit, "ROUNDTRIP_PROOF_EXPIRED_OR_WINDOW_CHANGED");
         }
 
         private static ReceiveProbe.SingleObservation RefreshObservation(ReceiveProbe.ObservationProof original, object owner,
@@ -290,7 +302,7 @@ namespace RemoteMonitorMaster
             Need(single.TryConsume(), "ROUNDTRIP_SINGLE_OBSERVATION_USED");
             Need(window != IntPtr.Zero && original.Window == window && single.Window == window &&
                 original.Bounds.Equals(single.Bounds) && single.Bounds.Equals(bounds) && single.Age != null && single.Age.IsRunning &&
-                single.Elapsed < TimeSpan.FromSeconds(15), "ROUNDTRIP_PROOF_EXPIRED_OR_WINDOW_CHANGED");
+                single.Elapsed < ProofAgeLimit, "ROUNDTRIP_PROOF_EXPIRED_OR_WINDOW_CHANGED");
             Need(original.Baseline != null && original.Baseline.PlainCommands && single.Snapshot != null && fresh != null &&
                 !ReferenceEquals(single.Snapshot, fresh) && !ReferenceEquals(single.Snapshot, original.Previous) &&
                 !ReferenceEquals(single.Snapshot, original.Final) && !ReferenceEquals(fresh, original.Previous) &&
@@ -303,7 +315,7 @@ namespace RemoteMonitorMaster
                 single.Snapshot, previous, fresh, final, single.AgeOffset, single.Age);
             SelectRefreshedProof(original, refreshed, owner, window);
             Need(!stop(), "ROUNDTRIP_CANCELLED");
-            Need(refreshed.Elapsed < TimeSpan.FromSeconds(15), "ROUNDTRIP_PROOF_EXPIRED_OR_WINDOW_CHANGED");
+            Need(refreshed.Elapsed < ProofAgeLimit, "ROUNDTRIP_PROOF_EXPIRED_OR_WINDOW_CHANGED");
             return refreshed;
         }
 
@@ -313,7 +325,7 @@ namespace RemoteMonitorMaster
             Need(original != null && refreshed != null && owner != null && ReferenceEquals(original.Owner, owner) &&
                 ReferenceEquals(refreshed.Owner, owner), "ROUNDTRIP_PROOF_OWNER_MISMATCH");
             Need(original.Window == window && refreshed.Window == window && original.Bounds.Equals(refreshed.Bounds) &&
-                refreshed.Elapsed < TimeSpan.FromSeconds(15), "ROUNDTRIP_PROOF_EXPIRED_OR_WINDOW_CHANGED");
+                refreshed.Elapsed < ProofAgeLimit, "ROUNDTRIP_PROOF_EXPIRED_OR_WINDOW_CHANGED");
             Need(original.Baseline != null && original.Baseline.PlainCommands &&
                 ReferenceEquals(original.Baseline, refreshed.Baseline), "ROUNDTRIP_PROOF_INCOMPLETE");
             ReceiveProbe.ValidatePlainHistoryPrefix(original.Final, refreshed.Previous, baseline: original.Baseline, acceptedRequest: true);
@@ -339,6 +351,9 @@ namespace RemoteMonitorMaster
 
         internal static void RunSelfTest(string directory)
         {
+            // The send proof spans two bounded captures, each capped at ReceivePhaseTimeLimit by ReceiveProbe.
+            Need(ProofAgeLimit >= TimeSpan.FromTicks(2 * ReceivePhaseTimeLimit.Ticks) &&
+                ReceivePhaseTimeLimit == TimeSpan.FromSeconds(15), "ROUNDTRIP_PROOF_AGE_LIMIT_COVERS_TWO_PHASES");
             const string marker = "M234567";
             var statePath = Path.Combine(directory, "roundtrip-selftest-tokens.txt");
             var blockedPath = Path.Combine(directory, "roundtrip-selftest-blocked-state");
@@ -473,10 +488,10 @@ namespace RemoteMonitorMaster
             try
             {
                 Reject(() => AuthorizeHandoffCore(Proof(0), owner, window, marker, History(1), path, () => false, false));
-                Reject(() => AuthorizeHandoffCore(Proof(0, TimeSpan.FromSeconds(16)), owner, window, marker,
+                Reject(() => AuthorizeHandoffCore(Proof(0, ProofAgeLimit), owner, window, marker,
                     History(1), path, () => false, true));
                 var accepted = Accepted();
-                Reject(() => Complete(accepted, Single(accepted, 1, TimeSpan.FromSeconds(16)), History(2, false)));
+                Reject(() => Complete(accepted, Single(accepted, 1, ProofAgeLimit), History(2, false)));
                 var same = Single(accepted, 1);
                 Reject(() => Complete(accepted, same, same.Snapshot));
                 Reject(() => Complete(accepted, new ReceiveProbe.SingleObservation(accepted, owner, window, accepted.Bounds,
@@ -545,6 +560,14 @@ namespace RemoteMonitorMaster
                     Reject(() => AuthorizeHandoffCore(refreshed, owner, window, marker, second, path, () => false, false));
                 }
                 Need(File.ReadAllLines(path).Length == 1, "OPERATING_TEN_PARTS_READY_REFRESH_REUSE_RESERVATION");
+                // Two long but legal captures (16 s together) still authorize; only an age past the bound expires.
+                var longFirst = Single(busyProof, 13, TimeSpan.FromSeconds(16));
+                var longSecond = History(14, candidateVisible: false);
+                var longProof = Complete(busyProof, longFirst, longSecond);
+                Need(longProof.Elapsed >= TimeSpan.FromSeconds(16) && longProof.Elapsed < ProofAgeLimit,
+                    "OPERATING_TWO_LONG_CAPTURES_ACCEPTED");
+                AuthorizeHandoffCore(longProof, owner, window, marker, longSecond, path, () => false, false);
+                Reject(() => Complete(busyProof, Single(busyProof, 13, ProofAgeLimit), History(14, candidateVisible: false)));
                 Reject(() => AuthorizeHandoffCore(Proof(3, candidateEnabled: false), owner, window, marker,
                     History(4, candidateEnabled: false), path, () => false, false));
                 var changed = Proof(3);
@@ -601,8 +624,9 @@ namespace RemoteMonitorMaster
                 ReceiveProbe.SetTestName(ReceiveProbe.SelectHistory(trimmedAtHandoff).Texts.Last(), "help");
                 Reject(() => AuthorizeHandoff(Proof(), owner, window, marker, trimmedAtHandoff, path, () => false));
                 Reject(() => AuthorizeHandoff(Proof(), owner, window, marker, History(true), path, () => true));
-                Reject(() => AuthorizeHandoff(Proof(ageOffset: TimeSpan.FromSeconds(16)), owner, window, marker,
+                Reject(() => AuthorizeHandoff(Proof(ageOffset: ProofAgeLimit), owner, window, marker,
                     History(true), path, () => false));
+                // The accepted request may be old; only the proof that authorizes the send must be inside the bound.
                 var agedOriginal = Proof(ageOffset: TimeSpan.FromSeconds(16));
                 var refreshed = Proof(agedOriginal.Baseline);
                 Need(ReferenceEquals(SelectRefreshedProof(agedOriginal, refreshed, owner, window), refreshed),
