@@ -20,9 +20,13 @@ namespace RemoteMonitorMaster
         private readonly Button slavePhone = new Button { Text = "PowerSI 보고서 + 명령어 운용" };
         private readonly CheckBox legacyMarker = new CheckBox { Text = "기존 M코드" };
         private readonly Button localPhone = new Button { Text = "이 PC만 연속 운용 (Slave 없이)" };
+        // Master-only setting read by the operating session at its start; it is never passed to a form or session here.
+        private readonly Label watchdogIntervalLabel = new Label { Text = "watchdog 확인 주기", TextAlign = ContentAlignment.MiddleRight };
+        private readonly ComboBox watchdogInterval = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList };
         private SlaveEndpoint endpoint;
         private CancellationTokenSource pending;
-        private bool closing, phoneOpen;
+        private bool closing, phoneOpen, restoringInterval;
+        private int savedIntervalMinutes;
 
         internal MasterHubForm(AuditLog log)
         {
@@ -42,8 +46,14 @@ namespace RemoteMonitorMaster
             pairing.SetBounds(18, 107, 666, 26);
             pairing.AccessibleName = "Slave 연결 코드 (비밀값, 붙여넣기 또는 연결파일 열기)";
             import.SetBounds(694, 103, 168, 32);
-            target.SetBounds(18, 144, 844, 30);
+            target.SetBounds(18, 144, 600, 30);
             target.AutoEllipsis = true;
+            watchdogIntervalLabel.SetBounds(626, 146, 122, 24);
+            watchdogInterval.SetBounds(752, 146, 110, 24);
+            watchdogInterval.Items.AddRange(new object[] { "30분", "60분" });
+            savedIntervalMinutes = WatchdogSettings.LoadIntervalMinutes(WatchdogSettings.DefaultPath); // Never throws; default 30.
+            watchdogInterval.SelectedIndex = savedIntervalMinutes == 60 ? 1 : 0;
+            watchdogInterval.AccessibleName = "watchdog 확인 주기 (30분 또는 60분, 다음 운용 시작부터 적용)";
             query.SetBounds(18, 182, 210, 36);
             slavePhone.SetBounds(238, 182, 285, 36);
             legacyMarker.SetBounds(531, 187, 92, 26);
@@ -53,11 +63,13 @@ namespace RemoteMonitorMaster
             result.Text = "v" + LinkVersion.AppValue + ": 메신저의 고정 읽기 전용 명령으로 Slave 상태와 PowerSI 증거를 요청합니다.\r\n" +
                 "pwrsi 그대로 입력하세요. total status는 단어 사이 한 칸입니다. 앞뒤 공백은 자동 제거합니다. 기존 M코드는 체크 시에만 사용합니다.\r\n" +
                 "pwrsi는 요청 시점에 한 번 수집하고 모든 대상을 표시합니다. 각 답장은 1,400자 이하이며 PART 순서대로 전송합니다.\r\n" +
+                "watchdog on [PID]는 위의 확인 주기마다 PowerSI 완료를 확인해 알리고 watchdog off [PID]로 해제합니다. 주기는 다음 운용 시작부터 적용됩니다.\r\n" +
                 "Pending 대상은 이름·PID·Pending만 표시합니다. 그 밖의 대상은 출처·수집 시각·설명·수집된 Output 전체 또는 이전 전송 이후 추가분을 표시합니다.\r\n" +
                 "보고서 수집은 최대 100초, 전체 조회는 최대 120초입니다. 진행률이나 완료율은 추측하지 않습니다.";
             var path = new TextBox { Text = log.FilePath, ReadOnly = true, TabStop = false, Bounds = new Rectangle(18, 389, 666, 25) };
             var folder = new Button { Text = "로그 폴더 열기", Bounds = new Rectangle(694, 386, 168, 32) };
-            Controls.AddRange(new Control[] { pairing, import, target, query, slavePhone, legacyMarker, localPhone, result, path, folder });
+            Controls.AddRange(new Control[] { pairing, import, target, watchdogIntervalLabel, watchdogInterval, query, slavePhone,
+                legacyMarker, localPhone, result, path, folder });
             Controls.Add(new Label { Text = "연결파일에는 인증키가 있습니다. 마스터 PC로만 전달하며, 진단 로그와 함께 첨부하지 마세요.",
                 Bounds = new Rectangle(18, 428, 844, 28) });
             pairing.TextChanged += delegate { ParseEndpoint(); };
@@ -65,6 +77,7 @@ namespace RemoteMonitorMaster
             query.Click += async delegate { await Query(); };
             slavePhone.Click += delegate { if (endpoint != null) OpenPhone(endpoint, !legacyMarker.Checked); };
             localPhone.Click += delegate { OpenPhone(null, false); };
+            watchdogInterval.SelectedIndexChanged += delegate { SaveWatchdogInterval(); }; // After the initial selection.
             folder.Click += delegate
             {
                 try { using (Process.Start("explorer.exe", "\"" + log.FolderPath + "\"")) { } }
@@ -72,6 +85,29 @@ namespace RemoteMonitorMaster
             };
             FormClosing += delegate { closing = true; pending?.Cancel(); };
             ParseEndpoint();
+        }
+
+        private void SaveWatchdogInterval()
+        {
+            if (restoringInterval) return;
+            var minutes = watchdogInterval.SelectedIndex == 1 ? 60 : 30;
+            if (minutes == savedIntervalMinutes) return;
+            try
+            {
+                WatchdogSettings.SaveIntervalMinutes(WatchdogSettings.DefaultPath, minutes);
+                savedIntervalMinutes = minutes;
+                try { log.Write("INFO", "WATCHDOG_INTERVAL_SAVED", AuditLog.Field("minutes", minutes)); } catch { }
+            }
+            catch (Exception ex)
+            {
+                try { log.WriteException("WATCHDOG_INTERVAL_SAVE_FAILED", ex); } catch { }
+                restoringInterval = true;
+                try { watchdogInterval.SelectedIndex = savedIntervalMinutes == 60 ? 1 : 0; }
+                finally { restoringInterval = false; }
+                MessageBox.Show(this, "watchdog 확인 주기를 저장하지 못했습니다 (" + ex.GetType().Name + ").\r\n" +
+                    "이전 설정 " + savedIntervalMinutes + "분을 그대로 사용합니다. 사용자 설정 폴더(%LOCALAPPDATA%\\RemoteMonitorMaster\\state)의 쓰기 권한을 확인하세요.",
+                    AppInfo.Title, MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
         }
 
         private void ParseEndpoint()
@@ -183,6 +219,7 @@ namespace RemoteMonitorMaster
             slavePhone.Enabled = idle && endpoint != null;
             legacyMarker.Enabled = idle && endpoint != null;
             localPhone.Enabled = idle;
+            watchdogInterval.Enabled = !closing && !phoneOpen; // The running session keeps the interval it started with.
         }
 
         internal static void RunSelfTest(string directory)
@@ -218,6 +255,13 @@ namespace RemoteMonitorMaster
                         hub.legacyMarker.Checked || hub.legacyMarker.Enabled || !hub.localPhone.Enabled ||
                         hub.slavePhone.Text != "PowerSI 보고서 + 명령어 운용")
                         throw new InvalidOperationException("Master auto-connected without a pairing.");
+                    // Read-only check of the real setting; the self-test never writes the user's settings file.
+                    if (hub.watchdogInterval.Items.Count != 2 || (string)hub.watchdogInterval.Items[0] != "30분" ||
+                        (string)hub.watchdogInterval.Items[1] != "60분" || !hub.watchdogInterval.Enabled ||
+                        hub.watchdogInterval.DropDownStyle != ComboBoxStyle.DropDownList ||
+                        hub.watchdogInterval.SelectedIndex != (hub.savedIntervalMinutes == 60 ? 1 : 0) ||
+                        !WatchdogState.IsValidIntervalMinutes(hub.savedIntervalMinutes) || !hub.result.Text.Contains("watchdog on"))
+                        throw new InvalidOperationException("Watchdog interval control invalid.");
                     hub.pairing.Text = pairingText;
                     if (!hub.slavePhone.Enabled || !hub.query.Enabled || !hub.legacyMarker.Enabled || !hub.pairing.UseSystemPasswordChar)
                         throw new InvalidOperationException("Master pairing controls invalid.");
@@ -248,14 +292,14 @@ namespace RemoteMonitorMaster
                         if (!commands.Text.Contains("COMMANDS") || !commands.Text.Contains("REPEAT UNTIL STOP") ||
                             !(bool)Field("plainCommands") || !approval.Text.Contains("help pwrsi") ||
                             !approval.Text.Contains("ASCII") || !approval.Text.Contains("대화창 활성화") ||
-                            !approval.Text.Contains("최소화 복원") ||
+                            !approval.Text.Contains("최소화 복원") || !approval.Text.Contains("완료·경고 알림") ||
                             !((TextBox)Field("details")).Text.Contains("모든 대상") ||
                             !((TextBox)Field("details")).Text.Contains("PART") || commandCode.Text != "WAIT")
                             throw new InvalidOperationException("Plain command operating consent/title was not explicit.");
                         foreach (Control control in commands.Controls)
                         {
                             if (control.Text.Contains(marker)) throw new InvalidOperationException("Plain command UI exposed an M code.");
-                            if (control.Text.Contains("help / help help / help total status / help pwrsi / total status / pwrsi"))
+                            if (control.Text.Contains("help / help help / help total status / help pwrsi / help watchdog / total status / pwrsi / watchdog on / watchdog off"))
                                 hasCommandGuide = true;
                             if (!commands.ClientRectangle.Contains(control.Bounds)) throw new InvalidOperationException("Plain command control clipped.");
                         }
@@ -296,10 +340,35 @@ namespace RemoteMonitorMaster
                         if (!commandStatus.Text.Contains("답장 전송 중")) throw new InvalidOperationException("Plain command send phase was not visible.");
                         Call("ApplyOperatingProgress", 0, "ROUNDTRIP_SENDING:2/3", "M234567", generation);
                         if (!commandStatus.Text.Contains("PART 2/3")) throw new InvalidOperationException("Multipart send progress was not visible.");
+                        var summary = (Label)Field("watchdogSummary");
+                        var statusBefore = commandStatus.Text;
+                        if (summary.Text != "watchdog: 감시 없음" || !commands.Controls.Contains(summary))
+                            throw new InvalidOperationException("Watchdog summary line was not visible.");
+                        foreach (var round in new[] { 0, 5 })
+                        {
+                            Call("ApplyOperatingProgress", round, "WATCHDOG:감시 2개 · 다음 확인 21:30", "M234567", generation);
+                            if (summary.Text != "watchdog: 감시 2개 · 다음 확인 21:30" || commandStatus.Text != statusBefore ||
+                                (int)Field("activeRound") != 0)
+                                throw new InvalidOperationException("Watchdog summary replaced the status line or moved the round.");
+                        }
+                        Call("ApplyOperatingProgress", 0, "WATCHDOG:감시 없음\r\n", "M234567", generation);
+                        if (summary.Text != "watchdog: 감시 없음") throw new InvalidOperationException("Watchdog summary was not updated in place.");
+                        Call("ApplyOperatingProgress", 0, "WATCHDOG_CHECKING", "M234567", generation);
+                        if (commandCode.Text != "WAIT" || !commandStatus.Text.Contains("watchdog 확인 중 (최대 120초)") ||
+                            !commandStatus.Text.Contains("확인 후 처리"))
+                            throw new InvalidOperationException("Watchdog check phase was not visible.");
+                        Call("ApplyOperatingProgress", 0, "NOTICE_WATCHDOG", "M234567", generation);
+                        if (!commandStatus.Text.Contains("watchdog 알림을 보내는 중"))
+                            throw new InvalidOperationException("Watchdog notice phase was not visible.");
                         Call("ApplyOperatingProgress", 0, "ROUND_COMPLETE", "M234567", generation);
                         if (!commandStatus.Text.Contains("다음 고정 명령어")) throw new InvalidOperationException("Plain command completion implied a separate test.");
                         Call("Stop", "TEST_COMMAND_STOP");
                         Set("busy", false);
+                        Call("ShowResult", "STATUS_SESSION_STOPPED — STATUS_WATCHDOG_NOTICE_UNCERTAIN; completed=0. No automatic retry or resume.",
+                            (int)Field("generation"));
+                        if (!commandDetails.Text.Contains("STATUS_WATCHDOG_NOTICE_UNCERTAIN — watchdog 알림 전송이 불확실") ||
+                            summary.Text != "watchdog: 세션 종료 — 감시 없음")
+                            throw new InvalidOperationException("Session stop reason was not explained.");
                     }
                     foreach (Control control in hub.Controls)
                         if (!hub.ClientRectangle.Contains(control.Bounds)) throw new InvalidOperationException("Master control clipped.");
@@ -348,6 +417,27 @@ namespace RemoteMonitorMaster
                     commandConsent.Cancel();
                     if (commandConsent.TryCommitMove()) throw new InvalidOperationException("Cancelled plain command committed input.");
                 }
+                // watchdog on performs the same loopback STATUS query as total status; watchdog off never connects.
+                var watch = new WatchdogState(TimeSpan.FromMinutes(WatchdogState.DefaultIntervalMinutes));
+                foreach (var command in new[] { "watchdog on", "watchdog off" })
+                {
+                    var nonce = command == "watchdog on" ? "D789234" : "D892345";
+                    var commandConsent = new SupervisedSendTest.Consent(nonce, true, true, endpoint, null, true);
+                    if (!commandConsent.TryClaimRoundTrip()) throw new InvalidOperationException("Watchdog command was not locally approved.");
+                    commandConsent.AttachWatchdog(watch);
+                    commandConsent.BindCommand(command);
+                    string[] commandReplies;
+                    using (ReadOnlyCommands.UseCommandLog(audit)) commandReplies = commandConsent.PrepareReplies();
+                    var commandReply = commandReplies.Length == 1 ? commandReplies[0] : null;
+                    if (commandReply == null || !ReadOnlyCommands.IsReplyPart(commandReply, command, nonce, 1, 1) ||
+                        !commandReply.StartsWith("WATCHDOG " + nonce + "\r\n", StringComparison.Ordinal) ||
+                        commandReply.Contains("Slave에 연결하지 못해") || !commandConsent.IsAuthorizedReply(commandReply) ||
+                        commandConsent.IsAuthorizedReply(commandReply + " ") || !commandConsent.TryConsume(commandReply) ||
+                        commandConsent.TryConsume(commandReply))
+                        throw new InvalidOperationException("Watchdog reply was not exact, single-part and request-bound.");
+                    commandConsent.Cancel();
+                }
+                if (watch.Count != 0) throw new InvalidOperationException("watchdog off left a watch armed.");
                 var stopped = new SupervisedSendTest.Consent("D345678", true, true, endpoint);
                 stopped.TryClaimRoundTrip(); stopped.Cancel();
                 try { stopped.PrepareReply(); throw new InvalidOperationException("Cancelled Slave query ran."); }
@@ -356,7 +446,11 @@ namespace RemoteMonitorMaster
                 audit.ReleaseFile();
                 using (var reader = new FileStream(audit.FilePath, FileMode.Open, FileAccess.Read, FileShare.None))
                     if (reader.Length == 0) throw new InvalidOperationException("Integrated log unavailable while alive.");
-                if (File.ReadAllText(audit.FilePath).Contains(identity.Token)) throw new InvalidOperationException("Pairing token leaked.");
+                var auditText = File.ReadAllText(audit.FilePath);
+                if (auditText.Contains(identity.Token)) throw new InvalidOperationException("Pairing token leaked.");
+                if (!auditText.Contains("code=\"WATCHDOG_COMMAND\"\taction=\"ON\"") || auditText.Contains("SLAVE_FAILURE") ||
+                    (!auditText.Contains("result=\"CLEARED_ALL\"") && !auditText.Contains("result=\"NOTHING_WATCHED\"")))
+                    throw new InvalidOperationException("Watchdog command record missing or failed.");
             }
             }
             finally { audit.Dispose(); File.Delete(audit.FilePath); }

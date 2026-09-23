@@ -21,7 +21,24 @@ namespace RemoteMonitorMaster
         private static readonly string[] Hashes = Commands.Select(TokenStore.Hash).ToArray();
         internal const int MaxReportParts = 9999999;
 
-        internal static bool IsCommand(string command) { return Commands.Contains(command, StringComparer.Ordinal); }
+        // The fixed phrases above plus the exact watchdog grammar (watchdog on|off [PID], help watchdog); nothing else.
+        internal static bool IsCommand(string command)
+        { return Commands.Contains(command, StringComparer.Ordinal) || WatchdogCommand.IsWatchdogCommand(command); }
+
+        // Reply preparation runs synchronously on the operating session thread (ReceiveForm -> StatusSession.Run ->
+        // RoundTripTest -> Consent.PrepareReplies). The operating form scopes its audit log to that thread so the
+        // WATCHDOG_COMMAND record needs no new parameter on the fixed consent interface. No scope means no record.
+        [ThreadStatic] private static AuditLog commandLog;
+
+        internal static IDisposable UseCommandLog(AuditLog log) { return new CommandLogScope(log); }
+
+        private sealed class CommandLogScope : IDisposable
+        {
+            private readonly AuditLog previous;
+            private bool disposed;
+            internal CommandLogScope(AuditLog log) { previous = commandLog; commandLog = log; }
+            public void Dispose() { if (disposed) return; disposed = true; commandLog = previous; }
+        }
 
         internal static bool TryMatchHash(string hash, out string command)
         {
@@ -80,11 +97,24 @@ namespace RemoteMonitorMaster
         internal static string[] CaptureReplies(string command, string nonce, SlaveEndpoint endpoint, CancellationToken cancellation,
             out PreparedPowerSiOutput preparedOutput)
         {
+            return CaptureReplies(command, nonce, endpoint, cancellation, null, out preparedOutput);
+        }
+
+        // watchdog: the session's WatchdogState attached to the consent; required only for watchdog on/off.
+        internal static string[] CaptureReplies(string command, string nonce, SlaveEndpoint endpoint, CancellationToken cancellation,
+            WatchdogState watchdog, out PreparedPowerSiOutput preparedOutput)
+        {
             preparedOutput = null;
             Need(IsCommand(command) && Protocol.IsDiagnosticMarker("DRAFT", nonce) && endpoint != null);
             var clock = Stopwatch.StartNew();
             cancellation.ThrowIfCancellationRequested();
             if (command.StartsWith("help", StringComparison.Ordinal)) return new[] { Help(command, nonce) };
+            bool watchdogOn;
+            int? watchdogPid;
+            if (WatchdogCommand.TryParse(command, out watchdogOn, out watchdogPid))
+                // The same plain STATUS query as total status (process inventory only), never the PowerSI collection.
+                return new[] { PrepareWatchdogReply(nonce, watchdogOn, watchdogPid, watchdog,
+                    () => StatusClient.QueryAsync(endpoint, cancellation, false).GetAwaiter().GetResult(), cancellation, DateTime.UtcNow) };
             MachineStatus state;
             try
             {
@@ -118,6 +148,63 @@ namespace RemoteMonitorMaster
             return replies;
         }
 
+        // One WATCHDOG reply part for watchdog on/off. Arming/disarming takes effect here, at reply preparation, not after
+        // the clean send: the watch list is Master-local memory, so a lost or aborted reply loses no data, and the change
+        // stays visible in the operating window summary and in the WATCHDOG_COMMAND record. No automatic retry.
+        // Output history is never touched; the record carries counts and kinds only, never names or text.
+        internal static string PrepareWatchdogReply(string nonce, bool on, int? pid, WatchdogState watchdog, Func<MachineStatus> query,
+            CancellationToken cancellation, DateTime nowUtc)
+        {
+            if (watchdog == null)
+                throw new MonitorException("WATCHDOG_STATE_UNAVAILABLE", "The operating session did not attach its watchdog state.");
+            Need(Protocol.IsDiagnosticMarker("DRAFT", nonce) && query != null && (!pid.HasValue || pid.Value > 0));
+            cancellation.ThrowIfCancellationRequested();
+            string reply;
+            if (!on)
+            {
+                var disarmed = watchdog.Disarm(pid); // Local only; no Slave query.
+                reply = WatchdogText.DisarmReply(nonce, disarmed, watchdog);
+                LogWatchdogCommand("OFF", pid, disarmed.Kind, 0, 0, disarmed.Cleared, disarmed.Remaining, watchdog.Count);
+            }
+            else
+            {
+                MachineStatus state;
+                try
+                {
+                    state = query();
+                    cancellation.ThrowIfCancellationRequested();
+                    // Validate before arming: a missing or malformed inventory never becomes a watch target.
+                    if (state == null || state.Processes == null) throw new InvalidDataException("Status inventory missing.");
+                    state.Validate();
+                }
+                catch (OperationCanceledException) { throw; }
+                catch (Exception ex) when (!cancellation.IsCancellationRequested && IsExpectedQueryFailure(ex))
+                {
+                    reply = WatchdogText.SlaveFailureReply(nonce, QueryFailureReason(ex));
+                    LogWatchdogCommand("ON", pid, WatchdogText.KindSlaveFailure + ":" + ex.GetType().Name, 0, 0, 0,
+                        watchdog.Count, watchdog.Count);
+                    Need(IsWatchdogReply(reply, nonce));
+                    return reply;
+                }
+                var armed = watchdog.Arm(WatchdogTarget.CandidatesFrom(state.Processes), pid, nowUtc);
+                reply = WatchdogText.ArmReply(nonce, armed, watchdog, nowUtc.ToLocalTime());
+                LogWatchdogCommand("ON", pid, armed.Kind, armed.Added.Length, armed.AlreadyWatched.Length, 0, armed.Total, armed.Total);
+            }
+            Need(IsWatchdogReply(reply, nonce));
+            return reply;
+        }
+
+        private static void LogWatchdogCommand(string action, int? pid, string result, int added, int already, int cleared,
+            int remaining, int total)
+        {
+            var log = commandLog;
+            if (log == null) return;
+            log.Write("INFO", "WATCHDOG_COMMAND", AuditLog.Field("action", action), AuditLog.Field("pid", pid ?? 0),
+                AuditLog.Field("result", result), AuditLog.Field("added", added), AuditLog.Field("already", already),
+                AuditLog.Field("cleared", cleared), AuditLog.Field("remaining", remaining), AuditLog.Field("total", total),
+                AuditLog.Field("delivery_verified", false));
+        }
+
         private static bool IsExpectedQueryFailure(Exception exception)
         {
             return exception is TimeoutException || exception is InvalidDataException || exception is IOException ||
@@ -129,13 +216,15 @@ namespace RemoteMonitorMaster
             string body;
             switch (command)
             {
-                case "help": body = "허용 명령: help | help help | help total status | help pwrsi | total status | pwrsi"; break;
+                case "help": body = "허용 명령: help | help help | help total status | help pwrsi | help watchdog | total status | pwrsi | " +
+                    "watchdog on | watchdog on <PID> | watchdog off | watchdog off <PID>"; break;
                 case "help help": body = "help는 허용 명령을 표시합니다. help 다음에 명령을 쓰면 해당 설명을 표시합니다."; break;
                 case "help total status": body = "total status는 Slave 시각, 가동 시간, RAM, 버전과 최대 8개 프로세스의 이름·PID·CPU·RAM·경과 시간을 표시합니다. CPU는 시뮬레이션 진행률이 아닙니다."; break;
+                case "help watchdog": return "HELP " + nonce + "\r\n" + WatchdogText.HelpBody() + "\r\n" + WatchdogText.HelpUsage();
                 case "help pwrsi": body = "pwrsi는 모든 PowerSI를 한 번 수집합니다. 처음에는 수집된 Output 전체, 이후에는 마지막 전송 이후 추가분을 보냅니다. 변동이 없으면 알립니다. 조회·답장 준비는 최대 120초이며, 긴 답장은 여러 메시지로 나뉩니다. 다음 Master Ready까지 기다리세요. 답장 머리글의 PWRSI REPORT 번호는 Master Ready의 대괄호 번호와 같은 숫자이며, 같은 보고서의 PART는 001/003처럼 이어집니다."; break;
                 default: throw new MonitorException("COMMAND_INVALID", "Unknown read-only command.");
             }
-            return "HELP " + nonce + "\r\n" + body + "\r\n명령은 표시된 소문자로 입력하세요. pwrsi에는 공백이 없고 total status의 단어 사이는 한 칸입니다. 바깥 공백은 허용하며 답장을 확인한 뒤 다음 명령을 보내세요.";
+            return "HELP " + nonce + "\r\n" + body + "\r\n명령은 표시된 소문자로 입력하세요. pwrsi에는 공백이 없고 total status와 watchdog on/off <PID>의 단어 사이는 한 칸입니다. 바깥 공백은 허용하며 답장을 확인한 뒤 다음 명령을 보내세요.";
         }
 
         internal static string FormatStatus(string command, string nonce, MachineStatus state)
@@ -288,7 +377,19 @@ namespace RemoteMonitorMaster
         internal static string[] FormatQueryFailure(string command, string nonce, Exception exception)
         {
             Need((command == "total status" || command == "pwrsi") && Protocol.IsDiagnosticMarker("DRAFT", nonce));
-            var reason = exception is OutputTooLargeException ? "전체 답장이 안전한 처리 한도(32 Mi 문자)를 넘었습니다. 내용을 잘라 보내거나 전송 이력을 갱신하지 않았습니다." :
+            var reason = QueryFailureReason(exception);
+            if (command == "pwrsi")
+                return PackReport(nonce, new[] { new ReportBlock(string.Empty, string.Empty,
+                    new[] { "PowerSI 보고서를 받지 못했습니다.", reason, "메신저 대상이 그대로일 때 새 요청으로 다시 확인할 수 있습니다." }) });
+            var text = "STATUS ERROR " + nonce + " | " + reason;
+            Need(IsReply(text, command, nonce));
+            return new[] { text };
+        }
+
+        // Shared Korean reason text (no header) for total status/pwrsi failure replies and the watchdog Slave-failure reply.
+        private static string QueryFailureReason(Exception exception)
+        {
+            return exception is OutputTooLargeException ? "전체 답장이 안전한 처리 한도(32 Mi 문자)를 넘었습니다. 내용을 잘라 보내거나 전송 이력을 갱신하지 않았습니다." :
                 exception is LinkVersionMismatchException mismatch ? "Slave와 통신 규약이 다릅니다 (Master " + LinkVersion.Value +
                     " / 받은 값 " + mismatch.ActualVersion + "). 프로토콜 " + LinkVersion.Value + "을 지원하는 Slave 버전으로 맞추세요." :
                 exception is TimeoutException ? "Slave 응답 시간이 초과되었습니다. 자동 재시도하지 않습니다. Slave 화면의 수집 진행 표시를 확인한 뒤 다시 요청하세요." :
@@ -296,12 +397,6 @@ namespace RemoteMonitorMaster
                 exception is AuthenticationException ? "Slave 연결 인증을 확인하지 못했습니다. Slave를 다시 시작하고 새 연결파일을 Master에서 여세요." :
                 exception is IOException || exception is SocketException ? "Slave 연결에서 응답을 받지 못했습니다. Slave 화면의 LISTENING 표시와 IP·방화벽을 확인하세요." :
                 "Slave 상태 조회에 실패했습니다.";
-            if (command == "pwrsi")
-                return PackReport(nonce, new[] { new ReportBlock(string.Empty, string.Empty,
-                    new[] { "PowerSI 보고서를 받지 못했습니다.", reason, "메신저 대상이 그대로일 때 새 요청으로 다시 확인할 수 있습니다." }) });
-            var text = "STATUS ERROR " + nonce + " | " + reason;
-            Need(IsReply(text, command, nonce));
-            return new[] { text };
         }
 
         private static string[] PackReport(string nonce, IEnumerable<ReportBlock> blocks, Action checkPreparation = null)
@@ -506,9 +601,20 @@ namespace RemoteMonitorMaster
                 text.Length > PcStatusReport.MaxPhoneLength || !SafeReplyText(text)) return false;
             if (command.StartsWith("help", StringComparison.Ordinal)) return text == Help(command, nonce);
             if (command == "pwrsi") return IsReportPart(text, nonce);
+            if (WatchdogCommand.IsWatchdogCommand(command)) return IsWatchdogReply(text, nonce);
             if (text.StartsWith("STATUS ERROR " + nonce + " | ", StringComparison.Ordinal)) return text.IndexOf('\r') < 0 && text.IndexOf('\n') < 0;
             return text.StartsWith("TOTAL STATUS " + nonce + "\r\n", StringComparison.Ordinal) &&
                 text.EndsWith("\r\n진행률: 제공 안 함 (PROGRESS N/A)", StringComparison.Ordinal);
+        }
+
+        // watchdog on/off: exactly one part, "WATCHDOG <nonce>" on the first line and a non-empty body after it.
+        private static bool IsWatchdogReply(string text, string nonce)
+        {
+            if (!Protocol.IsDiagnosticMarker("DRAFT", nonce) || !SafeReplyText(text) || text.Length > PcStatusReport.MaxPhoneLength)
+                return false;
+            var header = WatchdogText.ReplyHeader(nonce) + "\r\n";
+            return text.Length > header.Length && text.StartsWith(header, StringComparison.Ordinal) &&
+                text.Substring(header.Length).Trim().Length > 0;
         }
 
         internal static bool IsReplyPart(string text, string command, string nonce, int index, int count)
@@ -519,6 +625,7 @@ namespace RemoteMonitorMaster
 
         internal static void RunSelfTest(string directory)
         {
+            RunWatchdogSelfTest(directory); // Pure first: no Win32, UIA or network.
             const string nonce = "D234567";
             int Occurrences(string text, string value)
             {
@@ -699,7 +806,7 @@ namespace RemoteMonitorMaster
 
             // Help never connects to the endpoint. It still needs an exact, locally approved one-use send consent.
             var endpoint = new SlaveEndpoint(System.Net.IPAddress.Loopback, 1, new string('0', 64), Convert.ToBase64String(new byte[32]));
-            foreach (var command in Commands.Where(c => c.StartsWith("help", StringComparison.Ordinal)))
+            foreach (var command in Commands.Concat(new[] { WatchdogText.HelpWatchdog }).Where(c => c.StartsWith("help", StringComparison.Ordinal)))
             {
                 var consent = new SupervisedSendTest.Consent(nonce, true, true, endpoint, null, true);
                 Need(consent.TryClaimRoundTrip()); consent.BindCommand(command);
@@ -712,6 +819,193 @@ namespace RemoteMonitorMaster
             Need(cancelled.TryClaimRoundTrip()); cancelled.BindCommand("help"); cancelled.Cancel();
             try { cancelled.PrepareReply(); throw new InvalidOperationException("Cancelled command prepared a reply."); }
             catch (MonitorException) { }
+        }
+
+        // Watchdog admission, help, reply shape, preparation and logging. A fake query stands in for the Slave: the
+        // loopback TLS round trip of watchdog on/off is covered by MasterHubForm.RunSelfTest on Windows.
+        private static void RunWatchdogSelfTest(string directory)
+        {
+            const string nonce = "D234567";
+            void Expect(bool condition, string reason)
+            { if (!condition) throw new InvalidOperationException("Watchdog command self-test failed: " + reason + "."); }
+            void Throws<T>(Action action, string reason, Func<T, bool> check = null) where T : Exception
+            {
+                try { action(); }
+                catch (T ex) { Expect(check == null || check(ex), reason); return; }
+                throw new InvalidOperationException("Watchdog command self-test failed: " + reason + ".");
+            }
+
+            foreach (var command in new[] { "watchdog on", "watchdog off", "watchdog on 1234", "watchdog off 7", "help watchdog",
+                "watchdog on 2147483647" })
+                Expect(IsCommand(command), "ACCEPT " + command);
+            foreach (var command in new[] { null, "", "watchdog", "watchdog on ", " watchdog on", "watchdog  on", "watchdog on 0",
+                "watchdog on 01", "watchdog on 2147483648", "Watchdog on", "WATCHDOG OFF", "watchdog on\u00a012", "watchdog on 12 13",
+                "watchdog status", "help watchdog ", "help  watchdog", "Help watchdog", "watchdog on\r\n", "watchdog off -1" })
+                Expect(!IsCommand(command), "REJECT");
+
+            ProbeNode Observed(string name)
+            {
+                var node = new ProbeNode { Identity = new ElementIdentity("watchdog-node", 1, "", "ControlType.Text", "", "fixture", "",
+                    name.Length, TokenStore.Hash(name), "<redacted>") };
+                ObserveName(node, name);
+                return node;
+            }
+            string matched;
+            var exact = Observed("watchdog on 1234");
+            Expect(exact.CommandNameFormat == "EXACT" && exact.PlainCommand == "watchdog on 1234" &&
+                TryMatchNode(exact, out matched) && matched == "watchdog on 1234", "NAME_EXACT");
+            var padded = Observed(" watchdog off 7\u00a0");
+            Expect(padded.CommandNameFormat == "OUTER_SPACES" && TryMatchNode(padded, out matched) && matched == "watchdog off 7",
+                "NAME_OUTER_SPACES");
+            Expect(Observed("help watchdog").CommandNameFormat == "EXACT", "NAME_HELP");
+            foreach (var name in new[] { "Watchdog on", "WATCHDOG OFF 12", "watchdog ON 5" })
+            {
+                var node = Observed(name);
+                Expect(node.CommandNameFormat == "CASE_MISMATCH" && node.PlainCommand == null && !TryMatchNode(node, out matched),
+                    "NAME_CASE_MISMATCH");
+            }
+            Expect(Observed("watchdog on 01").CommandNameFormat == "UNSUPPORTED" &&
+                Observed(" watchdog on 0 ").CommandNameFormat == "UNSUPPORTED_EDGE_SPACES" &&
+                Observed("watchdog on " + new string('1', 60)).CommandNameFormat == "LONG_NAME", "NAME_REJECTED_FORMATS");
+
+            var help = Help(WatchdogText.HelpWatchdog, nonce);
+            var helpLines = help.Split(new[] { "\r\n" }, StringSplitOptions.None);
+            Expect(helpLines.Length == 3 && helpLines[0] == "HELP " + nonce && helpLines[1] == WatchdogText.HelpBody() &&
+                helpLines[2] == WatchdogText.HelpUsage() && IsReply(help, WatchdogText.HelpWatchdog, nonce) &&
+                !IsReply(help, "help", nonce) && IsReplyPart(help, WatchdogText.HelpWatchdog, nonce, 1, 1), "HELP_WATCHDOG");
+            var plainHelp = Help("help", nonce);
+            Expect(plainHelp.Contains("help watchdog") && plainHelp.Contains("watchdog on <PID>") &&
+                plainHelp.Contains("watchdog off <PID>") && Help("help pwrsi", nonce).Contains("watchdog on/off"), "HELP_LISTS_WATCHDOG");
+
+            var empty = new WatchdogState(TimeSpan.FromMinutes(30));
+            var sample = WatchdogText.DisarmReply(nonce, empty.Disarm(null), empty);
+            Expect(IsReply(sample, "watchdog off", nonce) && IsReply(sample, "watchdog on 42", nonce) &&
+                IsReplyPart(sample, "watchdog off", nonce, 1, 1) && !IsReplyPart(sample, "watchdog off", nonce, 1, 2) &&
+                !IsReplyPart(sample, "watchdog off", nonce, 2, 2), "REPLY_SHAPE");
+            var notice = WatchdogText.WarningNotice(nonce, WatchdogText.KindSlaveFailure, "self-test", empty, DateTime.Now)[0];
+            foreach (var tampered in new[] { null, "", sample.Replace("WATCHDOG " + nonce, "WATCHDOG D345678"),
+                sample.Replace("WATCHDOG " + nonce, "watchdog " + nonce), "WATCHDOG " + nonce, "WATCHDOG " + nonce + "\r\n",
+                "WATCHDOG " + nonce + "\r\n  ", " " + sample, "WATCHDOG " + nonce + " \r\n본문", sample + "\u0001",
+                sample + new string('x', PcStatusReport.MaxPhoneLength), notice, "STATUS ERROR " + nonce + " | x" })
+                Expect(!IsReply(tampered, "watchdog on", nonce), "REPLY_TAMPERED");
+            Expect(!IsReply(sample, "watchdog off", "D345678") && !IsReply(sample, "watchdog on 0", nonce) &&
+                !IsReply(sample, WatchdogText.HelpWatchdog, nonce) && !IsReply(sample, "total status", nonce) &&
+                !IsReply(sample, "pwrsi", nonce), "REPLY_WRONG_COMMAND_OR_NONCE");
+
+            var t0 = new DateTime(2026, 9, 23, 12, 0, 0, DateTimeKind.Utc);
+            var start = t0.AddHours(-3).Ticks;
+            var queries = 0;
+            MachineStatus Status(params ProcessState[] items)
+            {
+                return new MachineStatus { Version = LinkVersion.Value, LocalTime = new DateTime(2026, 9, 23, 21, 0, 0),
+                    UptimeMinutes = 1, AvailableMiB = 1024, TotalMiB = 2048,
+                    Processes = new ProcessInventory { SessionId = 1, Items = items } };
+            }
+            ProcessState Item(int pid, string fullName)
+            {
+                return new ProcessState { Pid = pid, Name = ProcessInventory.NormalizeName(fullName), FullName = fullName,
+                    StartUtcTicks = start + pid };
+            }
+            var running = Status(Item(5, "notepad"), Item(101, "PowerSI"), Item(202, "pwrsi"));
+            Func<MachineStatus> Returns(MachineStatus value) { return () => { queries++; return value; }; }
+            Func<MachineStatus> Fails(Exception exception) { return () => { queries++; throw exception; }; }
+            Func<MachineStatus> Forbidden = () => { throw new InvalidOperationException("watchdog off queried the Slave"); };
+            var state = new WatchdogState(TimeSpan.FromMinutes(30));
+            var audit = new AuditLog(directory);
+            try
+            {
+                string Prepare(bool on, int? pid, Func<MachineStatus> query)
+                { return PrepareWatchdogReply(nonce, on, pid, state, query, CancellationToken.None, t0); }
+                using (UseCommandLog(audit))
+                {
+                    Throws<MonitorException>(() => PrepareWatchdogReply(nonce, true, null, null, Returns(running), CancellationToken.None, t0),
+                        "STATE_REQUIRED", ex => ex.ReasonCode == "WATCHDOG_STATE_UNAVAILABLE" && queries == 0);
+                    Throws<OperationCanceledException>(() => PrepareWatchdogReply(nonce, true, null, state, Returns(running),
+                        new CancellationToken(true), t0), "CANCELLED_BEFORE_QUERY", ex => queries == 0 && state.Count == 0);
+
+                    var armed = Prepare(true, null, Returns(running));
+                    Expect(queries == 1 && state.Count == 2 && IsReply(armed, "watchdog on", nonce) &&
+                        armed.StartsWith("WATCHDOG " + nonce + "\r\n감시 시작: PowerSI (PID 101), pwrsi (PID 202)\r\n", StringComparison.Ordinal) &&
+                        !armed.Contains("notepad"), "ARM_ALL");
+                    var again = Prepare(true, 101, Returns(running));
+                    Expect(queries == 2 && state.Count == 2 && again.Contains("이미 감시 중입니다: PowerSI (PID 101)"), "ARM_ALREADY");
+                    var missing = Prepare(true, 999, Returns(running));
+                    Expect(queries == 3 && state.Count == 2 && missing.Contains("PID 999 PowerSI를 찾지 못해"), "ARM_PID_NOT_FOUND");
+                    var none = PrepareWatchdogReply(nonce, true, null, empty, Returns(Status(Item(5, "notepad"))), CancellationToken.None, t0);
+                    Expect(empty.Count == 0 && none.Contains("실행 중인 PowerSI를 찾지 못해"), "ARM_NO_POWERSI");
+
+                    var timeout = Prepare(true, null, Fails(new TimeoutException()));
+                    Expect(timeout == WatchdogText.SlaveFailureReply(nonce, QueryFailureReason(new TimeoutException())) &&
+                        IsReply(timeout, "watchdog on", nonce) && state.Count == 2, "SLAVE_TIMEOUT");
+                    var version = Prepare(true, 7, Fails(new LinkVersionMismatchException("0.1.58")));
+                    Expect(version.Contains("0.1.58") && version.Contains(LinkVersion.Value) && state.Count == 2, "SLAVE_VERSION");
+                    var socket = Prepare(true, null, Fails(new SocketException()));
+                    Expect(socket == WatchdogText.SlaveFailureReply(nonce, QueryFailureReason(new SocketException())), "SLAVE_SOCKET");
+                    var invalidReason = WatchdogText.SlaveFailureReply(nonce, QueryFailureReason(new InvalidDataException()));
+                    var fresh = new WatchdogState(TimeSpan.FromMinutes(30));
+                    Expect(PrepareWatchdogReply(nonce, true, null, fresh, Returns(new MachineStatus { Version = LinkVersion.Value,
+                        LocalTime = running.LocalTime, TotalMiB = 1 }), CancellationToken.None, t0) == invalidReason && fresh.Count == 0,
+                        "SLAVE_INVENTORY_MISSING");
+                    Expect(PrepareWatchdogReply(nonce, true, null, fresh, Returns(Status(Item(202, "pwrsi"), Item(101, "PowerSI"))),
+                        CancellationToken.None, t0) == invalidReason && fresh.Count == 0, "SLAVE_INVENTORY_UNSORTED_NOT_ARMED");
+                    Throws<InvalidOperationException>(() => Prepare(true, null, Fails(new InvalidOperationException())),
+                        "UNEXPECTED_FAILURE_PROPAGATES", ex => state.Count == 2);
+
+                    var queriesBeforeOff = queries;
+                    var pidNotWatched = Prepare(false, 555, Forbidden);
+                    Expect(pidNotWatched.Contains("PID 555는 감시 대상이 아닙니다") && state.Count == 2, "DISARM_PID_NOT_WATCHED");
+                    var one = Prepare(false, 101, Forbidden);
+                    Expect(one.Contains("PowerSI (PID 101) 감시를 해제했습니다.") && state.Count == 1 && IsReply(one, "watchdog off 101", nonce),
+                        "DISARM_ONE");
+                    var all = Prepare(false, null, Forbidden);
+                    Expect(all.Contains("감시 1개를 모두 해제했습니다") && state.Count == 0, "DISARM_ALL");
+                    Expect(Prepare(false, null, Forbidden).Contains("이미 꺼져 있습니다") && queries == queriesBeforeOff, "DISARM_NOTHING");
+                }
+                Prepare(false, null, Forbidden); // Outside the scope: no record.
+                audit.Dispose();
+                var text = File.ReadAllText(audit.FilePath);
+                Expect(Occurrences(text, "code=\"WATCHDOG_COMMAND\"") == 13, "LOG_ONE_RECORD_PER_COMMAND");
+                foreach (var field in new[] { "action=\"ON\"\tpid=\"0\"\tresult=\"ARMED\"\tadded=\"2\"\talready=\"0\"\tcleared=\"0\"\tremaining=\"2\"\ttotal=\"2\"\tdelivery_verified=\"False\"",
+                    "result=\"ALREADY_WATCHED\"\tadded=\"0\"\talready=\"1\"", "pid=\"999\"\tresult=\"PID_NOT_FOUND\"",
+                    "result=\"NO_POWERSI\"", "result=\"SLAVE_FAILURE:TimeoutException\"", "result=\"SLAVE_FAILURE:LinkVersionMismatchException\"",
+                    "result=\"SLAVE_FAILURE:InvalidDataException\"", "action=\"OFF\"\tpid=\"101\"\tresult=\"CLEARED_ONE\"\tadded=\"0\"\talready=\"0\"\tcleared=\"1\"\tremaining=\"1\"\ttotal=\"1\"",
+                    "result=\"PID_NOT_WATCHED\"", "result=\"CLEARED_ALL\"", "result=\"NOTHING_WATCHED\"" })
+                    Expect(text.Contains(field), "LOG_FIELDS");
+                Expect(!text.Contains("PowerSI") && !text.Contains("pwrsi") && !text.Contains("notepad") && !text.Contains("감시") &&
+                    !text.Contains(nonce), "LOG_NO_NAMES_OR_TEXT");
+            }
+            finally { audit.Dispose(); File.Delete(audit.FilePath); }
+
+            // The consent path: watchdog off never connects, so the loopback endpoint below is never dialled.
+            var endpoint = new SlaveEndpoint(System.Net.IPAddress.Loopback, 1, new string('0', 64), Convert.ToBase64String(new byte[32]));
+            var watched = new WatchdogState(TimeSpan.FromMinutes(30));
+            PrepareWatchdogReply(nonce, true, null, watched, () => running, CancellationToken.None, t0);
+            var consent = new SupervisedSendTest.Consent(nonce, true, true, endpoint, null, true);
+            Expect(consent.TryClaimRoundTrip(), "CONSENT_CLAIM");
+            consent.AttachWatchdog(watched);
+            consent.BindCommand("watchdog off 202");
+            var reply = consent.PrepareReply();
+            Expect(ReferenceEquals(consent.Watchdog, watched) && watched.Count == 1 && IsReply(reply, "watchdog off 202", nonce) &&
+                reply.Contains("pwrsi (PID 202) 감시를 해제했습니다.") && consent.IsAuthorizedReply(reply) &&
+                !consent.IsAuthorizedReply(reply + " ") && !consent.IsAuthorizedReply(sample) && consent.TryConsume(reply) &&
+                !consent.TryConsume(reply), "CONSENT_EXACT_ONCE");
+            consent.Cancel();
+            var detached = new SupervisedSendTest.Consent(nonce, true, true, endpoint, null, true);
+            Expect(detached.TryClaimRoundTrip() && detached.Watchdog == null, "CONSENT_DETACHED_CLAIM");
+            detached.BindCommand("watchdog off");
+            Throws<MonitorException>(() => detached.PrepareReply(), "CONSENT_STATE_REQUIRED",
+                ex => ex.ReasonCode == "WATCHDOG_STATE_UNAVAILABLE" && watched.Count == 1);
+            detached.Cancel();
+            Throws<MonitorException>(() => new SupervisedSendTest.Consent(nonce, true, true).AttachWatchdog(watched), "ATTACH_PLAIN_ONLY");
+            Throws<MonitorException>(() => new SupervisedSendTest.Consent(nonce, true, true, endpoint, null, true).AttachWatchdog(null),
+                "ATTACH_NULL");
+        }
+
+        private static int Occurrences(string text, string value)
+        {
+            var count = 0;
+            for (var offset = 0; (offset = text.IndexOf(value, offset, StringComparison.Ordinal)) >= 0; offset += value.Length) count++;
+            return count;
         }
 
         private static void Need(bool condition)
