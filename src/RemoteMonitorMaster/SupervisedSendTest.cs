@@ -52,6 +52,15 @@ namespace RemoteMonitorMaster
             private int confirmedReplyParts, outputCommitted;
             private Consent progressNotice;
             private bool isNotice;
+            // Watchdog wiring: the session attaches its WatchdogState so a watchdog command reply can arm/disarm it,
+            // and a watchdog notice consent authorizes exactly one prepared WATCHDOG text (one use, like Ready).
+            private bool isWatchdogNotice;
+            internal WatchdogState Watchdog { get; private set; }
+            internal void AttachWatchdog(WatchdogState state)
+            {
+                Need(state != null && IsPlainCommands && !isNotice, "COMMAND_CONSENT_INVALID");
+                Watchdog = state;
+            }
             internal bool IsOperational { get { return IsPlainCommands || isNotice; } }
             internal string NoticeText { get { Need(isNotice, "SEND_NOTICE_REQUIRED"); return preparedReply; } }
             private int replyPartIndex = 1, replyPartCount = 1;
@@ -102,6 +111,13 @@ namespace RemoteMonitorMaster
                 Need(text == ReadyNotice || text == PowerSiBusyNotice || text == StatusBusyNotice, "SEND_NOTICE_INVALID");
                 return new Consent(marker, true) { isNotice = true,
                     preparedReply = text == ReadyNotice ? ReadyText(marker) : text };
+            }
+
+            internal static Consent ForWatchdogNotice(string marker, string text)
+            {
+                Need(IsValidMarker(marker) && text != null && text.Length <= 1400 && WatchdogText.IsNotice(text) &&
+                    text.IndexOf(marker, StringComparison.Ordinal) >= 0, "SEND_NOTICE_INVALID");
+                return new Consent(marker, true) { isNotice = true, isWatchdogNotice = true, preparedReply = text };
             }
 
             internal Consent CreateProgressNotice(string text)
@@ -194,7 +210,7 @@ namespace RemoteMonitorMaster
             internal bool IsAuthorizedReply(string text)
             {
                 return text != null && text == Volatile.Read(ref preparedReply) &&
-                    (isNotice ? text == ReadyText(Marker) || text == PowerSiBusyNotice || text == StatusBusyNotice :
+                    (isNotice ? (isWatchdogNotice ? text == Volatile.Read(ref preparedReply) : text == ReadyText(Marker) || text == PowerSiBusyNotice || text == StatusBusyNotice) :
                     IsPlainCommands ? ReadOnlyCommands.IsReplyPart(text, Volatile.Read(ref command), Marker, replyPartIndex, replyPartCount) :
                         IsSlaveStatus ? PcStatusReport.IsSlaveReply(text, Marker, nextMarker) :
                         IsPcStatus ? PcStatusReport.IsReply(text, Marker, nextMarker) : IsValidMarker(text));
