@@ -18,8 +18,39 @@ namespace RemoteMonitorMaster
         private SupervisedSendTest.Consent active;
         private SupervisedSendTest.Consent activeNotice;
         private int cancelled, claimed, completedRounds, attempts;
+        private CancellationTokenSource watchdogQuery; // The in-flight periodic check; Cancel() revokes it.
         // Consecutive rounds that ended without a clean completion and without any input; the third one ends the session.
         internal const int AbortResumeLimit = 3;
+        // A watchdog notice rejected before any input is offered again at an idle yield no sooner than this, so a
+        // persistent pre-input rejection cannot re-activate the chat in a tight loop. A due check still yields at once.
+        internal static readonly TimeSpan WatchdogNoticeRetryDelay = TimeSpan.FromSeconds(30);
+        internal static readonly TimeSpan WatchdogNoticeRetryCeiling = TimeSpan.FromMinutes(10);
+
+        // Consecutive pre-input deferrals back off 30 s, 60 s, 120 s ... up to 10 minutes, so a persistently blocked
+        // notice (for example a busy Master PC) does not re-arm the idle gate every half minute; a clean send resets it.
+        internal static TimeSpan WatchdogNoticeRetryAfter(int consecutiveDeferrals)
+        {
+            if (consecutiveDeferrals <= 1) return WatchdogNoticeRetryDelay;
+            var ticks = WatchdogNoticeRetryDelay.Ticks;
+            for (var i = 1; i < consecutiveDeferrals && ticks < WatchdogNoticeRetryCeiling.Ticks; i++) ticks *= 2;
+            return ticks < WatchdogNoticeRetryCeiling.Ticks ? TimeSpan.FromTicks(ticks) : WatchdogNoticeRetryCeiling;
+        }
+
+        // Session-owned watch list (plain-command sessions). Commands arm/disarm it through the attached consent;
+        // the session runs the periodic check at an idle yield of the command wait. It ends with the session.
+        internal WatchdogState Watchdog { get; }
+        // WatchdogState reads its schedule under its own lock; safe from the UI thread.
+        internal string WatchdogSummary { get { return Watchdog.Summary(DateTime.Now); } }
+
+        // One queued WATCHDOG notice: a fresh code per notice, parts sent in order and never resent once clean.
+        private sealed class QueuedNotice
+        {
+            internal readonly string Kind, RequestMarker, Marker;
+            internal readonly string[] Parts;
+            internal int Sent;
+            internal QueuedNotice(string kind, string requestMarker, string[] parts)
+            { Kind = kind; RequestMarker = requestMarker; Marker = "D" + requestMarker.Substring(1); Parts = parts; }
+        }
 
         internal StatusSession(string firstMarker, bool confirmed, SlaveEndpoint slave)
             : this(firstMarker, confirmed, slave, false) { }
@@ -30,6 +61,8 @@ namespace RemoteMonitorMaster
             this.firstMarker = firstMarker;
             this.slave = slave;
             this.plainCommands = plainCommands;
+            // Run applies the saved 30/60-minute interval; construction stays free of file access.
+            Watchdog = new WatchdogState(TimeSpan.FromMinutes(WatchdogState.DefaultIntervalMinutes));
         }
 
         internal bool Cancelled { get { return Volatile.Read(ref cancelled) != 0; } }
@@ -46,6 +79,7 @@ namespace RemoteMonitorMaster
             Interlocked.Exchange(ref cancelled, 1);
             Volatile.Read(ref active)?.Cancel();
             Volatile.Read(ref activeNotice)?.Cancel();
+            try { Volatile.Read(ref watchdogQuery)?.Cancel(); } catch (ObjectDisposedException) { }
         }
 
         private bool TryClaim() { return !Cancelled && Interlocked.CompareExchange(ref claimed, 1, 0) == 0; }
@@ -62,6 +96,7 @@ namespace RemoteMonitorMaster
                 Need(!Cancelled && Volatile.Read(ref claimed) == 1 && active == null, "STATUS_SESSION_CANCELLED_OR_BUSY");
                 var consent = new SupervisedSendTest.Consent("D" + marker.Substring(1), true, true, slave,
                     plainCommands ? null : next, plainCommands);
+                if (plainCommands) consent.AttachWatchdog(Watchdog); // watchdog on/off replies arm/disarm this session's list.
                 Volatile.Write(ref active, consent);
                 // Cancellation can arrive between the initial check and publication.
                 if (Cancelled) { consent.Cancel(); throw new MonitorException("STATUS_SESSION_CANCELLED", "Status session stopped."); }
@@ -118,10 +153,65 @@ namespace RemoteMonitorMaster
             }
         }
 
+        // Retires a request whose idle wait was handed back for a watchdog task: nothing was observed, prepared or
+        // typed, so it is neither a completed round nor an abort. The caller re-enters with the same code and baseline.
+        private bool TryReleaseYieldedRequest(SupervisedSendTest.Consent consent, RoundTripTest.Outcome outcome)
+        {
+            lock (sync)
+            {
+                if (Cancelled || !ReferenceEquals(active, consent) || outcome == null || !outcome.Yielded ||
+                    outcome.CleanCompletion || outcome.Send != null || Flags(consent) != 0) return false;
+                attempts |= Flags(consent);
+                Volatile.Write(ref active, null);
+                return true;
+            }
+        }
+
+        // Pure rule for one WATCHDOG notice part. Only a clean guarded send advances; a part rejected before any
+        // cursor move, write or click stays queued for a later idle yield (not a resend: nothing was typed); any
+        // attempted or contradictory send is uncertain and ends the session without retry.
+        internal static string DecideAfterNotice(bool clean, bool inputAttempted)
+        {
+            if (clean && inputAttempted) return "SENT";
+            if (!clean && !inputAttempted) return "DEFERRED";
+            return "STATUS_WATCHDOG_NOTICE_UNCERTAIN";
+        }
+
+        // A notice never goes out while a command is waiting after the current Ready: that command is handled first.
+        // waitBaseline is the pre-Ready baseline of the current wait; the Ready row is re-bound on this snapshot.
+        internal static void RequireNoPendingCommand(ReceiveProbe.Baseline waitBaseline, ProbeSnapshot snapshot, AuditLog log = null)
+        {
+            Need(waitBaseline != null && waitBaseline.PlainCommands && waitBaseline.ReadyRow < 0 && snapshot != null,
+                "WATCHDOG_NOTICE_BASELINE_REQUIRED");
+            var bound = ReceiveProbe.BindReadyBoundary(waitBaseline, snapshot, log);
+            Need(bound != null, "WATCHDOG_NOTICE_READY_NOT_BOUND");
+            bool blocked;
+            var candidate = ReceiveProbe.Evaluate(bound, snapshot, log, out blocked);
+            Need(candidate == null && !blocked, "WATCHDOG_NOTICE_COMMAND_PENDING");
+        }
+
+        // Phone-facing reason for a Slave failure streak; a code, never exception text.
+        internal static string CheckFailureCode(Exception exception)
+        {
+            if (exception is TimeoutException) return "SLAVE_TIMEOUT";
+            if (exception is System.Security.Authentication.AuthenticationException) return "SLAVE_AUTHENTICATION";
+            if (exception is InvalidDataException) return "SLAVE_RESPONSE_INVALID";
+            if (exception is IOException || exception is System.Net.Sockets.SocketException) return "SLAVE_CONNECTION";
+            return "SLAVE_QUERY_FAILED";
+        }
+
+        private static bool IsExpectedCheckFailure(Exception exception)
+        {
+            return exception is MonitorException || exception is TimeoutException || exception is InvalidDataException ||
+                exception is IOException || exception is System.Net.Sockets.SocketException ||
+                exception is System.Security.Authentication.AuthenticationException || exception is OperationCanceledException;
+        }
+
         internal string Run(IntPtr window, AuditLog log, Func<bool> stop, Action<int, string, string> progress)
         {
             var clock = Stopwatch.StartNew();
             string last = null;
+            var pendingNotices = new List<QueuedNotice>(); // Watchdog notices prepared by a check and not yet sent cleanly.
             try
             {
                 Need(TryClaim(), "STATUS_SESSION_ALREADY_USED_OR_CANCELLED");
@@ -191,18 +281,164 @@ namespace RemoteMonitorMaster
                     lock (sync) { attempts |= Flags(notice); Volatile.Write(ref activeNotice, null); }
                     notice.Cancel();
                     log.Write("INFO", "MASTER_NOTICE_SENT", AuditLog.Field("stage", "READY"), AuditLog.Field("delivery_verified", false));
+                    progress(CompletedRounds, "WATCHDOG:" + Watchdog.Summary(DateTime.Now), requestMarker);
                 }
+                // A later notice attempt waits at least WatchdogNoticeRetryDelay after a deferral; a due check yields at once.
+                var noticeRetryUtc = DateTime.MinValue;
+                var noticeDeferrals = 0; // Consecutive deferrals since the last clean notice part.
+                void QueueNotice(string kind, Func<string, string[]> build)
+                {
+                    // Same allocation as a request code, so a notice never shares a D code with any Ready/reply of this session.
+                    var requestMarker = Allocate(store, allocated, "M" + Protocol.CreateDiagnosticDigits());
+                    var parts = build("D" + requestMarker.Substring(1));
+                    if (parts == null || parts.Length == 0) return;
+                    pendingNotices.Add(new QueuedNotice(kind, requestMarker, parts));
+                    log.Write("INFO", "WATCHDOG_NOTICE_QUEUED", AuditLog.Field("kind", kind), AuditLog.Field("parts", parts.Length),
+                        AuditLog.Field("payload_characters", parts.Sum(part => (long)part.Length)),
+                        AuditLog.Field("queued_notices", pendingNotices.Count));
+                }
+                // One periodic check. A failed collection is recorded and watching continues; it never ends the session.
+                // Only completion markers of the returned report are evaluated: PowerSI Output history is never read or advanced.
+                void RunWatchdogCheck(int checkRound, string waitMarker)
+                {
+                    Alive();
+                    progress(checkRound, "WATCHDOG_CHECKING", waitMarker);
+                    int entries, intervalMinutes, streak;
+                    DateTime? due;
+                    Watchdog.ReadSchedule(out entries, out due, out intervalMinutes, out streak);
+                    log.Write("INFO", "WATCHDOG_CHECK_BEGIN", AuditLog.Field("entries", entries),
+                        AuditLog.Field("interval_min", intervalMinutes), AuditLog.Field("failure_streak", streak));
+                    PowerSiReport report = null;
+                    Alive(); // A stop or target change before the query is never a failed check.
+                    var query = new CancellationTokenSource();
+                    Volatile.Write(ref watchdogQuery, query);
+                    try
+                    {
+                        if (Cancelled) query.Cancel(); // Cancel() may have run before the source was published.
+                        var status = StatusClient.QueryAsync(slave, query.Token, true).GetAwaiter().GetResult();
+                        query.Token.ThrowIfCancellationRequested();
+                        report = status?.PowerSiReport;
+                        if (report == null) throw new InvalidDataException("PowerSI report is missing.");
+                    }
+                    catch (Exception ex)
+                    {
+                        Alive(); // Stop or a target change ends the session; it is never counted as a failed check.
+                        var type = ex.GetType().Name;
+                        Watchdog.RecordCheckFailure(type, DateTime.UtcNow);
+                        var failures = Watchdog.FailureStreak;
+                        log.Write(IsExpectedCheckFailure(ex) ? "INFO" : "WARN", "WATCHDOG_CHECK_FAILED",
+                            AuditLog.Field("exception_type", type), AuditLog.Field("failure_streak", failures));
+                        if (failures == WatchdogState.FailureWarningThreshold)
+                            QueueNotice("WARNING", noticeMarker => WatchdogText.WarningNotice(noticeMarker,
+                                WatchdogText.KindSlaveFailure, CheckFailureCode(ex), Watchdog, DateTime.Now));
+                        progress(checkRound, "WATCHDOG:" + Watchdog.Summary(DateTime.Now), waitMarker);
+                        return;
+                    }
+                    finally { Interlocked.CompareExchange(ref watchdogQuery, null, query); }
+                    var result = Watchdog.ApplyCheck(WatchdogReport.FromPowerSiReport(report), DateTime.UtcNow,
+                        WatchdogReport.AbsentMeansMissing(report));
+                    foreach (var outcome in result.Outcomes) // Identity, states and counts only; never names or Output text.
+                        log.Write("INFO", "WATCHDOG_TARGET_EVALUATED", AuditLog.Field("pid", outcome.Target.Pid),
+                            AuditLog.Field("start_utc_ticks", outcome.Target.StartUtcTicks), AuditLog.Field("outcome", outcome.Outcome),
+                            AuditLog.Field("report_state", outcome.ReportState), AuditLog.Field("source", outcome.Source),
+                            AuditLog.Field("output_length", outcome.OutputLength),
+                            AuditLog.Field("consecutive_unjudged", outcome.ConsecutiveUnjudged));
+                    log.Write("INFO", "WATCHDOG_CHECK_RESULT", AuditLog.Field("finished", result.Finished.Length),
+                        AuditLog.Field("missing", result.Missing.Length), AuditLog.Field("remaining", result.Remaining),
+                        AuditLog.Field("all_cleared", result.AllCleared),
+                        AuditLog.Field("unjudged_streak", result.UnjudgedStreakReached.Length),
+                        AuditLog.Field("absent_means_missing", WatchdogReport.AbsentMeansMissing(report)));
+                    if (result.Finished.Length + result.Missing.Length > 0)
+                        QueueNotice("COMPLETION", noticeMarker =>
+                            WatchdogText.CompletionNotice(noticeMarker, result, Watchdog, DateTime.Now));
+                    if (result.UnjudgedStreakReached.Length > 0)
+                        QueueNotice("WARNING", noticeMarker => WatchdogText.WarningNotice(noticeMarker, WatchdogText.KindUnjudgeable,
+                            WatchdogText.UnjudgedDetail(result.UnjudgedStreakReached), Watchdog, DateTime.Now));
+                    progress(checkRound, "WATCHDOG:" + Watchdog.Summary(DateTime.Now), waitMarker);
+                }
+                // Sends queued parts in order through the Ready notice path. True when the queue is empty. A part rejected
+                // before any input (idle gate, pending command, proof/guard failure) stays queued; an attempted but unclean
+                // part ends the session and is never retried. Texts are sent as prepared: a later watchdog off does not
+                // rebuild them, because they describe checks that already happened.
+                bool SendQueuedNotices(int noticeRound, string waitMarker, out int sentParts)
+                {
+                    sentParts = 0;
+                    while (pendingNotices.Count > 0)
+                    {
+                        var notice = pendingNotices[0];
+                        var text = notice.Parts[notice.Sent];
+                        var part = (notice.Sent + 1) + "/" + notice.Parts.Length;
+                        Alive();
+                        var noticeConsent = SupervisedSendTest.Consent.ForWatchdogNotice(notice.Marker, text);
+                        Volatile.Write(ref activeNotice, noticeConsent);
+                        Alive();
+                        progress(noticeRound, "NOTICE_WATCHDOG", waitMarker);
+                        SupervisedSendTest.Outcome result = null;
+                        string reason;
+                        try
+                        {
+                            target?.PrepareSend(); // Idle gate and on-demand activation; its failure is a deferral.
+                            result = SupervisedSendTest.RunBoundObserved(window, log, text, new System.Windows.Point(), noticeConsent,
+                                Stopped, snapshot =>
+                                {
+                                    Alive();
+                                    Need(process.Equals(snapshot.Process), "STATUS_PROCESS_CHANGED");
+                                    ReceiveProbe.ValidateContinuity(original, snapshot);
+                                    RequireReplyAbsent(snapshot, notice.RequestMarker);
+                                    RequireNoPendingCommand(baseline, snapshot, log);
+                                });
+                            last = result.Message;
+                            reason = result.Reason;
+                        }
+                        catch (MonitorException ex) when (result == null) { reason = ex.ReasonCode; }
+                        var inputAttempted = Flags(noticeConsent) != 0 || (result != null && result.InputAttempted);
+                        var decision = DecideAfterNotice(result != null && result.CleanCompletion, inputAttempted);
+                        // Uncertain delivery keeps the notice consent visible for the final summary, like an unclean Ready.
+                        if (decision == "STATUS_WATCHDOG_NOTICE_UNCERTAIN")
+                            throw new MonitorException(decision, "A watchdog notice was not confirmed. It is never retried.");
+                        lock (sync) { attempts |= Flags(noticeConsent); Volatile.Write(ref activeNotice, null); }
+                        noticeConsent.Cancel();
+                        Alive(); // A stop during the attempt ends the session; it is never a deferral.
+                        if (decision == "DEFERRED")
+                        {
+                            noticeDeferrals++;
+                            noticeRetryUtc = DateTime.UtcNow + WatchdogNoticeRetryAfter(noticeDeferrals);
+                            log.Write("INFO", "WATCHDOG_NOTICE_DEFERRED", AuditLog.Field("kind", notice.Kind),
+                                AuditLog.Field("part", part), AuditLog.Field("reason", reason ?? "UNKNOWN"),
+                                AuditLog.Field("queued_parts", pendingNotices.Sum(item => item.Parts.Length - item.Sent)),
+                                AuditLog.Field("input_attempted", false), AuditLog.Field("delivery_verified", false));
+                            return false;
+                        }
+                        notice.Sent++;
+                        sentParts++;
+                        if (notice.Sent == notice.Parts.Length) pendingNotices.RemoveAt(0);
+                        noticeDeferrals = 0;
+                        log.Write("INFO", "WATCHDOG_NOTICE_SENT", AuditLog.Field("kind", notice.Kind), AuditLog.Field("part", part),
+                            AuditLog.Field("delivery_verified", false));
+                    }
+                    return true;
+                }
+                // Checked only at the idle point of the command wait (ReceiveProbe.MayYield); never while a command is pending.
+                Func<bool> yieldRequested = () => (pendingNotices.Count > 0 && DateTime.UtcNow >= noticeRetryUtc) ||
+                    (Watchdog.IsArmed && Watchdog.IsCheckDue(DateTime.UtcNow));
                 log.Write("INFO", "STATUS_SESSION_BEGIN", AuditLog.Field("slave_status", slave != null),
                     AuditLog.Field("plain_commands", plainCommands),
                     AuditLog.Field("idle_timeout", "NONE"), AuditLog.Field("per_request_replies", plainCommands ? "BOUNDED_PREPARED_PARTS" : "ONE"),
                     AuditLog.Field("background_receive", target != null), AuditLog.Field("on_demand_activation", target != null),
                     AuditLog.Field("next_format", plainCommands ? "NONE" : "DIGITS_ONLY"), AuditLog.Field("compact_receive_log", true));
+                if (plainCommands)
+                {
+                    Watchdog.TrySetIntervalMinutes(WatchdogSettings.LoadIntervalMinutes(WatchdogSettings.DefaultPath));
+                    log.Write("INFO", "WATCHDOG_INTERVAL", AuditLog.Field("minutes", (int)Watchdog.Interval.TotalMinutes));
+                }
                 if (plainCommands) SendReady(marker);
+                string carriedNext = null; // After a yield without a new Ready, the wait keeps its code and next code.
                 while (true)
                 {
                     Alive();
                     var round = CompletedRounds;
-                    var nextMarker = Allocate(store, allocated, "M" + Protocol.CreateDiagnosticDigits());
+                    var nextMarker = carriedNext ?? Allocate(store, allocated, "M" + Protocol.CreateDiagnosticDigits());
+                    carriedNext = null;
                     var consent = StartRequest(marker, nextMarker);
                     ReceiveProbe.Baseline nextBaseline = null;
                     log.Write("INFO", "STATUS_REQUEST_BEGIN", AuditLog.Field("round_index", round));
@@ -231,8 +467,34 @@ namespace RemoteMonitorMaster
                                 RequireReplyAbsent(snapshot, nextMarker);
                             }
                             Alive();
-                        }, baseline, true, target);
+                        }, baseline, true, target, plainCommands ? yieldRequested : null);
                     last = outcome.Message;
+                    if (outcome != null && outcome.Yielded && TryReleaseYieldedRequest(consent, outcome))
+                    {
+                        var checkDue = Watchdog.IsArmed && Watchdog.IsCheckDue(DateTime.UtcNow);
+                        log.Write("INFO", "STATUS_WAIT_YIELDED", AuditLog.Field("round_index", round),
+                            AuditLog.Field("check_due", checkDue),
+                            AuditLog.Field("queued_parts", pendingNotices.Sum(item => item.Parts.Length - item.Sent)));
+                        if (checkDue) RunWatchdogCheck(round, marker);
+                        var sentParts = 0;
+                        var allSent = pendingNotices.Count == 0 || SendQueuedNotices(round, marker, out sentParts);
+                        Alive();
+                        if (allSent && sentParts > 0)
+                        {
+                            // The phone sees a fresh Master Ready after the notice; the new Ready binds the next wait.
+                            marker = Allocate(store, allocated, "M" + Protocol.CreateDiagnosticDigits());
+                            reported = marker;
+                            SendReady(marker);
+                        }
+                        else
+                        {
+                            // Nothing new in the chat from Master, or a deferred part: keep the same code, the same pre-Ready
+                            // baseline and the same next code. The re-entered wait re-binds the same Ready row and finds any
+                            // command that arrived meanwhile; a queued part waits until that command's round is done.
+                            carriedNext = nextMarker;
+                        }
+                        continue;
+                    }
                     if (outcome == null || !outcome.CleanCompletion)
                     {
                         // Nothing typed or clicked: re-arm receiving with a new code and a new Ready. Never a resend.
@@ -282,6 +544,18 @@ namespace RemoteMonitorMaster
                 var reason = (ex as MonitorException)?.ReasonCode ?? "STATUS_SESSION_FAILED";
                 // An unexpected failure keeps its exception identity; a declared stop reason stays INFO.
                 if (!(ex is MonitorException)) { try { log?.WriteException("STATUS_SESSION_FAILED", ex); } catch { } }
+                try
+                {
+                    // Watching ends with the session; unsent notices are dropped (never sent by another session).
+                    var watched = Watchdog.Count;
+                    var unsent = pendingNotices.Sum(item => item.Parts.Length - item.Sent);
+                    Watchdog.ClearAll("SESSION_END");
+                    pendingNotices.Clear();
+                    if (watched > 0 || unsent > 0)
+                        log?.Write("INFO", "WATCHDOG_CLEARED", AuditLog.Field("reason", "SESSION_END"), AuditLog.Field("entries", watched),
+                            AuditLog.Field("unsent_notice_parts", unsent));
+                }
+                catch { }
                 try { log?.Write(reason == "STATUS_SESSION_FAILED" ? "WARN" : "INFO", "STATUS_SESSION_END", AuditLog.Field("reason", reason),
                     AuditLog.Field("completed_rounds", CompletedRounds), AuditLog.Field("pending_write", PendingWrite),
                     AuditLog.Field("send_attempted", SendAttempted), AuditLog.Field("elapsed_ms", clock.ElapsedMilliseconds)); }
@@ -327,6 +601,7 @@ namespace RemoteMonitorMaster
                 DecideAfterAbort(true, false, 1, AbortResumeLimit) == "STATUS_SESSION_CANCELLED" &&
                 DecideAfterAbort(true, false, AbortResumeLimit, AbortResumeLimit) == "STATUS_SESSION_CANCELLED",
                 "STATUS_SELFTEST_ABORT_DECISION");
+            RunWatchdogSelfTest(); // Pure; runs before the PC-status capture below.
             var path = Path.Combine(directory, "status-session-tokens.txt");
             void Reject(Action action)
             {
@@ -418,6 +693,113 @@ namespace RemoteMonitorMaster
                 RunPlainCommandSelfTest(directory);
             }
             finally { operation.Cancel(); if (File.Exists(path)) File.Delete(path); }
+        }
+
+        // Watchdog wiring without Win32: the notice decision, the yielded-request release, the pending-command guard and
+        // the one-use notice consent built from real WatchdogText parts.
+        private static void RunWatchdogSelfTest()
+        {
+            Need(DecideAfterNotice(true, true) == "SENT" && DecideAfterNotice(false, false) == "DEFERRED" &&
+                DecideAfterNotice(false, true) == "STATUS_WATCHDOG_NOTICE_UNCERTAIN" &&
+                DecideAfterNotice(true, false) == "STATUS_WATCHDOG_NOTICE_UNCERTAIN", "STATUS_SELFTEST_NOTICE_DECISION");
+            Need(WatchdogNoticeRetryAfter(0) == WatchdogNoticeRetryDelay && WatchdogNoticeRetryAfter(1) == WatchdogNoticeRetryDelay &&
+                WatchdogNoticeRetryAfter(2) == TimeSpan.FromSeconds(60) && WatchdogNoticeRetryAfter(3) == TimeSpan.FromSeconds(120) &&
+                WatchdogNoticeRetryAfter(6) == WatchdogNoticeRetryCeiling && WatchdogNoticeRetryAfter(40) == WatchdogNoticeRetryCeiling,
+                "STATUS_SELFTEST_NOTICE_BACKOFF");
+            Need(CheckFailureCode(new TimeoutException()) == "SLAVE_TIMEOUT" &&
+                CheckFailureCode(new System.Security.Authentication.AuthenticationException()) == "SLAVE_AUTHENTICATION" &&
+                CheckFailureCode(new InvalidDataException()) == "SLAVE_RESPONSE_INVALID" &&
+                CheckFailureCode(new IOException()) == "SLAVE_CONNECTION" &&
+                CheckFailureCode(new System.Net.Sockets.SocketException()) == "SLAVE_CONNECTION" &&
+                CheckFailureCode(new InvalidOperationException()) == "SLAVE_QUERY_FAILED", "STATUS_SELFTEST_CHECK_FAILURE_CODE");
+            void Reject(Action action, string expected)
+            {
+                try { action(); }
+                catch (MonitorException ex) { Need(ex.ReasonCode == expected, "STATUS_SELFTEST_WATCHDOG_REASON"); return; }
+                throw new InvalidOperationException("Unsafe watchdog transition accepted.");
+            }
+
+            // Yielded requests: only an untouched, unsent, yielded outcome of the active request is released.
+            var endpoint = new SlaveEndpoint(System.Net.IPAddress.Loopback, 1, new string('0', 64),
+                Convert.ToBase64String(new byte[32]));
+            var session = new StatusSession("M234567", true, endpoint, true);
+            try
+            {
+                Need(session.TryClaim() && session.Watchdog != null && !session.Watchdog.IsArmed &&
+                    session.Watchdog.Interval == TimeSpan.FromMinutes(WatchdogState.DefaultIntervalMinutes) &&
+                    session.WatchdogSummary == "감시 없음", "STATUS_SELFTEST_WATCHDOG_OWNER");
+                var waiting = session.StartRequest("M234567", "M345678");
+                Need(ReferenceEquals(waiting.Watchdog, session.Watchdog) && waiting.TryClaimRoundTrip(),
+                    "STATUS_SELFTEST_WATCHDOG_ATTACHED");
+                waiting.Cancel(); // RoundTripTest retires every consent on return, a yield included.
+                var yielded = new RoundTripTest.Outcome("yielded", null, false, true);
+                var rejected = new SupervisedSendTest.Outcome("REJECTED", "RECEIVE_PHASE_TIME_LIMIT", "test", false, false);
+                Need(!session.TryReleaseYieldedRequest(waiting, null) &&
+                    !session.TryReleaseYieldedRequest(waiting, new RoundTripTest.Outcome("aborted", rejected, false)) &&
+                    !session.TryReleaseYieldedRequest(waiting, new RoundTripTest.Outcome("not yielded")) &&
+                    !session.TryReleaseYieldedRequest(new SupervisedSendTest.Consent("D234567", true, true, endpoint, null, true),
+                        yielded), "STATUS_SELFTEST_YIELD_ONLY_UNTOUCHED");
+                Need(session.TryReleaseYieldedRequest(waiting, yielded) && !session.Cancelled && session.CompletedRounds == 0 &&
+                    !session.PendingWrite && !session.CursorMoveAttempted && !session.SendAttempted, "STATUS_SELFTEST_YIELD_RELEASED");
+                Need(!session.TryReleaseYieldedRequest(waiting, yielded), "STATUS_SELFTEST_YIELD_ONCE");
+                // Re-entry keeps the code and next code: a fresh one-use consent with the same watchdog.
+                var resumed = session.StartRequest("M234567", "M345678");
+                Need(!ReferenceEquals(resumed, waiting) && resumed.Marker == waiting.Marker &&
+                    ReferenceEquals(resumed.Watchdog, session.Watchdog), "STATUS_SELFTEST_YIELD_REENTRY");
+                Reject(() => session.StartRequest("M234567", "M345678"), "STATUS_SESSION_CANCELLED_OR_BUSY");
+                Need(resumed.TryClaimRoundTrip(), "STATUS_SELFTEST_YIELD_REENTRY_CLAIM");
+                resumed.BindCommand("help");
+                var draft = resumed.PrepareReply(); // help is local; the dummy endpoint is never contacted.
+                Need(resumed.TryConsume(draft) && resumed.TryCommitMove(), "STATUS_SELFTEST_YIELD_TOUCHED");
+                resumed.Cancel();
+                Need(!session.TryReleaseYieldedRequest(resumed, yielded) && !session.Cancelled && session.CursorMoveAttempted,
+                    "STATUS_SELFTEST_YIELD_TOUCHED_KEPT");
+                session.Cancel();
+                Need(!session.TryReleaseYieldedRequest(resumed, yielded), "STATUS_SELFTEST_YIELD_CANCELLED");
+            }
+            finally { session.Cancel(); }
+
+            // The notice waits while a command is pending after the current Ready, visible or pinned offscreen.
+            const string marker = "M234567";
+            var readyText = SupervisedSendTest.ReadyText("D234567");
+            ProbeSnapshot History(bool ready, bool notice = false, string command = null, bool visible = true)
+            {
+                var snapshot = ReceiveProbe.CreateTestSnapshot();
+                ReceiveProbe.SetTestName(snapshot.Nodes.Single(n => n.Node == 52), "old message");
+                ReceiveProbe.SetTestName(snapshot.Nodes.Single(n => n.Node == 54), "old reply");
+                if (ready) ReceiveProbe.AppendTestHistoryText(snapshot, readyText);
+                if (notice)
+                    ReceiveProbe.AppendTestHistoryText(snapshot,
+                        "WATCHDOG D456789 | 경고\r\nSlave 조회 3회 연속 실패 (SLAVE_TIMEOUT). 감시는 유지합니다.");
+                if (command != null) ReceiveProbe.AppendTestHistoryText(snapshot, command).Visible = visible;
+                return snapshot;
+            }
+            var preReady = ReceiveProbe.CreateBaseline(History(false), marker, true);
+            RequireNoPendingCommand(preReady, History(true));
+            RequireNoPendingCommand(preReady, History(true, true)); // An earlier notice part is not a command.
+            Reject(() => RequireNoPendingCommand(preReady, History(true, false, "pwrsi")), "WATCHDOG_NOTICE_COMMAND_PENDING");
+            Reject(() => RequireNoPendingCommand(preReady, History(true, true, "help")), "WATCHDOG_NOTICE_COMMAND_PENDING");
+            Reject(() => RequireNoPendingCommand(preReady, History(true, true, "pwrsi", false)), "WATCHDOG_NOTICE_COMMAND_PENDING");
+            Reject(() => RequireNoPendingCommand(preReady, History(false)), "WATCHDOG_NOTICE_READY_NOT_BOUND");
+            Reject(() => RequireNoPendingCommand(ReceiveProbe.BindReadyBoundary(preReady, History(true)), History(true)),
+                "WATCHDOG_NOTICE_BASELINE_REQUIRED");
+
+            // Real notice parts: each part is exactly one one-use consent bound to its own notice code.
+            var state = new WatchdogState(TimeSpan.FromMinutes(30));
+            var t0 = new DateTime(2026, 9, 23, 3, 0, 0, DateTimeKind.Utc);
+            state.Arm(new[] { new WatchdogTarget(4321, t0.AddHours(-2).Ticks, "PowerSI.exe"),
+                new WatchdogTarget(4322, t0.AddHours(-1).Ticks, "PowerSI.exe") }, null, t0);
+            var check = state.ApplyCheck(new WatchdogReport[0], t0.AddMinutes(30), true); // Complete report: both gone.
+            Need(check.Missing.Length == 2 && !state.IsArmed, "STATUS_SELFTEST_WATCHDOG_CHECK");
+            var parts = WatchdogText.CompletionNotice("D456789", check, state, t0.ToLocalTime());
+            Need(parts.Length >= 1 && parts.All(part =>
+                {
+                    var once = SupervisedSendTest.Consent.ForWatchdogNotice("D456789", part);
+                    return part.Length <= PcStatusReport.MaxPhoneLength && once.IsAuthorizedReply(part) &&
+                        !once.IsAuthorizedReply(part + " ") && once.TryConsume(part) && !once.TryConsume(part);
+                }), "STATUS_SELFTEST_WATCHDOG_NOTICE_CONSENT");
+            Reject(() => SupervisedSendTest.Consent.ForWatchdogNotice("D567892", parts[0]), "SEND_NOTICE_INVALID");
+            Reject(() => SupervisedSendTest.Consent.ForWatchdogNotice("D456789", readyText), "SEND_NOTICE_INVALID");
         }
 
         private static void RunPlainCommandSelfTest(string directory)

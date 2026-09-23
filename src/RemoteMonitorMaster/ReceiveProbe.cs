@@ -517,6 +517,17 @@ namespace RemoteMonitorMaster
             return waited >= cap ? "PERIODIC" : null;
         }
 
+        // Pure rule for the idle command wait; the cheap tail trigger and the yield point share it. Only a background
+        // plain-command wait that has completed at least one poll after binding Ready, with no candidate waiting for its
+        // repeat observation and no pinned-but-blocked command row, is idle. Everything else keeps today's cadence and
+        // can never be interrupted: a pending candidate always completes its repeat observation first.
+        internal static bool MayYield(bool continuousWait, bool plainCommands, bool hasAcceptedProof, bool collectMetadata,
+            int polls, bool candidatePending, bool commandBlocked, int readyRow)
+        {
+            return continuousWait && plainCommands && !hasAcceptedProof && !collectMetadata && polls > 0 &&
+                !candidatePending && !commandBlocked && readyRow >= 0;
+        }
+
         public static string Run(IntPtr window, AuditLog log, string marker, Func<bool> stop, Action<string> progress)
         {
             return Observe(window, log, marker, stop, progress, new object(), true).Message;
@@ -525,7 +536,8 @@ namespace RemoteMonitorMaster
         internal static ObservationResult Observe(IntPtr window, AuditLog log, string marker, Func<bool> stop,
             Action<string> progress, object owner, bool collectMetadata, Action<string, ProbeSnapshot> inspectSnapshot = null,
             Baseline suppliedBaseline = null, bool continuousWait = false, bool plainCommands = false,
-            ObservationProof acceptedProof = null, bool singleRefresh = false, OperationalTarget target = null)
+            ObservationProof acceptedProof = null, bool singleRefresh = false, OperationalTarget target = null,
+            Func<bool> yieldRequested = null)
         {
             var overall = Stopwatch.StartNew();
             var phaseClock = Stopwatch.StartNew();
@@ -798,14 +810,30 @@ namespace RemoteMonitorMaster
                 int[] tailPath = null;
                 string tailHistoryRuntime = null, tailRootRuntime = null;
                 string[] previousChain = null;
+                // Yield point: the caller may take over the idle wait for a scheduled Master task (watchdog check or
+                // notice). It returns no proof and nothing observed is carried over; the caller re-enters with the same
+                // pre-Ready baseline, which re-binds the same Ready row and re-evaluates every row after it.
+                bool YieldNow()
+                {
+                    if (yieldRequested == null || !yieldRequested()) return false;
+                    Alive(); // A stop or target change keeps its own reason instead of looking like a yield.
+                    return true;
+                }
+                ObservationResult Yielded()
+                {
+                    Result(log, "WAIT_YIELDED", "NONE", polls);
+                    return new ObservationResult("WAIT_YIELDED", "NONE",
+                        "WAIT_YIELDED - the idle command wait paused for a scheduled Master task. No input, click or send was executed.");
+                }
                 while (true)
                 {
                     phaseClock.Restart(); // The inter-snapshot wait is not charged to the preceding snapshot's 15-second cap.
                     var wait = Stopwatch.StartNew();
                     // Idle waiting state only. Waiting for the repeat observation, a pinned not-yet-visible command row,
                     // the first poll after Ready and every non-background flow keep the unconditional capture cadence.
-                    var idleWait = polls > 0 && previousCandidate == null && !commandBlocked && baseline.ReadyRow >= 0 &&
-                        continuousWait && plainCommands && !collectMetadata && acceptedProof == null;
+                    var idleWait = MayYield(continuousWait, plainCommands, acceptedProof != null, collectMetadata, polls,
+                        previousCandidate != null, commandBlocked, baseline.ReadyRow);
+                    if (idleWait && YieldNow()) return Yielded();
                     var samples = 0;
                     var chainDepth = 0;
                     var trigger = TriggerReason(idleWait, idleWait && OperationalTarget.IsMinimized(window),
@@ -828,6 +856,7 @@ namespace RemoteMonitorMaster
                                 wait.Elapsed, TailWaitCap);
                             if (reference == null) reference = sample;
                             if (trigger != null) break;
+                            if (YieldNow()) return Yielded(); // Only an unchanged tail; a change starts the full snapshot first.
                             for (var i = 0; i < 5; i++) { Alive(); Thread.Sleep(50); }
                         }
                     }
@@ -1009,6 +1038,7 @@ namespace RemoteMonitorMaster
             Reject(() => AcceptSuppliedBaseline(wrongHash, first, marker, boundWindow));
             RunPlainCommandSelfTest();
             RunChangeTriggerSelfTest();
+            RunYieldSelfTest();
         }
 
         // The change trigger decides only WHEN a full snapshot starts, so these cover the pure parts alone:
@@ -1088,6 +1118,87 @@ namespace RemoteMonitorMaster
                 "RECEIVE_SELF_TEST_TRIGGER_REASON");
             // The cap stays below one field snapshot (5.6-6.8 s), so the worst-case cadence is not slower than before.
             Need(TailWaitCap <= TimeSpan.FromSeconds(5) && TailDepthLimit == 32, "RECEIVE_SELF_TEST_TRIGGER_BOUNDS");
+        }
+
+        // The yield rule and the caller's re-entry: after a yield the caller keeps the SAME pre-Ready baseline and marker,
+        // Observe re-binds the unique Ready row, and a watchdog notice row (a non-command Master row after Ready) never
+        // hides or replaces the first command row that follows it.
+        private static void RunYieldSelfTest()
+        {
+            Need(MayYield(true, true, false, false, 1, false, false, 0) && MayYield(true, true, false, false, 9, false, false, 23),
+                "RECEIVE_SELF_TEST_YIELD_IDLE");
+            Need(!MayYield(false, true, false, false, 1, false, false, 0) && !MayYield(true, false, false, false, 1, false, false, 0) &&
+                !MayYield(true, true, true, false, 1, false, false, 0) && !MayYield(true, true, false, true, 1, false, false, 0) &&
+                !MayYield(true, true, false, false, 0, false, false, 0) && !MayYield(true, true, false, false, 1, true, false, 0) &&
+                !MayYield(true, true, false, false, 1, false, true, 0) && !MayYield(true, true, false, false, 1, false, false, -1),
+                "RECEIVE_SELF_TEST_YIELD_GUARDS");
+            var allowed = 0;
+            for (var bits = 0; bits < 256; bits++)
+                if (MayYield((bits & 1) != 0, (bits & 2) != 0, (bits & 4) != 0, (bits & 8) != 0, (bits & 16) != 0 ? 1 : 0,
+                    (bits & 32) != 0, (bits & 64) != 0, (bits & 128) != 0 ? 0 : -1)) allowed++;
+            Need(allowed == 1, "RECEIVE_SELF_TEST_YIELD_TABLE");
+
+            const string marker = "M234567";
+            var readyText = SupervisedSendTest.ReadyText("D234567");
+            var notices = new[] {
+                "WATCHDOG D345678 | 완료 알림 | PART 001/002\r\n" +
+                    "PowerSI (PID 4321): AFS Finished, Total Sampling Points = 1201 (출처: 버퍼)",
+                "WATCHDOG D345678 | 완료 알림 | PART 002/002\r\n남은 감시 없음 — watchdog 꺼짐" };
+            Need(notices.All(WatchdogText.IsNotice), "RECEIVE_SELF_TEST_YIELD_NOTICE_FIXTURE");
+            ProbeSnapshot History(bool ready, int noticeRows = 0, string command = null, bool commandVisible = true)
+            {
+                var snapshot = CreateTestSnapshot();
+                SetTestName(snapshot.Nodes.Single(n => n.Node == 52), "old message");
+                SetTestName(snapshot.Nodes.Single(n => n.Node == 54), "old reply");
+                if (ready) AppendTestHistoryText(snapshot, readyText);
+                for (var i = 0; i < noticeRows; i++)
+                    AppendTestHistorySiblingText(snapshot, AppendTestHistoryText(snapshot, notices[i]), "14:0" + i);
+                if (command != null) AppendTestHistoryText(snapshot, command).Visible = commandVisible;
+                return snapshot;
+            }
+            void Reject(Action action)
+            {
+                try { action(); } catch (MonitorException) { return; }
+                throw new InvalidOperationException("Unsafe yield re-entry accepted.");
+            }
+            var preReady = CreateBaseline(History(false), marker, true);
+            var window = new IntPtr(preReady.Snapshot.Process.WindowHandle);
+            bool blocked;
+            var idle = History(true);
+            var bound = BindReadyBoundary(preReady, idle);
+            Need(bound != null && Evaluate(bound, idle, null, out blocked) == null && !blocked &&
+                MayYield(true, true, false, false, 1, false, blocked, bound.ReadyRow), "RECEIVE_SELF_TEST_YIELD_FIRST_WAIT");
+            // Re-entry after a check: same marker, same pre-Ready baseline object, Ready re-bound to the same row.
+            foreach (var noticeRows in new[] { 0, 1, 2 })
+            {
+                var entry = History(true, noticeRows);
+                Need(ReferenceEquals(AcceptSuppliedBaseline(preReady, entry, marker, window, true), preReady),
+                    "RECEIVE_SELF_TEST_YIELD_SAME_BASELINE");
+                var rebound = BindReadyBoundary(preReady, entry);
+                Need(rebound != null && rebound.ReadyRow == bound.ReadyRow && Evaluate(rebound, entry, null, out blocked) == null &&
+                    !blocked, "RECEIVE_SELF_TEST_YIELD_REBOUND_IDLE");
+                // A command that arrived during the check is found on the re-entry's first capture, then repeated.
+                var first = History(true, noticeRows, "pwrsi"); var second = History(true, noticeRows, "pwrsi");
+                var reboundFirst = BindReadyBoundary(preReady, first);
+                var candidate = Evaluate(reboundFirst, first, null, out blocked);
+                Need(candidate != null && !blocked && candidate == SelectHistory(first).Texts.Last() &&
+                    SameCandidate(first, candidate, second, Evaluate(reboundFirst, second)) &&
+                    !MayYield(true, true, false, false, 1, true, false, reboundFirst.ReadyRow), "RECEIVE_SELF_TEST_YIELD_COMMAND_ADMITTED");
+                ValidatePlainHistoryPrefix(entry, first, baseline: rebound); // The poll-to-poll prefix still holds.
+                // A pinned offscreen command blocks the round and the yield alike; no later row takes its place.
+                var hidden = History(true, noticeRows, "pwrsi", false);
+                Need(Evaluate(BindReadyBoundary(preReady, hidden), hidden, null, out blocked) == null && blocked &&
+                    !MayYield(true, true, false, false, 1, false, blocked, 0), "RECEIVE_SELF_TEST_YIELD_BLOCKED");
+            }
+            // The re-entry never binds anything but the one exact Ready row of this marker.
+            var noReady = History(false, 0);
+            AppendTestHistoryText(noReady, notices[0]);
+            Need(BindReadyBoundary(preReady, noReady) == null, "RECEIVE_SELF_TEST_YIELD_READY_REQUIRED");
+            var twice = History(true, 1); AppendTestHistoryText(twice, readyText);
+            Reject(() => BindReadyBoundary(preReady, twice));
+            var recycled = History(true, 1); SetTestName(recycled.Nodes.Single(n => n.Node == 51), "", "recycled-row");
+            Reject(() => BindReadyBoundary(preReady, recycled)); // Old rows keep identity and order across the yield.
+            Reject(() => BindReadyBoundary(bound, History(true, 1))); // A bound baseline is never carried as pre-Ready.
         }
 
         private static void RunPlainCommandSelfTest()
