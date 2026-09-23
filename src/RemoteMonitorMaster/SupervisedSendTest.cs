@@ -13,7 +13,8 @@ namespace RemoteMonitorMaster
     internal static class SupervisedSendTest
     {
         internal const string MouseReleaseWarning = "Mouse-button release was NOT confirmed.";
-        internal const string ReadyNotice = "Master Ready. help, total status, pwrsi 중 하나를 보내세요.";
+        // The leading "Master Ready" token and the " [marker]" suffix (ReadyText) are what ReceiveProbe binds by hash.
+        internal const string ReadyNotice = "Master Ready. help, total status, pwrsi, watchdog 중 하나를 보내세요.";
         internal const string PowerSiBusyNotice = "Processing pwrsi. 답장과 다음 Master Ready를 기다리세요. 그 사이 보낸 메시지는 무시됩니다.";
         internal const string StatusBusyNotice = "Processing total status. 답장과 다음 Master Ready를 기다리세요. 그 사이 보낸 메시지는 무시됩니다.";
 
@@ -52,6 +53,17 @@ namespace RemoteMonitorMaster
             private int confirmedReplyParts, outputCommitted;
             private Consent progressNotice;
             private bool isNotice;
+            // Watchdog wiring: the session attaches its WatchdogState so a watchdog command reply can arm/disarm it,
+            // and a watchdog notice consent authorizes exactly one prepared WATCHDOG text (one use, like Ready).
+            private bool isWatchdogNotice;
+            internal WatchdogState Watchdog { get; private set; }
+            internal void AttachWatchdog(WatchdogState state)
+            {
+                // Before reply preparation only, and never re-bound to a different state.
+                Need(state != null && IsPlainCommands && !isNotice && Volatile.Read(ref preparedReply) == null &&
+                    (Watchdog == null || ReferenceEquals(Watchdog, state)), "COMMAND_CONSENT_INVALID");
+                Watchdog = state;
+            }
             internal bool IsOperational { get { return IsPlainCommands || isNotice; } }
             internal string NoticeText { get { Need(isNotice, "SEND_NOTICE_REQUIRED"); return preparedReply; } }
             private int replyPartIndex = 1, replyPartCount = 1;
@@ -104,6 +116,22 @@ namespace RemoteMonitorMaster
                     preparedReply = text == ReadyNotice ? ReadyText(marker) : text };
             }
 
+            internal static Consent ForWatchdogNotice(string marker, string text)
+            {
+                Need(IsValidMarker(marker) && IsWatchdogNoticeText(marker, text), "SEND_NOTICE_INVALID");
+                return new Consent(marker, true) { isNotice = true, isWatchdogNotice = true, preparedReply = text };
+            }
+
+            // The marker must be the notice header's own marker ("WATCHDOG <marker> | ..."), not merely appear in the body,
+            // and a non-empty body must follow the header line. The exact prepared text remains the authority.
+            private static bool IsWatchdogNoticeText(string marker, string text)
+            {
+                if (text == null || text.Length > PcStatusReport.MaxPhoneLength || !WatchdogText.IsNotice(text) ||
+                    !text.StartsWith("WATCHDOG " + marker + " | ", StringComparison.Ordinal)) return false;
+                var lineEnd = text.IndexOf("\r\n", StringComparison.Ordinal);
+                return lineEnd > 0 && text.Substring(lineEnd + 2).Trim().Length > 0;
+            }
+
             internal Consent CreateProgressNotice(string text)
             {
                 Need(IsPlainCommands && !Cancelled, "SEND_NOTICE_INVALID");
@@ -135,7 +163,8 @@ namespace RemoteMonitorMaster
                 Need(Volatile.Read(ref state) == 0 && Volatile.Read(ref roundTripClaimed) == 1 &&
                     Volatile.Read(ref preparedReply) == null, "PC_STATUS_CONSENT_USED");
                 PreparedPowerSiOutput output = null;
-                var replies = IsPlainCommands ? ReadOnlyCommands.CaptureReplies(Volatile.Read(ref command), Marker, slave, slaveCancellation.Token, out output) :
+                var replies = IsPlainCommands ? ReadOnlyCommands.CaptureReplies(Volatile.Read(ref command), Marker, slave, slaveCancellation.Token,
+                        Watchdog, out output) :
                     new[] { slave == null ? PcStatusReport.Capture(Marker) :
                         PcStatusReport.CaptureSlave(Marker, slave, slaveCancellation.Token) };
                 if (nextMarker != null) replies[0] = PcStatusReport.WithNext(replies[0], Marker, IsSlaveStatus, nextMarker);
@@ -194,7 +223,7 @@ namespace RemoteMonitorMaster
             internal bool IsAuthorizedReply(string text)
             {
                 return text != null && text == Volatile.Read(ref preparedReply) &&
-                    (isNotice ? text == ReadyText(Marker) || text == PowerSiBusyNotice || text == StatusBusyNotice :
+                    (isNotice ? (isWatchdogNotice ? IsWatchdogNoticeText(Marker, text) : text == ReadyText(Marker) || text == PowerSiBusyNotice || text == StatusBusyNotice) :
                     IsPlainCommands ? ReadOnlyCommands.IsReplyPart(text, Volatile.Read(ref command), Marker, replyPartIndex, replyPartCount) :
                         IsSlaveStatus ? PcStatusReport.IsSlaveReply(text, Marker, nextMarker) :
                         IsPcStatus ? PcStatusReport.IsReply(text, Marker, nextMarker) : IsValidMarker(text));
@@ -766,6 +795,11 @@ namespace RemoteMonitorMaster
             Need(!readyNotice.TryConsume(PowerSiBusyNotice) && !readyNotice.TryConsume(ReadyNotice), "SEND_SELF_TEST_NOTICE_EXACT");
             var onceNotice = Consent.ForNotice("D234567", ReadyNotice);
             Need(onceNotice.TryConsume(onceNotice.NoticeText) && !onceNotice.TryConsume(onceNotice.NoticeText), "SEND_SELF_TEST_NOTICE_ONCE");
+            // ReadOnlyCommands.ObserveName hashes a Ready echo only up to 128 characters; the text itself is never a command.
+            Need(ReadyText("D234567") == "Master Ready. help, total status, pwrsi, watchdog 중 하나를 보내세요. [D234567]" &&
+                ReadyText("D234567").Length <= 128 && !ReadOnlyCommands.IsCommand(ReadyNotice) &&
+                !ReadOnlyCommands.IsCommand(ReadyText("D234567")), "SEND_SELF_TEST_READY_TEXT");
+            RunWatchdogNoticeSelfTest();
             const string marker = "D234567";
             var observedPointer = new NativeMethods.ScreenPoint { X = -10, Y = 20 };
             Need(PointerFailure(true, observedPointer, new Point(-10, 20)) == null &&
@@ -912,6 +946,64 @@ namespace RemoteMonitorMaster
             try { new Consent(marker, false); }
             catch (MonitorException) { return; }
             throw new InvalidOperationException("An unconfirmed supervised send was accepted.");
+        }
+
+        // Pure: notice consents only, no Win32/UIA. A WATCHDOG notice is authorized for exactly its prepared text, once.
+        private static void RunWatchdogNoticeSelfTest()
+        {
+            const string marker = "D234567";
+            var state = new WatchdogState(TimeSpan.FromMinutes(30));
+            var t0 = new DateTime(2026, 9, 23, 12, 0, 0, DateTimeKind.Utc);
+            state.Arm(new[] { new WatchdogTarget(101, t0.AddHours(-2).Ticks, "PowerSI"), new WatchdogTarget(202, t0.AddHours(-1).Ticks, "PowerSI") },
+                null, t0);
+            var check = state.ApplyCheck(new[]
+            {
+                new WatchdogReport { Pid = 101, StartUtcTicks = t0.AddHours(-2).Ticks, ProcessName = "PowerSI", State = "READ",
+                    Source = "BUFFER", OutputText = "AFS Finished\r\nTotal Sampling Points = 42\r\n" },
+                new WatchdogReport { Pid = 202, StartUtcTicks = t0.AddHours(-1).Ticks, ProcessName = "PowerSI", State = "READ",
+                    Source = "BUFFER", OutputText = "AFS Current Frequency (GHz) = 1.5\r\n" }
+            }, t0.AddMinutes(30));
+            var completion = WatchdogText.CompletionNotice(marker, check, state, t0.ToLocalTime());
+            var warning = WatchdogText.WarningNotice(marker, WatchdogText.KindSlaveFailure, "self-test", state, t0.ToLocalTime());
+            Need(completion.Length == 1 && warning.Length == 1, "WATCHDOG_NOTICE_SELF_TEST_TEXT");
+            foreach (var text in new[] { completion[0], warning[0] })
+            {
+                var notice = Consent.ForWatchdogNotice(marker, text);
+                Need(notice.IsOperational && notice.NoticeText == text && notice.IsAuthorizedReply(text) &&
+                    !notice.IsAuthorizedReply(text + " ") && !notice.IsAuthorizedReply(text.Replace("\r\n", "\n")) &&
+                    !notice.IsAuthorizedReply(ReadyText(marker)) && !notice.IsAuthorizedReply(PowerSiBusyNotice) &&
+                    !notice.IsAuthorizedReply(null), "WATCHDOG_NOTICE_SELF_TEST_EXACT");
+                Need(!notice.TryConsume(text + " ") && notice.Cancelled && !notice.TryConsume(text), "WATCHDOG_NOTICE_SELF_TEST_MISMATCH_CONSUMES");
+                var once = Consent.ForWatchdogNotice(marker, text);
+                Need(once.TryConsume(text) && !once.TryConsume(text) && once.TryCommitMove() && once.TryCommitWrite() &&
+                    once.TryCommit() && !once.TryCommit() && once.Attempted, "WATCHDOG_NOTICE_SELF_TEST_ONCE");
+                var cancelled = Consent.ForWatchdogNotice(marker, text);
+                cancelled.Cancel();
+                Need(!cancelled.TryConsume(text) && !cancelled.TryCommitMove(), "WATCHDOG_NOTICE_SELF_TEST_CANCELLED");
+            }
+            var otherMarker = WatchdogText.WarningNotice("D345678", WatchdogText.KindSlaveFailure, "D234567", state, t0.ToLocalTime())[0];
+            foreach (var invalid in new[]
+            {
+                null, "", ReadyText(marker), PowerSiBusyNotice, "WATCHDOG " + marker, "WATCHDOG " + marker + " | ",
+                "watchdog " + marker + " | 경고\r\nx", "WATCHDOG " + marker + "\r\n감시 시작: PowerSI (PID 1)", " " + warning[0],
+                otherMarker, // Our marker appears only in its body, not in its header.
+                "WATCHDOG " + marker + " | 경고\r\n" + new string('x', PcStatusReport.MaxPhoneLength)
+            })
+            {
+                try { Consent.ForWatchdogNotice(marker, invalid); }
+                catch (MonitorException) { continue; }
+                throw new InvalidOperationException("An invalid watchdog notice was authorized.");
+            }
+            foreach (var invalidMarker in new[] { null, "M234567", "D123456", "d234567" })
+            {
+                try { Consent.ForWatchdogNotice(invalidMarker, warning[0]); }
+                catch (MonitorException) { continue; }
+                throw new InvalidOperationException("A watchdog notice with an invalid consent marker was authorized.");
+            }
+            try { Consent.ForWatchdogNotice(marker, warning[0]).AttachWatchdog(state); throw new InvalidOperationException("Notice took a watchdog."); }
+            catch (MonitorException) { }
+            try { Consent.ForNotice(marker, warning[0]); throw new InvalidOperationException("Watchdog text became a fixed notice."); }
+            catch (MonitorException) { }
         }
 
         private static void Need(bool condition, string reason)

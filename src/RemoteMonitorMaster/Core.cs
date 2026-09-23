@@ -536,6 +536,8 @@ namespace RemoteMonitorMaster
                 TestElementIdentity();
                 ProbeElementCache.RunSelfTest();
                 ProcessIdentity.RunSelfTest();
+                PowerSiCompletion.RunSelfTest();
+                WatchdogSelfTest.RunSelfTest();
                 TestReadOnlyGuards();
                 TestPointerAndShapeHints();
                 ReadOnlyPair.RunSelfTest();

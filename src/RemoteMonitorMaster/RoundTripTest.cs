@@ -26,8 +26,14 @@ namespace RemoteMonitorMaster
             internal readonly SupervisedSendTest.Outcome Send;
             private readonly bool cleanCompletion;
             internal bool CleanCompletion { get { return cleanCompletion; } }
-            internal Outcome(string message, SupervisedSendTest.Outcome send = null, bool? clean = null)
-            { Message = message; Send = send; cleanCompletion = clean ?? (send != null && send.CleanCompletion); }
+            // The idle wait was handed back to the session before any request was observed: not a completion, not an
+            // abort. Only an outcome without a send can be yielded.
+            internal bool Yielded { get; }
+            internal Outcome(string message, SupervisedSendTest.Outcome send = null, bool? clean = null, bool yielded = false)
+            {
+                Message = message; Send = send; cleanCompletion = clean ?? (send != null && send.CleanCompletion);
+                Yielded = yielded && send == null && !cleanCompletion;
+            }
         }
 
         public static string Run(IntPtr window, AuditLog log, string incomingMarker, SupervisedSendTest.Consent consent,
@@ -46,7 +52,8 @@ namespace RemoteMonitorMaster
 
         internal static Outcome ObserveWithStatePath(IntPtr window, AuditLog log, string incomingMarker, SupervisedSendTest.Consent consent,
             Func<bool> stop, Action<string> progress, string statePath, Action<string, ProbeSnapshot> inspectSnapshot,
-            ReceiveProbe.Baseline baseline = null, bool continuousWait = false, OperationalTarget target = null)
+            ReceiveProbe.Baseline baseline = null, bool continuousWait = false, OperationalTarget target = null,
+            Func<bool> yieldRequested = null)
         {
             var owner = new object();
             var reserved = false;
@@ -75,8 +82,14 @@ namespace RemoteMonitorMaster
                     AuditLog.Field("plain_body_verified", false), AuditLog.Field("automatic_send_allowed", false));
                 phase = "RECEIVE";
                 var received = ReceiveProbe.Observe(window, log, incomingMarker, Stopped, progress, owner, false,
-                    inspectSnapshot, baseline, continuousWait, consent.IsPlainCommands, target: target);
+                    inspectSnapshot, baseline, continuousWait, consent.IsPlainCommands, target: target, yieldRequested: yieldRequested);
                 Alive();
+                if (received.Status == "WAIT_YIELDED" && received.Proof == null && received.Single == null)
+                {
+                    // Nothing was observed as a request; the send stage is never entered and the consent retires below.
+                    Result(log, received.Status, received.Reason, false, false, preparedReplyCount, confirmedReplyCount, failedPart);
+                    return new Outcome(received.Message, null, false, true);
+                }
                 if (received.Proof == null)
                 {
                     Result(log, received.Status, received.Reason, false, false, preparedReplyCount,
@@ -130,8 +143,8 @@ namespace RemoteMonitorMaster
                     reserved |= sendProof.DiagnosticTokenReserved;
                     return outcome;
                 }
-                var samplesPcStatus = consent.IsPcStatus && (!consent.IsPlainCommands ||
-                    !observedCommand.StartsWith("help", StringComparison.Ordinal));
+                var watchdogCommand = consent.IsPlainCommands && WatchdogCommand.IsWatchdogCommand(observedCommand);
+                var samplesPcStatus = SamplesPcStatus(consent.IsPcStatus, consent.IsPlainCommands, observedCommand);
                 if (continuousWait && consent.IsPlainCommands && samplesPcStatus)
                 {
                     phase = "NOTICE_BUSY";
@@ -157,6 +170,10 @@ namespace RemoteMonitorMaster
                 if (samplesPcStatus)
                     log.Write("INFO", "PC_STATUS_READY", AuditLog.Field("sampled_after_request", true),
                         AuditLog.Field("source", consent.IsSlaveStatus ? "SLAVE" : "MASTER"),
+                        AuditLog.Field("payload_characters", replies.Sum(value => (long)value.Length)),
+                        AuditLog.Field("prepared_replies", replies.Length));
+                else if (watchdogCommand)
+                    log.Write("INFO", "WATCHDOG_COMMAND_READY",
                         AuditLog.Field("payload_characters", replies.Sum(value => (long)value.Length)),
                         AuditLog.Field("prepared_replies", replies.Length));
                 else if (consent.IsPlainCommands)
@@ -221,6 +238,14 @@ namespace RemoteMonitorMaster
                 // Even no-match, cancellation or a rejected handoff consumes this local test. Durable reservations are never removed.
                 if (consent != null) consent.Cancel();
             }
+        }
+
+        // Like help, a watchdog command (watchdog on|off [PID], help watchdog) is a plain command reply: no BUSY notice,
+        // no PC_STATUS_READY sample; its one prepared part comes from Consent.PrepareReplies. pwrsi/total status sample.
+        internal static bool SamplesPcStatus(bool pcStatus, bool plainCommands, string command)
+        {
+            return pcStatus && (!plainCommands || !(command.StartsWith("help", StringComparison.Ordinal) ||
+                WatchdogCommand.IsWatchdogCommand(command)));
         }
 
         internal static void AuthorizeHandoff(ReceiveProbe.ObservationProof proof, object owner, IntPtr window,
@@ -354,6 +379,19 @@ namespace RemoteMonitorMaster
             // The send proof spans two bounded captures, each capped at ReceivePhaseTimeLimit by ReceiveProbe.
             Need(ProofAgeLimit >= TimeSpan.FromTicks(2 * ReceivePhaseTimeLimit.Ticks) &&
                 ReceivePhaseTimeLimit == TimeSpan.FromSeconds(15), "ROUNDTRIP_PROOF_AGE_LIMIT_COVERS_TWO_PHASES");
+            // A yield is only ever an untouched, unsent, non-clean outcome; every existing outcome stays non-yielded.
+            var rejectedSend = new SupervisedSendTest.Outcome("REJECTED", "TARGET_PC_NOT_IDLE", "test", false, false);
+            Need(!new Outcome("plain").Yielded && !new Outcome("aborted", rejectedSend, false).Yielded &&
+                !new Outcome("clean", new SupervisedSendTest.Outcome("ACTION_RETURNED", "NONE", "test", true)).Yielded &&
+                new Outcome("yielded", null, false, true).Yielded && !new Outcome("yielded", null, false, true).CleanCompletion &&
+                !new Outcome("sent", rejectedSend, false, true).Yielded && !new Outcome("clean", null, true, true).Yielded,
+                "ROUNDTRIP_SELF_TEST_YIELD_OUTCOME");
+            // Watchdog commands share help's reply path: never a BUSY notice or PC status sample; pwrsi/total status still do.
+            Need(new[] { "watchdog on", "watchdog off", "watchdog on 4321", "watchdog off 42", "help watchdog", "help", "help pwrsi" }
+                    .All(command => !SamplesPcStatus(true, true, command)) &&
+                SamplesPcStatus(true, true, "pwrsi") && SamplesPcStatus(true, true, "total status") &&
+                SamplesPcStatus(true, false, null) && !SamplesPcStatus(false, false, null),
+                "ROUNDTRIP_SELF_TEST_WATCHDOG_NOT_SAMPLED");
             const string marker = "M234567";
             var statePath = Path.Combine(directory, "roundtrip-selftest-tokens.txt");
             var blockedPath = Path.Combine(directory, "roundtrip-selftest-blocked-state");

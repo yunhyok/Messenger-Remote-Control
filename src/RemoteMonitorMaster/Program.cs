@@ -73,6 +73,7 @@ namespace RemoteMonitorMaster
                             AuditLog.Field("slave_client_available", true),
                             AuditLog.Field("per_request_replies", "ONE_OR_BOUNDED_REPORT_PARTS"),
                             AuditLog.Field("repeated_requests_require_local_approval", true),
+                            AuditLog.Field("watchdog_available", true),
                             AuditLog.Field("receive_diagnostic", true),
                             AuditLog.Field("send_method", "TIMED_MOUSE_CLICK"),
                             AuditLog.Field("entry_method", "UIA_SETVALUE"),

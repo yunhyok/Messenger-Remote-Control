@@ -31,6 +31,9 @@ namespace RemoteMonitorMaster
         private readonly Label status = new Label();
         private readonly TextBox code = new TextBox();
         private readonly Label replyCode = new Label();
+        private readonly Label watchdogSummary = new Label(); // 명령어 운용 전용: watchdog 요약 한 줄. 상태 줄과 회차는 바꾸지 않습니다.
+        private const string WatchdogSummaryPhase = "WATCHDOG:";
+        private const string WatchdogIdleSummary = "watchdog: 감시 없음";
         private readonly TextBox details = new TextBox();
         private readonly CheckBox confirmation = new CheckBox();
         private readonly Button start = new Button();
@@ -127,7 +130,7 @@ namespace RemoteMonitorMaster
                 Controls.Add(replyCode);
                 Controls.Add(new Label
                 {
-                    Text = operating ? (plainCommands ? "← 휴대폰: pwrsi 그대로 / total status는 단어 사이 한 칸"
+                    Text = operating ? (plainCommands ? "← 휴대폰: pwrsi 그대로 / total status·watchdog on 1234는 단어 사이 한 칸"
                         : "← 첫 M은 READY / 이후 NEXT 숫자 앞에 M")
                         : pcStatus ? "← 휴대폰에서 보낼 M코드 (READY 후 한 번 / 공백 없음)"
                         : "← 현재 회차에 휴대폰에서 보낼 M코드 (READY 후 한 번 / 공백 없음)",
@@ -144,8 +147,9 @@ namespace RemoteMonitorMaster
             confirmation.Text = operating
                 ? (plainCommands
                     ? "본인의 개별 자기 대화창입니다. Slave " + slave.Address + ":" + slave.Port + "의 고정 읽기 전용 명령어 상태 답장을 Stop 전까지 전송하는 것을 승인합니다.\r\n" +
-                        "허용 명령: help / help help / help total status / help pwrsi / total status / pwrsi (소문자, 단어 사이는 ASCII 공백 한 칸).\r\n" +
-                        "발송 시 선택한 대화창 활성화·최소화 복원을 허용합니다. 각 답장 부분마다 커서 이동·입력·클릭은 1회이며, 목록 밖 명령은 실행하지 않습니다."
+                        "허용 명령: help / help help / help total status / help pwrsi / help watchdog / total status / pwrsi / watchdog on / watchdog off (on·off 뒤 PID 지정 가능, 소문자, 단어 사이는 ASCII 공백 한 칸).\r\n" +
+                        "watchdog on으로 켠 감시는 설정 주기(30/60분)마다 Slave의 PowerSI Output을 수집하고 완료·경고 알림을 이 대화창에 보냅니다. watchdog off 또는 Stop으로 끝납니다.\r\n" +
+                        "발송 시 선택한 대화창 활성화·최소화 복원을 허용합니다. 각 답장·알림 부분마다 커서 이동·입력·클릭은 1회이며, 목록 밖 명령은 실행하지 않습니다."
                     : "본인의 개별 자기 대화창입니다. " + (slave == null ? "이 PC" : "Slave " + slave.Address + ":" + slave.Port) + "의 읽기 전용 상태 답장을 Stop 전까지 반복 전송하는 것을 승인합니다.\r\n" +
                         StatusFields + " 커서 이동·입력·클릭은 각 1회입니다.\r\n" +
                         "첫 READY의 M만 보내고 이후에는 답장 NEXT 숫자 앞에 M을 붙여 보냅니다. Stop 후 LOG READY까지 마우스·키보드를 건드리지 않습니다.")
@@ -173,6 +177,16 @@ namespace RemoteMonitorMaster
             stop.SetBounds(737, 266 + offset, 105, 36);
             stop.Click += delegate { Stop("STOPPED"); };
             Controls.AddRange(new Control[] { start, stop });
+            if (plainCommands)
+            {
+                // Start와 Stop 사이의 빈 칸에 둡니다. 기본 크기·스크롤 동작과 다른 컨트롤 위치는 그대로입니다.
+                watchdogSummary.SetBounds(238, 266 + offset + 6, 489, 24);
+                watchdogSummary.AutoEllipsis = true;
+                watchdogSummary.Font = new Font(Font, FontStyle.Bold);
+                watchdogSummary.Text = WatchdogIdleSummary;
+                watchdogSummary.AccessibleName = "watchdog 감시 요약 (감시 수와 다음 확인 시각)";
+                Controls.Add(watchdogSummary);
+            }
             details.SetBounds(18, 322 + offset, 824, 155);
             details.Multiline = true;
             details.ReadOnly = true;
@@ -182,6 +196,7 @@ namespace RemoteMonitorMaster
                 ? (plainCommands
                     ? "pwrsi 한 번은 Slave에서 요청 시점의 PowerSI 보고서를 한 번 수집하고, 1,400자 이하 PART 답장을 순서대로 전송합니다.\r\n" +
                         "help help, help total status도 인식하는 고정 읽기 전용 명령어입니다. 목록 밖의 명령은 승인하거나 실행하지 않으며, 메시지 본문 인증을 주장하지 않습니다.\r\n" +
+                        "watchdog on [PID]는 PowerSI 완료 감시를 켜고 watchdog off [PID]는 해제합니다. 확인 주기는 Master 시작 화면에서 30/60분으로 정하며, 완료·경고만 알리고 진행률은 추측하지 않습니다.\r\n" +
                         "모든 대상이 표시되며 Pending 대상은 이름·PID·Pending만 보냅니다. 나머지는 출처·수집 시각·설명·수집된 Output 전체 또는 이전 전송 이후 추가분을 보내고 진행률·완료를 추측하지 않습니다.\r\n" +
                         "보고서 수집은 최대 100초, 전체 조회는 최대 120초입니다. 한 PART라도 전송 결과가 불확실하면 남은 PART를 보내지 않습니다. Stop 뒤 현재 호출이 끝나야 LOG READY가 표시됩니다."
                     : "반복 통합 확인: 첫 휴대폰 M코드 수신 → " + (slave == null ? "이 PC" : "선택한 Slave PC") + " 읽기 전용 상태 조회 → " + ReportPrefix + " 답장 → 다음 NEXT 숫자 앞에 M을 붙여 반복합니다.\r\n" +
@@ -402,8 +417,13 @@ namespace RemoteMonitorMaster
                     "PREPARING BASELINE - do not send from the phone yet", false);
                 var result = await Task.Run(() =>
                 {
-                    if (operating) return runStatusSession.Run(window, log, () => stopped || EnvironmentChanged(runEnvironmentRevision),
-                        (round, phase, currentMarker) => PublishOperatingSession(round, phase, currentMarker, runGeneration));
+                    // 답장 준비는 이 작업자 스레드에서 동기로 실행되므로 WATCHDOG_COMMAND 기록을 이 로그에 남깁니다.
+                    if (operating)
+                    {
+                        using (ReadOnlyCommands.UseCommandLog(log))
+                            return runStatusSession.Run(window, log, () => stopped || EnvironmentChanged(runEnvironmentRevision),
+                                (round, phase, currentMarker) => PublishOperatingSession(round, phase, currentMarker, runGeneration));
+                    }
                     if (roundTrip) return runSession.Run(window, log, () => stopped || EnvironmentChanged(runEnvironmentRevision),
                         (round, phase) => PublishSession(round, phase, runGeneration));
                     return ReceiveProbe.Run(window, log, marker, () => stopped || EnvironmentChanged(runEnvironmentRevision),
@@ -521,7 +541,14 @@ namespace RemoteMonitorMaster
 
         private void ApplyOperatingProgress(int round, string phase, string currentMarker, int runGeneration)
         {
-            if (stopped || closing || !busy || generation != runGeneration || round < activeRound || round < 0) return;
+            if (stopped || closing || !busy || generation != runGeneration) return;
+            // watchdog 요약은 언제든 올 수 있습니다. 전용 줄만 제자리에서 바꾸고 상태 줄·회차(activeRound)는 건드리지 않습니다.
+            if (plainCommands && phase != null && phase.StartsWith(WatchdogSummaryPhase, StringComparison.Ordinal))
+            {
+                SetWatchdogSummary(phase.Substring(WatchdogSummaryPhase.Length));
+                return;
+            }
+            if (round < activeRound || round < 0) return;
             if (plainCommands)
             {
                 ApplyPlainOperatingProgress(round, phase);
@@ -597,6 +624,19 @@ namespace RemoteMonitorMaster
                     "답장을 위해 처음 선택한 대화창을 앞으로 가져옵니다.", false);
                 SetInteractionNotice("다른 대화창으로 대상을 바꾸지 않습니다. 실제 전송 중에는 잠시 PC 입력을 멈춰 주세요.");
             }
+            else if (phase == "WATCHDOG_CHECKING")
+            {
+                // Slave 수집(최대 약 120초) 동안에는 수신 확인을 쉬고, 그 사이 온 명령은 확인이 끝난 뒤 처리합니다.
+                code.Text = "WAIT";
+                SetStatus("watchdog 확인 중 (최대 120초). 이 동안 보낸 명령은 확인 후 처리됩니다.", false);
+                SetInteractionNotice("watchdog 확인 중 — Slave의 PowerSI Output 수집 / Stop으로 종료");
+            }
+            else if (phase == "NOTICE_WATCHDOG")
+            {
+                code.Text = "WAIT";
+                SetStatus("watchdog 알림을 보내는 중", false);
+                SetInteractionNotice("메신저 안내 전송 중 — 마우스·키보드를 건드리지 마세요.");
+            }
             else if (phase == "NOTICE_READY" || phase == "NOTICE_BUSY")
             {
                 code.Text = "WAIT";
@@ -629,7 +669,7 @@ namespace RemoteMonitorMaster
                 code.Text = "READY";
                 SetStatus("READY — " + count + " / 휴대폰에서 소문자 명령어 하나 (pwrsi에는 공백 불필요)", true);
                 SetInteractionNotice("다른 창 뒤에서도 고정 명령어 수신 대기 / 마우스 오버 불필요 / Stop으로 종료");
-                details.Text = "허용 고정 명령어: help / help help / help total status / help pwrsi / total status / pwrsi\r\n" +
+                details.Text = "허용 고정 명령어: help / help help / help total status / help pwrsi / help watchdog / total status / pwrsi / watchdog on [PID] / watchdog off [PID]\r\n" +
                     "메신저의 Master Ready 이후 첫 명령 하나를 처리합니다. 처리 중 추가 메시지는 대기열에 넣지 않고 무시하므로 다음 Master Ready 뒤에 새 명령을 보내세요.\r\n" +
                     "처음 선택한 대화창을 기억합니다. 다른 창 뒤에서는 그대로 읽고, 발송할 때 앞으로 가져옵니다. 최소화된 창은 복원합니다. PC 입력 중이면 잠시 기다립니다.\r\n" +
                     "total status는 Slave 프로그램 상태를 표시합니다. pwrsi는 모든 PowerSI 대상의 요청 시점 증거를 1,400자 이하 PART로 순서대로 보냅니다.\r\n" +
@@ -640,7 +680,7 @@ namespace RemoteMonitorMaster
             else if (phase == "COMMAND_NOT_MATCHED")
             {
                 code.Text = "READY";
-                SetStatus("새 메시지는 읽었지만 지원 명령과 불일치 — 소문자 pwrsi / total status를 확인하세요.", false);
+                SetStatus("새 메시지는 읽었지만 지원 명령과 불일치 — 소문자 pwrsi / total status / watchdog on을 확인하세요.", false);
                 SetInteractionNotice("앞뒤 공백은 허용 / 철자·대소문자·단어 사이 공백은 구분 / Stop으로 종료");
             }
             else if (phase == "COMMAND_NOT_VISIBLE")
@@ -670,6 +710,19 @@ namespace RemoteMonitorMaster
                 SetStatus("명령 " + (round + 1) + "회 완료 — 휴대폰 답장을 확인하고 다음 고정 명령어를 보낼 수 있습니다. Stop으로 종료합니다.", false);
                 SetInteractionNotice("완료됨 — 명령어 통합 확인 중 / 종료하려면 Stop");
             }
+        }
+
+        // 세션이 만든 요약(감시 수·다음 확인 시각)만 표시합니다. 제어 문자는 공백으로 바꾸고 길이를 제한합니다.
+        private void SetWatchdogSummary(string summary)
+        {
+            var text = new System.Text.StringBuilder();
+            foreach (var value in summary ?? string.Empty)
+            {
+                if (text.Length >= 120) break;
+                text.Append(char.IsControl(value) ? ' ' : value);
+            }
+            var clean = text.ToString().Trim();
+            watchdogSummary.Text = clean.Length == 0 ? WatchdogIdleSummary : "watchdog: " + clean;
         }
 
         // PC 입력 정지 대기를 막고 있는 원인 하나를 그대로 알려 줍니다. 모르는 코드는 기본 문구를 씁니다.
@@ -732,7 +785,13 @@ namespace RemoteMonitorMaster
             if (roundTrip && (result.Contains(SupervisedSendTest.MouseReleaseWarning) ||
                 ActivePendingWrite)) closing = false;
             var explanation = Explain(result); // 작업자 결과 본문은 매핑되지 않으므로 사유 코드일 때만 설명이 붙습니다.
-            details.Text = (string.IsNullOrEmpty(explanation) ? result : result + " — " + explanation) + "\r\n" + OutcomeAdvice();
+            // 운용 세션 결과("STATUS_SESSION_STOPPED — <사유>; ...")는 사유 코드만 꺼내 별도 줄에 설명을 붙입니다.
+            var sessionReason = string.IsNullOrEmpty(explanation) ? SessionStopReason(result) : null;
+            var sessionExplanation = Explain(sessionReason);
+            details.Text = (string.IsNullOrEmpty(explanation) ? result : result + " — " + explanation) +
+                (string.IsNullOrEmpty(sessionExplanation) ? "" : "\r\n" + sessionReason + " — " + sessionExplanation) +
+                "\r\n" + OutcomeAdvice();
+            if (plainCommands) watchdogSummary.Text = "watchdog: 세션 종료 — 감시 없음";
             if (EnvironmentChanged(approvedEnvironmentRevision))
                 details.AppendText("\r\n환경 변경: " + environmentReason + " — 승인은 취소되었으며 자동 재개하지 않습니다.");
             details.AppendText("\r\n" + RestartAdvice);
@@ -817,6 +876,15 @@ namespace RemoteMonitorMaster
             UpdateButtons();
         }
 
+        // StatusSession.Run의 종료 결과 첫 부분에서 사유 코드만 읽습니다. 다른 형식이면 null입니다.
+        private static string SessionStopReason(string result)
+        {
+            const string prefix = "STATUS_SESSION_STOPPED — ";
+            if (result == null || !result.StartsWith(prefix, StringComparison.Ordinal)) return null;
+            var end = result.IndexOf(';', prefix.Length);
+            return end > prefix.Length && end - prefix.Length <= 64 ? result.Substring(prefix.Length, end - prefix.Length) : null;
+        }
+
         // 사유 코드는 그대로 두고 다음 행동만 덧붙입니다. 모르는 코드는 null이며 코드만 표시합니다.
         private static string Explain(string reason)
         {
@@ -854,6 +922,10 @@ namespace RemoteMonitorMaster
                     return "자동 입력·전송이 시작된 뒤 이번 요청이 중단되어 다음 요청을 시작하지 않았습니다. 전달 여부는 확인되지 않으며 자동 재시도는 하지 않습니다. 휴대폰 수신을 직접 확인하고 새 세션을 시작하세요.";
                 case "STATUS_REQUEST_ABORT_LIMIT":
                     return "요청이 연속 " + StatusSession.AbortResumeLimit + "회 중단되어 세션을 끝냈습니다. 새 세션을 시작하세요.";
+                case "STATUS_WATCHDOG_NOTICE_UNCERTAIN":
+                    return "watchdog 알림 전송이 불확실하게 끝나 세션을 중단했습니다. 대화창에서 알림이 보였는지 확인한 뒤 새 세션을 시작하세요.";
+                case "WATCHDOG_STATE_UNAVAILABLE":
+                    return "내부 오류: 운용 세션의 watchdog 상태가 연결되지 않아 watchdog 명령을 처리하지 않았습니다. 로그 폴더의 최신 로그를 첨부해 문의하세요.";
                 case "ROUNDTRIP_PROOF_EXPIRED_OR_WINDOW_CHANGED":
                     return "답장 증거가 허용 시간을 넘었거나 대화창이 바뀌었습니다. 대화 기록이 매우 길면 새 대화를 사용하세요.";
                 case "STATUS_TARGET_CHANGED":
