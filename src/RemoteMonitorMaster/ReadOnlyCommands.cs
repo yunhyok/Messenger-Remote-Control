@@ -310,16 +310,24 @@ namespace RemoteMonitorMaster
                 if (target.State == "PENDING") continue;
                 var repeat = Abbreviate(target.ProcessName) + " (PID " + target.Pid.ToString(CultureInfo.InvariantCulture) + ")";
 
+                // A READ/AUTO_COPY copied by an LLM-free fallback route names that route; its VisionCode is always the
+                // LLM locate failure (OUTPUT_* included), so the LLM line is never suppressed for it.
+                var route = target.State == "READ" && target.Source == "AUTO_COPY" ? FallbackRoute(target.Code) : null;
                 var lines = new List<string>
                 {
-                    "상태: " + StateName(target.State) + " | 출처: " + SourceName(target.Source),
+                    "상태: " + StateName(target.State) + " | 출처: " +
+                        (route == null ? SourceName(target.Source) : "자동 복사(LLM 위치 확인 실패 → " + route + ")"),
                     "대상 수집 UTC: " + (target.CapturedUtc.HasValue ? Utc(target.CapturedUtc.Value) : "확인 불가"),
                     "설명: " + StateExplanation(target.State, target.Source) + " [code " + target.Code + "]"
                 };
                 var captured = target.State == "READ" || target.State == "VISIBLE_EMPTY";
                 if (!captured) lines.Add(RecoveryAdvice(target.Code));
-                if (!string.IsNullOrEmpty(target.VisionCode) && target.VisionCode.StartsWith("VISION_", StringComparison.Ordinal))
+                if (route != null && !string.IsNullOrEmpty(target.VisionCode))
+                    lines.Add("로컬 LLM: " + LocateAdvice(target.VisionCode) + " [code " + target.VisionCode + "]");
+                else if (!string.IsNullOrEmpty(target.VisionCode) && target.VisionCode.StartsWith("VISION_", StringComparison.Ordinal))
                     lines.Add("로컬 LLM: " + RecoveryAdvice(target.VisionCode) + " [code " + target.VisionCode + "]");
+                var chain = FallbackChainAdvice(target);
+                if (chain != null) lines.Add(chain);
                 // Every required status line is in place before Output; order must not depend on lazy evaluation.
                 IEnumerable<string> details = lines;
                 if (captured)
@@ -506,8 +514,50 @@ namespace RemoteMonitorMaster
                 case "NOT_ATTEMPTED": return "전체 수집 시간 제한으로 미확인";
                 case "BUSY": return "다른 수집이 진행 중입니다; 완료 후 다시 요청하세요";
                 case "OUTPUT_REGION_UNCONFIRMED": case "AUTO_COPY_REGION_UNCONFIRMED": return "Output 영역을 확인하지 못해 자동 입력을 생략했습니다";
+                case "AUTO_COPY_BODY_UNCONFIRMED": return "복사할 위치에서 Output 본문을 확인하지 못해 자동 입력을 생략했습니다";
+                case "AUTO_COPY_BODY_MOVED": return "Output 본문 위치가 확인한 위치와 달라져 자동 입력을 생략했습니다";
+                case "AUTO_COPY_OCCLUDED": return "다른 창이 Output을 가리고 있어 자동 입력을 생략했습니다";
+                case "AUTO_COPY_ANCHOR_CONTINUITY": return "저장 위치의 텍스트가 이전과 이어지지 않아 복사 결과를 버렸습니다";
                 default: return "수집 미확인; Slave의 대상 창과 로컬 설정을 확인하세요";
             }
+        }
+
+        // LLM-free fallback copy routes the Slave uses when its local LLM could not locate the Output pane.
+        private static string FallbackRoute(string code)
+        {
+            switch (code)
+            {
+                case "AUTO_COPY_ANCHOR_READ": return "저장 위치로 복사";
+                case "AUTO_COPY_SCOPE_READ": return "Output 창 구조로 복사";
+                case "AUTO_COPY_LAYOUT_READ": return "같은 창 크기의 저장 레이아웃으로 복사";
+                default: return null;
+            }
+        }
+
+        // The LLM locate failure behind a fallback copy. OUTPUT_* is the locator's own result here, not a skipped copy.
+        private static string LocateAdvice(string code)
+        {
+            switch (code)
+            {
+                case "OUTPUT_UNAVAILABLE": return "Output 창 위치를 찾지 못했습니다";
+                case "OUTPUT_REGION_UNCONFIRMED": return "찾은 Output 위치를 확인하지 못했습니다";
+                case "VISION_BUSY": return "다른 로컬 LLM 판독이 진행 중이었습니다";
+                default: return RecoveryAdvice(code);
+            }
+        }
+
+        // UNAVAILABLE after the LLM locate and every fallback route failed. PS4 carries no detail: the Slave's per-route
+        // "FB|VISION=..|ANCHOR=..|SCOPE=..|LAYOUT=.." stays Slave-local, so this names the LLM failure and the last route's
+        // code, both already validated as [A-Z0-9_] codes. VISION_* and OUTPUT_REGION_UNCONFIRMED are always locate
+        // failures; OUTPUT_UNAVAILABLE is also what a successful LOCATE_ONLY reports, so that pairing gets no chain line.
+        private static string FallbackChainAdvice(PowerSiTargetReport target)
+        {
+            var vision = target.VisionCode ?? string.Empty;
+            if (target.State != "UNAVAILABLE" || target.Code == null || !target.Code.StartsWith("AUTO_COPY_", StringComparison.Ordinal) ||
+                !(vision.StartsWith("VISION_", StringComparison.Ordinal) || vision == "OUTPUT_REGION_UNCONFIRMED")) return null;
+            return "LLM 위치 확인(" + vision + ")과 대체 복사(" +
+                (target.Code == "AUTO_COPY_REGION_UNCONFIRMED" ? "사용할 위치 없음" : "마지막 결과: " + target.Code) +
+                ")가 모두 실패했습니다. LM Studio와 모델 상태를 확인하거나 Slave에서 PowerSI 전체 수집을 한 번 실행해 위치를 다시 저장하세요.";
         }
 
         private static string BatchExplanation(string code, int targets)
@@ -794,6 +844,66 @@ namespace RemoteMonitorMaster
             };
             var blankOcr = string.Join("\n", FormatPowerSi(nonce, state));
             Need(blankOcr.Contains("본문") && !blankOcr.Contains("별도 로컬 OCR") && !blankOcr.Contains("LLM 전사본"));
+
+            // LLM-free fallback copies: READ/AUTO_COPY stays the judged direct source, the route and the LLM failure both show.
+            const string relearn = "LM Studio와 모델 상태를 확인하거나 Slave에서 PowerSI 전체 수집을 한 번 실행해 위치를 다시 저장하세요.";
+            PowerSiTargetReport Fallback(int pid, string targetState, string code, string vision)
+            {
+                var read = targetState == "READ";
+                return new PowerSiTargetReport { Pid = pid, StartUtcTicks = captured.Ticks, CapturedUtc = read ? captured : (DateTime?)null,
+                    ProcessName = "PowerSI Fallback " + pid.ToString(CultureInfo.InvariantCulture) + " " + new string('界', 200),
+                    State = targetState, Source = read ? "AUTO_COPY" : "NONE", Code = code, BufferCode = read ? "AUTO_COPY_READ" : code,
+                    VisionCode = vision, OutputText = read ? "대체 본문 " + pid.ToString(CultureInfo.InvariantCulture) : string.Empty };
+            }
+            string Rendered(params PowerSiTargetReport[] targets)
+            {
+                state.PowerSiReport = new PowerSiReport { CapturedUtc = captured, SessionId = 7, Targets = targets,
+                    Partial = targets.Any(t => t.State != "READ") };
+                var rendered = FormatPowerSi(nonce, state);
+                Need(rendered.Length > 1 && rendered.Select((part, i) => part.Length <= PcStatusReport.MaxPhoneLength &&
+                    IsReply(part, "pwrsi", nonce) && IsReplyPart(part, "pwrsi", nonce, i + 1, rendered.Length)).All(valid => valid));
+                return string.Join("\n", rendered);
+            }
+            var routes = Rendered(Fallback(41, "READ", "AUTO_COPY_ANCHOR_READ", "VISION_SERVER_UNAVAILABLE"),
+                Fallback(42, "READ", "AUTO_COPY_SCOPE_READ", "OUTPUT_UNAVAILABLE"),
+                Fallback(43, "READ", "AUTO_COPY_LAYOUT_READ", "OUTPUT_REGION_UNCONFIRMED"),
+                Fallback(44, "READ", "AUTO_COPY_READ", "OUTPUT_UNAVAILABLE"));
+            Need(routes.Contains("상태: 읽음 | 출처: 자동 복사(LLM 위치 확인 실패 → 저장 위치로 복사)") &&
+                routes.Contains("로컬 LLM: Slave의 LM Studio 로컬 서버 실행과 포트를 확인하세요 [code VISION_SERVER_UNAVAILABLE]") &&
+                routes.Contains("상태: 읽음 | 출처: 자동 복사(LLM 위치 확인 실패 → Output 창 구조로 복사)") &&
+                routes.Contains("로컬 LLM: Output 창 위치를 찾지 못했습니다 [code OUTPUT_UNAVAILABLE]") &&
+                routes.Contains("상태: 읽음 | 출처: 자동 복사(LLM 위치 확인 실패 → 같은 창 크기의 저장 레이아웃으로 복사)") &&
+                routes.Contains("로컬 LLM: 찾은 Output 위치를 확인하지 못했습니다 [code OUTPUT_REGION_UNCONFIRMED]") &&
+                routes.Contains("[code AUTO_COPY_SCOPE_READ]") && routes.Contains("대체 본문 41") && routes.Contains("대체 본문 43") &&
+                Occurrences(routes, "출처: 자동 복사(") == 3 && Occurrences(routes, "로컬 LLM: ") == 3 &&
+                Occurrences(routes, "출처: 자동 복사\r\n") == 1 && !routes.Contains("자동 입력을 생략") && !routes.Contains("LLM 위치 확인("));
+            var chains = Rendered(Fallback(51, "UNAVAILABLE", "AUTO_COPY_BODY_MOVED", "VISION_TIMEOUT"),
+                Fallback(52, "UNAVAILABLE", "AUTO_COPY_REGION_UNCONFIRMED", "OUTPUT_REGION_UNCONFIRMED"),
+                Fallback(53, "UNAVAILABLE", "AUTO_COPY_ANCHOR_CONTINUITY", "VISION_MODEL_UNAVAILABLE"),
+                Fallback(54, "UNAVAILABLE", "AUTO_COPY_OCCLUDED", "OUTPUT_UNAVAILABLE"),
+                Fallback(55, "UNAVAILABLE", "AUTO_COPY_BODY_UNCONFIRMED", null),
+                Fallback(56, "UNAVAILABLE", "VISION_SERVER_UNAVAILABLE", "VISION_SERVER_UNAVAILABLE"));
+            var fallbackCodes = new[] { "AUTO_COPY_ANCHOR_CONTINUITY", "AUTO_COPY_BODY_MOVED", "AUTO_COPY_BODY_UNCONFIRMED", "AUTO_COPY_OCCLUDED" };
+            Need(chains.Contains("LLM 위치 확인(VISION_TIMEOUT)과 대체 복사(마지막 결과: AUTO_COPY_BODY_MOVED)가 모두 실패했습니다. " + relearn) &&
+                chains.Contains("LLM 위치 확인(OUTPUT_REGION_UNCONFIRMED)과 대체 복사(사용할 위치 없음)가 모두 실패했습니다. " + relearn) &&
+                chains.Contains("LLM 위치 확인(VISION_MODEL_UNAVAILABLE)과 대체 복사(마지막 결과: AUTO_COPY_ANCHOR_CONTINUITY)가 모두 실패했습니다. ") &&
+                Occurrences(chains, "LLM 위치 확인(") == 3 && Occurrences(chains, relearn) == 3 &&
+                chains.Contains("로컬 LLM: 제한 시간 내 수집하지 못했습니다 [code VISION_TIMEOUT]") && !chains.Contains("출처: 자동 복사") &&
+                chains.Contains("저장 위치의 텍스트가 이전과 이어지지 않아 복사 결과를 버렸습니다") &&
+                fallbackCodes.Select(RecoveryAdvice).Distinct().Count() == 4 &&
+                fallbackCodes.All(code => RecoveryAdvice(code) != RecoveryAdvice("UNKNOWN_CODE") && chains.Contains(RecoveryAdvice(code))));
+            // The route code never changes the output-history identity: same direct family, same text, nothing new to send.
+            var routeHistoryPath = Path.Combine(directory, "command-route-history.txt");
+            try
+            {
+                var routeHistory = new PowerSiOutputHistory(routeHistoryPath);
+                var direct = new PowerSiReport { CapturedUtc = captured, SessionId = 7,
+                    Targets = new[] { Fallback(61, "READ", "AUTO_COPY_READ", "OUTPUT_UNAVAILABLE") } };
+                Need(routeHistory.Prepare(pin, direct).Commit());
+                direct.Targets[0].Code = "AUTO_COPY_LAYOUT_READ"; direct.Targets[0].VisionCode = "VISION_TIMEOUT";
+                Need(routeHistory.Prepare(pin, direct).Primary[0].Kind == PowerSiOutputDelta.Unchanged);
+            }
+            finally { File.Delete(routeHistoryPath); }
 
             var mismatch = FormatQueryFailure("pwrsi", nonce, new LinkVersionMismatchException("0.1.58"));
             Need(mismatch.Length == 1 && IsReportPart(mismatch[0], nonce, 1, 1) && mismatch[0].Contains(LinkVersion.Value) &&
