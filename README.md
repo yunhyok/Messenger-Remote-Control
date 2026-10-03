@@ -1,4 +1,4 @@
-# Messenger Remote Control v0.3.9
+# Messenger Remote Control v0.3.10
 
 모바일 KI-Messenger의 나와의 대화에 명령을 보내면 Desktop의 **Master**가 Workstation의 **Slave**에 상태를 요청하고, PowerSI별 결과를 같은 대화로 회신합니다.
 
@@ -13,6 +13,8 @@ flowchart LR
 ## 설치와 실행
 
 [공개 Releases](https://github.com/yunhyok/Messenger-Remote-Control/releases)에서 역할에 맞는 설치 파일을 받으세요. 오프라인 Slave에는 Slave 설치 파일 또는 Slave ZIP만 옮기면 됩니다. 자세한 설치·업그레이드 방법은 [INSTALL.md](INSTALL.md)에 있습니다.
+
+v0.3.10은 Slave의 로컬 LLM(LM Studio)이 PowerSI Output 위치를 찾지 못할 때를 위한 Slave 변경입니다. 지금까지는 서버 꺼짐·모델 미로드·시간 초과·판독 불가로 위치 확인이 실패하면 그 대상의 Output을 받지 못했습니다(`AUTO_COPY_REGION_UNCONFIRMED`). 이제 Slave의 LLM 판독과 자동 탐색·복사가 켜져 있으면 LLM 없이 위치를 정해 기존 자동 복사(Ctrl+A/Ctrl+C, 같은 창·크기·본문 위치·가림·입력·클립보드 확인 그대로)를 시도합니다. 순서는 ① 같은 PowerSI 프로세스에서 이전에 LLM이 확인해 복사했던 위치(이전 본문과 이어지는지 확인), ② PowerSI 창이 알려 주는 Output 창 영역, ③ 같은 창 크기의 다른 PowerSI에서 확인했던 위치입니다. 성공하면 `pwrsi` 답장의 출처가 "자동 복사(LLM 위치 확인 실패 → …)"로 표시되고 LLM 실패 코드가 함께 나오며, 모두 실패하면 그 결과와 다음 행동을 한 줄로 안내합니다. 위치는 Slave의 `%LOCALAPPDATA%\RemoteMonitorSlave\output-anchors-v1.txt`에 좌표·창 크기·식별값만 저장되고 Output 본문은 저장되지 않습니다. 대체 복사도 종전 자동 복사처럼 PowerSI 창을 앞으로 가져오고 클립보드를 덮어쓰며 복원하지 않습니다. 이렇게 읽은 본문은 watchdog 완료 판정에도 쓰입니다. Master와 Slave 실행 파일·설치파일에는 새 아이콘(Master: 메신저 말풍선과 원격 신호, Slave: 작업용 화면과 주파수 스윕·완료 체크)이 들어갔습니다. **실제 현장에서는 아직 확인하지 않았습니다**(자동 검사만 통과).
 
 v0.3.9는 휴대폰 명령 `watchdog`을 추가한 Master 변경입니다. `watchdog on`을 보내면 그 시점에 Slave에서 실행 중인 PowerSI를 감시 목록에 올리고, Master 시작 화면에서 고른 주기(30분 또는 60분)마다 `pwrsi`와 같은 방법으로 Output을 수집해 버퍼·자동 복사로 읽은 Output에 `AFS Finished`와 `Total Sampling Points`가 보이면 `WATCHDOG … | 완료 알림`을 보내고 해당 감시를 해제합니다. 알림 뒤에는 새 `Master Ready`가 옵니다. Pending·수집 실패·OCR 결과는 완료로 판정하지 않고, 이 확인은 `pwrsi`의 전송 이력을 바꾸지 않습니다. 감시는 Master의 운용 세션이 끝나면(Stop·잠금·절전) 함께 끝납니다. 직접 버퍼 읽기가 실패한 대상은 `pwrsi`와 같이 Slave에서 PowerSI 창 활성화와 자동 복사(포커스·클립보드 사용)를 쓸 수 있고 Slave에는 사용자가 작업 중인지 보는 보호가 없으므로, Slave PC를 직접 쓰는 동안에는 감시를 꺼 두는 편이 안전합니다. **실제 현장에서는 아직 확인하지 않았습니다**(자동 검사만 통과). Slave는 버전 표기만 0.3.9로 올랐습니다.
 
@@ -30,7 +32,7 @@ v0.3.3은 분할 회신 중 이미 접수한 명령을 다시 확인할 때, 화
 
 Start 뒤 5초 안에 한 번 선택한 나와의 대화만 연결합니다. 일반 창에 다른 창이 덮여 있어도 읽기는 계속합니다. 선택한 창을 최소화하면 읽기 전 그 창만 원래 크기로 복원하므로, 동작 중에는 최소화 상태로 남지 않습니다. Ready·처리 안내·각 회신 부분 전에는 PC 입력이 1초 이상 멈추고 메뉴·끌기·누른 키가 없어야 합니다. 그 뒤 원래 프로그램과 창, 대화를 다시 확인하고 회신 입력 직전에만 해당 창을 한 번 앞으로 가져옵니다. 다른 창을 움직이거나 크기를 바꾸지 않습니다. Windows가 앞으로 가져오기를 거부하면 `TARGET_ACTIVATION_REJECTED`로 회신 전 중단하며 자동 재시도하지 않습니다. 잠금·세션 전환·절전도 중단하며 자동으로 다시 시작하지 않습니다.
 
-**Master만 0.3.9로 업그레이드하면 기존 Slave v0.3.0~0.3.8과 함께 사용할 수 있습니다.** 프로토콜은 0.3.0이며 연결파일·설정·송부 이력은 유지됩니다. Slave 0.3.9 설치파일도 함께 배포하지만 Slave는 버전 표기 외에 달라지는 것이 없습니다.
+**Master만 0.3.10으로 업그레이드하면 기존 Slave v0.3.0~0.3.9와 함께 사용할 수 있고, Slave 0.3.10도 Master 0.3.x와 함께 동작합니다.** LLM 위치 확인 실패 시의 대체 복사는 Slave 0.3.10의 기능이므로 이를 쓰려면 Slave도 0.3.10으로 올립니다. 이전 Master에서는 그 대상의 출처가 "자동 복사"로만 보이고 경로는 `[code AUTO_COPY_…_READ]`에만 나타납니다. 프로토콜은 0.3.0이며 연결파일·설정·송부 이력은 유지됩니다.
 
 1. Workstation에서 Slave를 실행하고 통신 IP를 선택한 뒤 Start를 누릅니다. 화면 판독이 필요한 경우 같은 PC의 LM Studio 서버와 이미지 모델을 사용자가 미리 준비합니다.
 2. Slave의 연결파일을 내보내 Desktop Master로 전달합니다. 이 파일은 공개하거나 저장소에 넣지 마세요.

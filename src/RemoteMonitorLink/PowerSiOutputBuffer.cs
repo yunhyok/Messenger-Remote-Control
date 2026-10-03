@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Drawing;
 using System.Globalization;
 using System.Linq;
 using System.Runtime.InteropServices;
@@ -41,6 +42,7 @@ namespace RemoteMonitorLink
             var scopes = new HashSet<IntPtr>();
             int uiaVisited = 0, textCandidates = 0;
             string code = "BUFFER_FAILED";
+            IntPtr output = IntPtr.Zero; // Set only once exactly one outer Output scope HWND is identified.
             try
             {
                 uint pid;
@@ -89,7 +91,7 @@ namespace RemoteMonitorLink
                 var outerScopes = scopes.Where(s => !scopes.Any(other => other != s && IsChild(other, s))).ToArray();
                 Require(outerScopes.Length != 0, "BUFFER_OUTPUT_NOT_IDENTIFIED");
                 Require(outerScopes.Length == 1, "BUFFER_OUTPUT_AMBIGUOUS");
-                var output = outerScopes[0];
+                output = outerScopes[0];
                 var candidates = nodes.Where(n => n.Visible && IsTextClass(n.Class) && (n.Style & Multiline) != 0 &&
                     (n.Style & Password) == 0 && IsChild(output, n.Handle)).ToArray();
                 textCandidates = candidates.Length;
@@ -120,13 +122,60 @@ namespace RemoteMonitorLink
             }
             catch (ReadFailure ex) { code = ex.Message; }
             catch { code = "BUFFER_FAILED"; }
-            return new OutputBufferResult { Code = code, Method = "NATIVE_WM_GETTEXT",
-                Detail = Detail(nodes.Count, scopes.Count, textCandidates, uiaVisited) };
+            // One identified Output HWND whose text could not be read whole: add its rectangle (geometry only) so a
+            // separately guarded copy fallback can aim without vision. Every other result keeps the 5-field B1 shape.
+            var detail = Detail(nodes.Count, scopes.Count, textCandidates, uiaVisited);
+            if (output != IntPtr.Zero && ScopeRectCodes.Contains(code, StringComparer.Ordinal)) detail += ScopeRectSuffix(root, output);
+            return new OutputBufferResult { Code = code, Method = "NATIVE_WM_GETTEXT", Detail = detail };
         }
 
+        private static readonly string[] ScopeRectCodes = { "BUFFER_STANDARD_TEXT_NOT_FOUND", "BUFFER_TEXT_AMBIGUOUS",
+            "BUFFER_RICHEDIT_LARGE_UNSUPPORTED", "BUFFER_READ_TIMEOUT", "BUFFER_INCOMPLETE", "BUFFER_CHANGED_DURING_READ" };
         private static string Detail(int nodes, int scopes, int candidates, int uia)
         {
             return string.Format(CultureInfo.InvariantCulture, "B1|{0}|{1}|{2}|{3}", nodes, scopes, candidates, uia);
+        }
+        // "|R|x|y|w|h" in the root's CLIENT pixels, in this DPI-unaware process's virtualized space like the Slave's other
+        // window coordinates. Empty when the scope is gone or maps to an empty rectangle; never throws.
+        private static string ScopeRectSuffix(IntPtr root, IntPtr scope)
+        {
+            try
+            {
+                NativeRect bounds;
+                if (!IsWindow(scope) || !IsChild(root, scope) || !IsWindowVisible(scope) || !GetWindowRect(scope, out bounds)) return "";
+                var a = new NativePoint { X = bounds.Left, Y = bounds.Top };
+                var b = new NativePoint { X = bounds.Right, Y = bounds.Bottom };
+                if (!ScreenToClient(root, ref a) || !ScreenToClient(root, ref b)) return "";
+                // A mirrored (RTL) root swaps the horizontal corners; normalize instead of reporting a negative width.
+                long x = Math.Min(a.X, b.X), y = Math.Min(a.Y, b.Y), w = Math.Abs((long)b.X - a.X), h = Math.Abs((long)b.Y - a.Y);
+                if (w <= 0 || h <= 0 || w > int.MaxValue || h > int.MaxValue) return "";
+                return string.Format(CultureInfo.InvariantCulture, "|R|{0}|{1}|{2}|{3}", x, y, w, h);
+            }
+            catch { return ""; }
+        }
+        // Parses the "|R|x|y|w|h" suffix of a 10-field B1 Detail. False for the 5-field shape, any extra/malformed field,
+        // non-canonical or signed numbers, zero size, or a rectangle not fully inside clientSize. Never throws.
+        internal static bool TryScopeRect(string detail, Size clientSize, out Rectangle rect)
+        {
+            rect = Rectangle.Empty;
+            try
+            {
+                if (detail == null) return false;
+                var p = detail.Split('|');
+                bool Number(int index, out int value)
+                {
+                    return int.TryParse(p[index], NumberStyles.None, CultureInfo.InvariantCulture, out value) &&
+                        value.ToString(CultureInfo.InvariantCulture) == p[index];
+                }
+                int count, x, y, w, h;
+                if (p.Length != 10 || p[0] != "B1" || p[5] != "R" || !Number(1, out count) || !Number(2, out count) ||
+                    !Number(3, out count) || !Number(4, out count) || !Number(6, out x) || !Number(7, out y) ||
+                    !Number(8, out w) || !Number(9, out h) || w == 0 || h == 0 ||
+                    (long)x + w > clientSize.Width || (long)y + h > clientSize.Height) return false;
+                rect = new Rectangle(x, y, w, h);
+                return true;
+            }
+            catch { rect = Rectangle.Empty; return false; }
         }
         private static void ValidateTarget(IntPtr root, IntPtr scope, Node target, uint expectedPid)
         {
@@ -237,6 +286,7 @@ namespace RemoteMonitorLink
             catch (ReadFailure ex) { Require(ex.Message == "BUFFER_TOO_LARGE", "TEST_SIZE"); }
             try { ValidateLength(65536, true); throw new InvalidOperationException("Large RichEdit accepted."); }
             catch (ReadFailure ex) { Require(ex.Message == "BUFFER_RICHEDIT_LARGE_UNSUPPORTED", "TEST_RICHEDIT_SIZE"); }
+            ScopeRectParseSelfTest();
             // Owned offscreen HWND fixture. Never changes another application's focus, input, or clipboard.
             var root = CreateWindowEx(0x08000080, "Static", "Owned buffer self-test", 0x80000000 | Visible,
                 -32000, -32000, 420, 280, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
@@ -258,13 +308,18 @@ namespace RemoteMonitorLink
                 Require(GetForegroundWindow() == beforeFocus && GetClipboardSequenceNumber() == beforeClipboard, "TEST_NO_GLOBAL_MUTATION");
                 var second = CreateWindowEx(0, "Edit", "other", Child | Visible | Multiline, 0, 30, 100, 30,
                     scope, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
-                Require(second != IntPtr.Zero && Read(root).Code == "BUFFER_TEXT_AMBIGUOUS", "TEST_AMBIGUOUS_TEXT");
+                var ambiguous = Read(root);
+                Require(second != IntPtr.Zero && ambiguous.Code == "BUFFER_TEXT_AMBIGUOUS" && ambiguous.Text == null &&
+                    ambiguous.Detail == "B1|3|1|2|0|R|0|0|400|250", "TEST_AMBIGUOUS_TEXT");
                 DestroyWindow(second);
                 var secondScope = CreateWindowEx(0, "Static", "Output", Child | Visible, 0, 0, 100, 100,
                     root, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
                 var secondEdit = CreateWindowEx(0, "Edit", "other", Child | Visible | Multiline, 0, 0, 50, 50,
                     secondScope, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
-                Require(secondScope != IntPtr.Zero && secondEdit != IntPtr.Zero && Read(root).Code == "BUFFER_OUTPUT_AMBIGUOUS",
+                var twoScopes = Read(root);
+                Rectangle none;
+                Require(secondScope != IntPtr.Zero && secondEdit != IntPtr.Zero && twoScopes.Code == "BUFFER_OUTPUT_AMBIGUOUS" &&
+                    twoScopes.Detail == "B1|4|2|0|0" && !TryScopeRect(twoScopes.Detail, new Size(420, 280), out none),
                     "TEST_AMBIGUOUS_OUTPUT");
                 DestroyWindow(secondScope);
                 DestroyWindow(edit);
@@ -278,8 +333,44 @@ namespace RemoteMonitorLink
                         !rejected.Detail.Contains("private"), "TEST_HIDDEN_SINGLELINE_PASSWORD");
                     DestroyWindow(excluded);
                 }
+                // A non-Edit child keeps one Output scope with no standard text control: its rectangle is reported in
+                // root client pixels (geometry and counts only) and parses back exactly.
+                DestroyWindow(scope);
+                var aimed = CreateWindowEx(0, "Static", "Output", Child | Visible, 12, 8, 300, 200,
+                    root, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+                var custom = CreateWindowEx(0, "Static", "", Child | Visible, 0, 0, 120, 80,
+                    aimed, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+                Require(aimed != IntPtr.Zero && custom != IntPtr.Zero, "TEST_CREATE_CUSTOM");
+                var located = Read(root);
+                Rectangle aim;
+                Require(located.Code == "BUFFER_STANDARD_TEXT_NOT_FOUND" && located.Text == null &&
+                    located.Detail == "B1|2|1|0|0|R|12|8|300|200" && TryScopeRect(located.Detail, new Size(420, 280), out aim) &&
+                    aim == new Rectangle(12, 8, 300, 200) && !TryScopeRect(located.Detail, new Size(311, 280), out aim),
+                    "TEST_SCOPE_RECT");
             }
             finally { DestroyWindow(root); }
+        }
+
+        private static void ScopeRectParseSelfTest()
+        {
+            var client = new Size(800, 600);
+            Rectangle rect;
+            Require(TryScopeRect("B1|5|1|0|0|R|10|20|300|200", client, out rect) && rect == new Rectangle(10, 20, 300, 200),
+                "TEST_SCOPE_RECT_PARSE");
+            Require(TryScopeRect("B1|5|1|2|0|R|0|0|800|600", client, out rect) && rect == new Rectangle(0, 0, 800, 600),
+                "TEST_SCOPE_RECT_EDGE");
+            foreach (var bad in new[] { null, "", "NONE", "B1|2|1|1|0", "B1|5|1|0|0|R", "B1|5|1|0|0|R|10|20|300",
+                "B1|5|1|0|0|R|10|20|300|200|7", "B1|5|1|0|0|R|10|20|300|200|R|1|1|1|1", "B1|5|1|0|0|R|10|20|300|200|",
+                "B1|5|1|0|0|R|-1|20|300|200", "B1|5|1|0|0|R|10|-20|300|200", "B1|5|1|0|0|R|10|20|-300|200",
+                "B1|5|1|0|0|R|10|20|300|-200", "B1|5|1|0|0|R|10|20|0|200", "B1|5|1|0|0|R|10|20|300|0",
+                "B1|5|1|0|0|R|501|20|300|200", "B1|5|1|0|0|R|10|401|300|200", "B1|5|1|0|0|R|0|0|801|600",
+                "B1|5|1|0|0|R|2147483647|0|2147483647|1", "B1|5|1|0|0|R|x|20|300|200", "B1|5|1|0|0|R|10|20|3e2|200",
+                "B1|5|1|0|0|R| 10|20|300|200", "B1|5|1|0|0|R|+10|20|300|200", "B1|5|1|0|0|R|010|20|300|200",
+                "B1|5|1|0|0|R|10|20|300|99999999999", "B1|5|1|0|0|Q|10|20|300|200", "B2|5|1|0|0|R|10|20|300|200",
+                "B1|x|1|0|0|R|10|20|300|200", "B1|5|1|0|-1|R|10|20|300|200", "SOURCE_PID_MATCH|R|10|20|300|200|1|1|1" })
+                Require(!TryScopeRect(bad, client, out rect) && rect == Rectangle.Empty, "TEST_SCOPE_RECT_REJECT");
+            Require(!TryScopeRect("B1|5|1|0|0|R|0|0|1|1", Size.Empty, out rect) &&
+                !TryScopeRect("B1|5|1|0|0|R|0|0|1|1", new Size(-5, 600), out rect), "TEST_SCOPE_RECT_EMPTY_CLIENT");
         }
 
         private delegate bool WindowCallback(IntPtr window, IntPtr parameter);
@@ -303,6 +394,10 @@ namespace RemoteMonitorLink
         private static extern IntPtr CreateWindowEx(uint exStyle, string className, string title, uint style, int x, int y, int width,
             int height, IntPtr parent, IntPtr menu, IntPtr instance, IntPtr parameter);
         [DllImport("user32.dll")] private static extern bool DestroyWindow(IntPtr window);
+        [StructLayout(LayoutKind.Sequential)] private struct NativeRect { internal int Left, Top, Right, Bottom; }
+        [StructLayout(LayoutKind.Sequential)] private struct NativePoint { internal int X, Y; }
+        [DllImport("user32.dll")] private static extern bool GetWindowRect(IntPtr window, out NativeRect rect);
+        [DllImport("user32.dll")] private static extern bool ScreenToClient(IntPtr window, ref NativePoint point);
         [DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
         [DllImport("user32.dll")] private static extern uint GetClipboardSequenceNumber();
     }

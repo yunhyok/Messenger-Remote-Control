@@ -16,6 +16,7 @@
   #define ProductName "Messenger Remote Control Master"
   #define ExecutableName "RemoteMonitorMaster.exe"
   #define SourceDirectory ProjectRoot + "\src\RemoteMonitorMaster\bin\Release\net48"
+  #define SourceIcon ProjectRoot + "\src\RemoteMonitorMaster\app.ico"
   #define SetupName "Messenger-Remote-Control-Master-Setup-" + AppVersion
   #define AppIdentifier "{{3F6487C1-1D80-4C38-8CAB-92C22E3DF4A0}"
   #define AppMutexName "Local\RemoteMonitorMaster"
@@ -25,6 +26,7 @@
   #define ProductName "Messenger Remote Control Slave"
   #define ExecutableName "RemoteMonitorSlave.exe"
   #define SourceDirectory ProjectRoot + "\src\RemoteMonitorSlave\bin\Release\net48"
+  #define SourceIcon ProjectRoot + "\src\RemoteMonitorSlave\app.ico"
   #define SetupName "Messenger-Remote-Control-Slave-Setup-" + AppVersion
   #define AppIdentifier "{{8D85E8BA-6F8E-4B51-BA88-4B8B6D515627}"
   #define AppMutexName "Local\RemoteMonitorSlave"
@@ -54,6 +56,7 @@ RestartApplications=no
 AppMutex={#AppMutexName}
 UninstallDisplayName={#ProductName} v{#AppVersion}
 UninstallDisplayIcon={app}\{#ExecutableName}
+SetupIconFile={#SourceIcon}
 VersionInfoCompany=Messenger Remote Control
 VersionInfoDescription={#ProductName} Setup
 VersionInfoProductName={#ProductName}
