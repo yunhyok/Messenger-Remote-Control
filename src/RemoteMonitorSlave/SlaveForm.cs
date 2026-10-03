@@ -99,6 +99,7 @@ namespace RemoteMonitorSlave
 
         internal SlaveForm(string testDirectory = null)
         {
+            RemoteMonitorLink.AppIcon.Apply(this);
             Text = Program.Title + " - READ ONLY";
             Font = new Font("Segoe UI", 9F);
             AutoScaleMode = AutoScaleMode.Dpi;

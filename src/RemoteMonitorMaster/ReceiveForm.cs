@@ -67,6 +67,7 @@ namespace RemoteMonitorMaster
 
         internal ReceiveForm(AuditLog log, bool roundTrip, bool pcStatus, SlaveEndpoint slave, bool operating, bool plainCommands)
         {
+            RemoteMonitorLink.AppIcon.Apply(this);
             this.log = log ?? throw new ArgumentNullException(nameof(log));
             if (pcStatus && !roundTrip) throw new ArgumentException("PC status requires the approved reply mode.", nameof(pcStatus));
             if (slave != null && !pcStatus) throw new ArgumentException("Slave requires status mode.", nameof(slave));

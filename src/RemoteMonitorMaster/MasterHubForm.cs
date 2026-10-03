@@ -30,6 +30,7 @@ namespace RemoteMonitorMaster
 
         internal MasterHubForm(AuditLog log)
         {
+            RemoteMonitorLink.AppIcon.Apply(this);
             this.log = log;
             Text = AppInfo.Title + " - MASTER / SLAVE";
             Font = new Font("Segoe UI", 9F);

@@ -80,6 +80,7 @@ namespace RemoteMonitorSlave
 
         internal LocalVisionSettingsForm(LocalVisionSettings settings)
         {
+            RemoteMonitorLink.AppIcon.Apply(this);
             Text = Program.Title + " — LM Studio 설정"; Font = dialogFont;
             ClientSize = new Size(640, 516); FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false; MinimizeBox = false; StartPosition = FormStartPosition.CenterParent;
