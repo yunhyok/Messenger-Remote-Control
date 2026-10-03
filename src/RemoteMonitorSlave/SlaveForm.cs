@@ -40,7 +40,13 @@ namespace RemoteMonitorSlave
             internal readonly List<PowerSiObservation> Runs = new List<PowerSiObservation>();
             internal byte[] FailureFrame;
             internal string Failure;
-            public override string ToString() { return "PID " + Process.Pid + " / " + (Buffer?.Code ?? "대기") + " / OCR " +
+            // Vision-failure fallback: the model code that started it, the FB|... chain once any route was attempted,
+            // and the route ("ANCHOR"/"SCOPE"/"LAYOUT") whose copy was accepted. All null when no fallback ran.
+            internal string FallbackVision;
+            internal string Fallback;
+            internal string Route;
+            public override string ToString() { return "PID " + Process.Pid + " / " + (Buffer?.Code ?? "대기") +
+                (Route != null ? " · 대체 복사 " + Route : Fallback != null ? " · 대체 복사 실패" : "") + " / OCR " +
                 (Vision?.LocalVisibleEmpty == true ? "보이는 내용 없음" : Vision?.LocalFailure != null ? "실패 (상세 확인)" : Vision?.Code ?? "없음"); }
         }
         private readonly List<OutputSample> outputSamples = new List<OutputSample>();
@@ -52,6 +58,9 @@ namespace RemoteMonitorSlave
         private OutputBufferResult lastBuffer;
         private DateTime lastBufferReceivedUtc;
         private string lastAutoCopyCode;      // Outcome code of the most recent auto-copy attempt, for the status line.
+        // Vision-confirmed Output positions for the LLM-free fallback copy (output-anchors-v1.txt beside local-vision.json).
+        private readonly OutputAnchorStore anchorStore;
+        private string lastFallbackResult;    // e.g. "비전 실패(VISION_TIMEOUT) → 저장 위치 복사 성공", for the status line.
         // The worker capture of the most recent FAILED auto copy (memory only, last one kept) and its code/detail.
         // It is what explains an abort, so it stays available for the diagnostic bundle until a newer failure.
         private byte[] autoCopyFrame;
@@ -103,7 +112,7 @@ namespace RemoteMonitorSlave
             Text = Program.Title + " - READ ONLY";
             Font = new Font("Segoe UI", 9F);
             AutoScaleMode = AutoScaleMode.Dpi;
-            ClientSize = new Size(840, 812);
+            ClientSize = new Size(840, 828); // Room for a third status line (last vision-failure fallback result).
             AutoScroll = true;
             AutoScrollMinSize = ClientSize;
             MinimumSize = new Size(640, 480);
@@ -112,6 +121,10 @@ namespace RemoteMonitorSlave
             log = new SlaveLog(Path.Combine(dataPath, "logs"));
             try { visionSettings = VisionSettingsStore.Load(Path.Combine(dataPath, "local-vision.json")); }
             catch { log.Write("VISION_SETTINGS_INVALID"); visionSettingsReset = true; }
+            anchorStore = new OutputAnchorStore(Path.Combine(dataPath, OutputAnchorStore.FileName));
+            if (anchorStore.InvalidLines > 0 || anchorStore.LastFileError != null)
+                try { log.Write("OUTPUT_ANCHOR_STORE_INVALID", "lines=" + anchorStore.InvalidLines.ToString(CultureInfo.InvariantCulture) +
+                    " kept=" + anchorStore.Count.ToString(CultureInfo.InvariantCulture) + " error=" + LogValue(anchorStore.LastFileError)); } catch { }
             Controls.Add(new Label { Text = Text, Font = new Font(Font, FontStyle.Bold), Bounds = new Rectangle(18, 16, 804, 28) });
             Controls.Add(new Label { Text = "Slave를 시작하면 Master의 pwrsi 요청마다 모든 PowerSI를 한 번 수집합니다.\r\n" +
                 "Pending은 추가 수집 없이 회신합니다. 로컬 전체 수집과 저장한 화면 비교도 사용할 수 있습니다.",
@@ -159,7 +172,7 @@ namespace RemoteMonitorSlave
             powerSi.AccessibleName = "PowerSI Output 수집 결과";
             var path = new TextBox { Text = log.Path, ReadOnly = true, Bounds = new Rectangle(18, 682, 650, 25) };
             var folder = new Button { Text = "Open Log Folder", Bounds = new Rectangle(680, 678, 142, 32) };
-            anchorState.SetBounds(18, 764, 804, 40);
+            anchorState.SetBounds(18, 764, 804, 56);
             anchorState.AccessibleName = "자동 Output 탐색·복사 및 Windows 응답 상태";
             Controls.AddRange(new Control[] { address, start, stop, export, powerSiCheck, outputAll, replayVision, refresh, state, pairing, snapshot, processes, outputTargets, powerSi, path, folder, visionSetup, visionPreview, anchorState });
             Controls.Add(new Label { Text = "수집된 유효 Output 원문은 사내 Master로 전달되며 화면 이미지는 Slave에만 보관합니다. 수집은 한 번씩, 최대 100초이며 Stop으로 취소할 수 있습니다. 이미지 판독은 이 PC의 LM Studio만 사용합니다.",
@@ -555,8 +568,10 @@ namespace RemoteMonitorSlave
 
         private void UpdateAnchorState()
         {
-            anchorState.Text = "자동 복사: 매번 Output 영역 확인 / 최근 결과: " + (lastAutoCopyCode ?? "없음") +
+            anchorState.Text = "자동 복사: 매번 Output 영역 확인 / 저장 위치 " + anchorStore.Count.ToString(CultureInfo.InvariantCulture) +
+                "개 / 최근 결과: " + (lastAutoCopyCode ?? "없음") +
                 " / 자동 복사 설정: " + (visionSettings.AutoCopyEnabled ? "사용" : "꺼짐") + Environment.NewLine +
+                (lastFallbackResult == null ? "" : "최근 대체 복사: " + lastFallbackResult + Environment.NewLine) +
                 "PowerSI 크기 변경 없음. 응답 없음(PENDING)은 입력 없이 건너뜁니다. 내부 시뮬레이션 pending 판별은 미구현입니다.";
         }
 
@@ -681,6 +696,170 @@ namespace RemoteMonitorSlave
             return true;
         }
 
+        // ---------------------------------------------------------------- vision-failure fallback copy
+
+        // LLM-free aims for one target, all in the prepared frame's (= root client) pixels: this process's stored
+        // vision-confirmed position, the Output scope HWND rectangle of the buffer read, another PowerSI's position.
+        private sealed class FallbackAims
+        {
+            internal OutputAnchorEntry Process, Layout;
+            internal Rectangle Scope = Rectangle.Empty;
+        }
+
+        private FallbackAims FindFallbackAims(OutputSample sample, PowerSiFrame frame, OutputBufferResult bufferRead)
+        {
+            var aims = new FallbackAims();
+            if (frame == null || !sample.Process.StartUtcTicks.HasValue) return aims;
+            var size = frame.PixelSize;
+            OutputAnchorEntry entry;
+            if (anchorStore.TryGetProcessAnchor(sample.Process.Pid, sample.Process.StartUtcTicks.Value, sample.SessionId, size, out entry))
+                aims.Process = entry;
+            Rectangle scope;
+            if (PowerSiOutputBuffer.TryScopeRect(bufferRead?.Detail, size, out scope)) aims.Scope = scope;
+            if (anchorStore.TryGetLayoutAnchor(sample.Process.Name, size, sample.Process.Pid, out entry)) aims.Layout = entry;
+            return aims;
+        }
+
+        // The locator call. With limitMilliseconds > 0 a child limit of the target deadline ends a slow model as a local
+        // VISION_TIMEOUT, so the fallback still has time; the target deadline itself keeps its TARGET_TIMEOUT meaning.
+        private async Task<PowerSiObservation> LocateOutput(ProcessInventory target, CancellationToken deadline,
+            IProgress<string> progress, PowerSiFrame frame, int limitMilliseconds)
+        {
+            Func<CancellationToken, Task<PowerSiObservation>> locate = token => PowerSiVision.CaptureAsync(target, visionSettings, token,
+                progress, frame, null, true, probe => PowerSiScreenCapture.CheckResponsiveAsync(target, probe));
+            if (limitMilliseconds <= 0) return await ResponsiveStep(target, deadline, () => locate(deadline));
+            using (var limit = CancellationTokenSource.CreateLinkedTokenSource(deadline))
+            {
+                limit.CancelAfter(limitMilliseconds);
+                try { return await ResponsiveStep(target, deadline, () => locate(limit.Token)); }
+                catch (OperationCanceledException) when (!deadline.IsCancellationRequested && limit.IsCancellationRequested)
+                {
+                    var timedOut = PowerSiObservation.VisionUnavailable("VISION_TIMEOUT");
+                    timedOut.LocalFailure = "LOCATE_OUTPUT_LIMIT";
+                    timedOut.LocalFrame = frame;
+                    timedOut.LocalFullImage = frame?.Png;
+                    timedOut.LocalFrameSize = frame?.PixelSize ?? Size.Empty;
+                    timedOut.LocalVisionMode = "LOCATE_ONLY";
+                    timedOut.LocalRequestTimeoutSeconds = visionSettings.TimeoutSeconds;
+                    return timedOut;
+                }
+            }
+        }
+
+        // After a model failure: aim without the model, in priority order ANCHOR (this process's stored vision-confirmed
+        // position), SCOPE (the Output scope HWND rectangle of the buffer read), LAYOUT (another PowerSI's position for
+        // the same client size). Every try is the unchanged guarded worker (fresh window/identity/exact size, body re-found
+        // within 8 px before input, occlusion/idle/cursor/foreground, a PowerSI-owned clipboard change, the 8 Mi cap).
+        // Like every auto copy the clipboard keeps the copied Output afterwards; it is neither saved nor restored.
+        // A route that proved its aim wrong (or was refused before input) passes to the next one; anything else ends the
+        // chain. A fallback success never stores a position: only vision-confirmed copies do.
+        private async Task CopyWithoutVision(OutputSample sample, ProcessInventory target, PowerSiFrame frame, string visionCode,
+            FallbackAims aims, CancellationToken deadline, Func<long> remainingMilliseconds, string prefix)
+        {
+            OutputBufferResult Refused(string code) { return new OutputBufferResult { Code = code, Method = "NONE", Detail = "NONE" }; }
+            var codes = new Dictionary<string, string>(StringComparer.Ordinal);
+            string Code(string name) { string value; return codes.TryGetValue(name, out value) ? value : null; }
+            var pid = sample.Process.Pid.ToString(CultureInfo.InvariantCulture);
+            OutputBufferResult last = null;
+            string route;
+            // Kept current after every route, so a target deadline or Pending in the middle still leaves the chain so far.
+            sample.FallbackVision = visionCode;
+            sample.Fallback = OutputAnchorStore.FallbackDetail(visionCode, null, null, null);
+            while ((route = OutputAnchorStore.DecideFallbackRoute(visionSettings.Enabled, visionSettings.AutoCopyEnabled, true, visionCode,
+                aims.Process != null && !codes.ContainsKey("ANCHOR"), !aims.Scope.IsEmpty && !codes.ContainsKey("SCOPE"),
+                aims.Layout != null && !codes.ContainsKey("LAYOUT"))) != null)
+            {
+                // A further route only while this target can still afford one whole guarded copy.
+                if (codes.Count > 0 && remainingMilliseconds() < OutputAutoCopy.BudgetMilliseconds + 2000) break;
+                try { log.Write("OUTPUT_FALLBACK_BEGIN", "pid=" + pid + " route=" + route + " vision=" + LogValue(visionCode)); } catch { }
+                ShowActivity(prefix + " / 비전 실패(" + visionCode + ") → " + OutputAnchorStore.RouteCaption(route) + " 복사 시도");
+                OutputAnchor anchor = route == "ANCHOR" ? aims.Process.Anchor
+                    : route == "SCOPE" ? OutputAutoCopy.AnchorFromScope(frame, aims.Scope, target, deadline)
+                    : OutputAnchorStore.Rekey(aims.Layout.Anchor, target, frame.PixelSize);
+                OutputBufferResult result;
+                if (anchor == null) result = Refused(route == "SCOPE" ? "AUTO_COPY_SCOPE_UNCONFIRMED" : "AUTO_COPY_REQUEST_INVALID");
+                // A known Output scope window outranks a remembered point: a point outside it aims at another pane.
+                else if (route != "SCOPE" && !OutputAnchorStore.InsideScope(anchor, aims.Scope)) result = Refused("AUTO_COPY_OUTSIDE_SCOPE");
+                else
+                {
+                    result = await ResponsiveStep(target, deadline, () => OutputAutoCopy.AutoCopyAsync(target, anchor, deadline));
+                    sample.ReceivedUtc = DateTime.UtcNow;
+                    if (IsPending(result.Code)) throw new InvalidDataException("SC_PENDING");
+                    // A stored position must yield a continuation of the text it copied before; anything else may be
+                    // another pane or a replaced log, so the text is discarded rather than reported.
+                    if (route == "ANCHOR" && result.Code == "AUTO_COPY_READ" && result.Text != null &&
+                        !OutputAnchorStore.CheckContinuity(aims.Process, result.Text))
+                    {
+                        var discarded = Refused("AUTO_COPY_ANCHOR_CONTINUITY");
+                        OutputAutoCopy.AttachFrame(discarded, OutputAutoCopy.FrameOf(result));
+                        result = discarded;
+                    }
+                }
+                codes[route] = result.Code;
+                sample.Fallback = OutputAnchorStore.FallbackDetail(visionCode, Code("ANCHOR"), Code("SCOPE"), Code("LAYOUT"));
+                try { log.Write("OUTPUT_FALLBACK_RESULT", "pid=" + pid + " route=" + route + " code=" + LogValue(result.Code)); } catch { }
+                if (result.Code == "AUTO_COPY_READ" && result.Text != null)
+                {
+                    sample.Buffer = result;
+                    sample.Route = route;
+                    break;
+                }
+                last = result;
+                // Only this process's own entry is dropped; a borrowed LAYOUT position still belongs to its PowerSI.
+                if (route == "ANCHOR" && OutputAnchorStore.DropsEntry(result.Code) &&
+                    anchorStore.Drop(aims.Process.Anchor.Pid, aims.Process.Anchor.StartUtcTicks, result.Code) > 0)
+                    try { log.Write("OUTPUT_ANCHOR_DROPPED", "pid=" + pid + " reason=" + LogValue(result.Code)); } catch { }
+                if (!OutputAnchorStore.FallsThrough(result.Code)) break;
+            }
+            if (sample.Route == null)
+            {
+                var code = last?.Code ?? "AUTO_COPY_REGION_UNCONFIRMED";
+                sample.Buffer = new OutputBufferResult { Code = code, Method = "NONE", Detail = sample.Fallback };
+                sample.FailureFrame = OutputAutoCopy.FrameOf(last);
+                sample.Failure = code + " " + (last?.Detail ?? "NONE") + " " + sample.Fallback;
+            }
+            lastFallbackResult = FallbackSummary(sample);
+            UpdateAnchorState();
+        }
+
+        private static string FallbackSummary(OutputSample sample)
+        {
+            if (sample?.Fallback == null) return null;
+            return "비전 실패(" + (sample.FallbackVision ?? "?") + ") → " + (sample.Route != null
+                ? OutputAnchorStore.RouteCaption(sample.Route) + " 복사 성공"
+                : "대체 복사 실패(" + (sample.Buffer?.Code ?? "?") + ")");
+        }
+
+        // Only a vision-confirmed clean copy teaches a position; it is also the LAYOUT candidate for other PIDs of this size.
+        private void StoreConfirmedAnchor(OutputSample sample, OutputAnchor anchor)
+        {
+            try
+            {
+                var entry = OutputAnchorEntry.Create(anchor, sample.Process.Name, sample.Buffer.Text, DateTime.UtcNow);
+                if (entry == null) return;
+                bool saved = anchorStore.Store(entry);
+                log.Write("OUTPUT_ANCHOR_STORED", "pid=" + sample.Process.Pid.ToString(CultureInfo.InvariantCulture) +
+                    " count=" + anchorStore.Count.ToString(CultureInfo.InvariantCulture) + " file=" + (saved ? "OK" : LogValue(anchorStore.LastFileError)));
+                UpdateAnchorState();
+            }
+            catch { } // A position that could not be kept never fails the copy that produced it.
+        }
+
+        // Exited processes lose their positions only on a complete inventory of this session.
+        private void PruneOutputAnchors(ProcessInventory inventory)
+        {
+            try
+            {
+                bool complete = inventory.Omitted == 0 && inventory.Unreadable == 0 && inventory.Items.All(item => item.StartUtcTicks.HasValue);
+                int removed = anchorStore.PruneMissing(inventory.SessionId, inventory.Items.Where(item => item.StartUtcTicks.HasValue)
+                    .Select(item => new KeyValuePair<int, long>(item.Pid, item.StartUtcTicks.Value)), complete);
+                if (removed == 0) return;
+                log.Write("OUTPUT_ANCHOR_DROPPED", "reason=PROCESS_EXITED count=" + removed.ToString(CultureInfo.InvariantCulture));
+                UpdateAnchorState();
+            }
+            catch { }
+        }
+
         private async Task<PowerSiReport> ReadOutputBuffer(ProcessInventory capturedInventory = null,
             bool remote = false, CancellationToken externalCancellation = default(CancellationToken))
         {
@@ -700,6 +879,7 @@ namespace RemoteMonitorSlave
                 cancellation.Token.ThrowIfCancellationRequested();
                 inventory.Validate();
                 RenderSnapshot(inventory, DateTime.Now, "PowerSI 전체 인스턴스 수집");
+                PruneOutputAnchors(inventory);
                 foreach (var process in inventory.Items.OrderBy(item => item.Pid))
                     outputSamples.Add(new OutputSample { Process = process, SessionId = inventory.SessionId,
                         Buffer = new OutputBufferResult { Code = "NOT_ATTEMPTED", Method = "NONE", Detail = "NONE" },
@@ -730,6 +910,7 @@ namespace RemoteMonitorSlave
                             PowerSiFrame frame = null;
                             PowerSiObservation located = null;
                             bool autoCopy = visionSettings.Enabled && visionSettings.AutoCopyEnabled;
+                            bool fallbackAttempted = false;
                             List<KeyValuePair<Form, FormWindowState>> hidden = null;
                             try
                             {
@@ -761,9 +942,15 @@ namespace RemoteMonitorSlave
                                     sample.Buffer.Code != "BUFFER_SIZE" && sample.Buffer.Code != "BUFFER_TOO_LARGE";
                                 if (copyAllowed && autoCopy)
                                 {
-                                    located = await ResponsiveStep(target, deadline.Token,
-                                        () => PowerSiVision.CaptureAsync(target, visionSettings, deadline.Token, progress, frame, null, true,
-                                            token => PowerSiScreenCapture.CheckResponsiveAsync(target, token)));
+                                    // The buffer read result is kept as read: its scope rectangle is one LLM-free aim. All aims
+                                    // are known before the model runs; with one available the model gets a child limit, so a
+                                    // slow or hung server still leaves this target time for one guarded fallback copy.
+                                    var bufferRead = sample.Buffer;
+                                    var aims = FindFallbackAims(sample, frame, bufferRead);
+                                    int locateLimit = OutputAnchorStore.DecideFallbackRoute(true, true, true, "VISION_TIMEOUT",
+                                        aims.Process != null, !aims.Scope.IsEmpty, aims.Layout != null) == null ? 0 :
+                                        (int)Math.Max(5000, allowance - targetClock.ElapsedMilliseconds - 12000);
+                                    located = await LocateOutput(target, deadline.Token, progress, frame, locateLimit);
                                     if (IsPending(located.LocalFailure)) throw new InvalidDataException("SC_PENDING");
                                     sample.Runs.Add(located);
                                     try { log.WritePowerSi(located); } catch { }
@@ -779,6 +966,7 @@ namespace RemoteMonitorSlave
                                         if (IsPending(sample.Buffer.Code)) throw new InvalidDataException("SC_PENDING");
                                         if (sample.Buffer.Code == "AUTO_COPY_READ" && sample.Buffer.Text != null)
                                         {
+                                            StoreConfirmedAnchor(sample, anchor);
                                             frame = OutputAutoCopy.CleanFrameOf(sample.Buffer);
                                             located = PowerSiVision.ReframeOutput(located, frame);
                                             sample.Vision = located;
@@ -790,13 +978,27 @@ namespace RemoteMonitorSlave
                                             located = null;
                                         }
                                     }
-                                    else sample.Buffer = new OutputBufferResult { Code = "AUTO_COPY_REGION_UNCONFIRMED",
-                                        Method = "NONE", Detail = LogValue(located?.LocalFailure) };
+                                    else
+                                    {
+                                        var visionCode = OutputAnchorStore.LocateFailureCode(located);
+                                        if (OutputAnchorStore.DecideFallbackRoute(visionSettings.Enabled, visionSettings.AutoCopyEnabled,
+                                            copyAllowed, visionCode, aims.Process != null, !aims.Scope.IsEmpty, aims.Layout != null) != null)
+                                        {
+                                            fallbackAttempted = true;
+                                            await CopyWithoutVision(sample, target, frame, visionCode, aims, deadline.Token,
+                                                () => allowance - targetClock.ElapsedMilliseconds, prefix);
+                                        }
+                                        else sample.Buffer = new OutputBufferResult { Code = "AUTO_COPY_REGION_UNCONFIRMED",
+                                            Method = "NONE", Detail = LogValue(located?.LocalFailure) };
+                                    }
                                 }
                             }
                             finally { RestoreAfterAutoCopy(hidden); }
                             deadline.Token.ThrowIfCancellationRequested();
                             if (remote && sample.Buffer.Text != null) continue; // A fresh exact copy needs no extra OCR request.
+                            // The model just failed: a fallback never spends the rest of the budget on a second model call (OCR)
+                            // and never reframes, because its copy has no located observation behind it.
+                            if (fallbackAttempted) continue;
                             // Nonresponsive or failed input targets receive no more operations. Their captured diagnostics remain.
                             if (sample.Buffer.Code == "AUTO_COPY_READ")
                                 sample.Vision = await ResponsiveStep(target, deadline.Token,
@@ -985,6 +1187,13 @@ namespace RemoteMonitorSlave
                 target.Source = sample.Buffer.Code == "AUTO_COPY_READ" ? "AUTO_COPY" : "BUFFER";
                 target.CapturedUtc = sample.ReceivedUtc;
                 target.OutputText = text;
+                var routed = FallbackReadCode(sample);
+                if (routed != null)
+                {
+                    // The model failed, so no OCR rides along; VisionCode keeps that model failure.
+                    target.Code = routed;
+                    return target;
+                }
                 if (!string.IsNullOrWhiteSpace(ocr))
                 {
                     target.OcrText = ocr;
@@ -1013,7 +1222,8 @@ namespace RemoteMonitorSlave
                 return target;
             }
             if (target.Code == "NOT_ATTEMPTED") target.State = "NOT_ATTEMPTED";
-            else if (sample.Vision?.LocalFailure == "TARGET_TIMEOUT" || sample.Vision?.Code == "VISION_TIMEOUT")
+            // After a fallback attempt a VISION_TIMEOUT is the model's, not the target's: the copy chain still finished.
+            else if (sample.Vision?.LocalFailure == "TARGET_TIMEOUT" || (sample.Fallback == null && sample.Vision?.Code == "VISION_TIMEOUT"))
             { target.State = "TIMEOUT"; target.Code = "TARGET_TIMEOUT"; }
             else if (sample.Vision != null && (sample.Vision.Code.StartsWith("VISION_", StringComparison.Ordinal) ||
                 sample.Vision.Code == "OUTPUT_REGION_UNCONFIRMED") && !target.Code.StartsWith("SC_", StringComparison.Ordinal) &&
@@ -1022,6 +1232,14 @@ namespace RemoteMonitorSlave
             else if (sample.Buffer?.Text != null) target.Code = "OUTPUT_EMPTY";
             if (invalidText || invalidOcr) target.Code = "OUTPUT_INVALID_TEXT";
             return target;
+        }
+
+        // AUTO_COPY_<ROUTE>_READ for a copy accepted from the vision-failure fallback, otherwise null.
+        private static string FallbackReadCode(OutputSample sample)
+        {
+            var route = sample?.Route;
+            return sample?.Buffer?.Code == "AUTO_COPY_READ" && sample.Buffer.Text != null &&
+                (route == "ANCHOR" || route == "SCOPE" || route == "LAYOUT") ? "AUTO_COPY_" + route + "_READ" : null;
         }
 
         private void RenderOutputBuffer(OutputBufferResult result, PowerSiObservation vision = null, DateTime? receivedUtc = null)
@@ -1041,8 +1259,13 @@ namespace RemoteMonitorSlave
             lastBufferReceivedUtc = receivedUtc ?? DateTime.UtcNow;
             visionPreview.Text = "결과 비교 보기";
             visionPreview.Enabled = vision != null; // The comparison is a snapshot; enable only after both paths finish.
+            // The PID being shown owns its fallback route; a replay of the same buffer keeps showing it.
+            var routed = selectedSample != null && ReferenceEquals(selectedSample.Buffer, result) ? selectedSample : null;
+            var fallback = FallbackSummary(routed);
             powerSi.Text = "출처: " + result.Method + " / " + result.Code + " / " + result.CharacterCount.ToString(CultureInfo.InvariantCulture) +
                 "자 / " + result.LineCount.ToString(CultureInfo.InvariantCulture) + "줄 / LLM " + (vision?.Code ?? "대기 중") + "\r\n" +
+                (fallback == null ? "" : fallback + (routed.Route != null ? " — LLM 없이 위치를 정해 Ctrl+A/C로 복사, OCR 생략." :
+                    " — " + routed.Fallback) + "\r\n") +
                 (result.Code == "OUTPUT_VISIBLE_EMPTY" ? "보이는 Output 내용 없음 — 전체 버퍼 미확인, 클릭·복사·OCR 생략.\r\n" :
                     result.Code == "SC_MINIMIZED" ? "선택된 PowerSI 창을 Windows가 최소화 상태로 보고하여 활성화·입력을 생략했습니다. 창이 열려 있었다면 진단 ZIP으로 식별값을 확인합니다.\r\n" :
                     result.Method == "USER_CLIPBOARD" ? "수동 복사본 — Output에서 Ctrl+A로 선택했는지 확인하세요.\r\n" :
@@ -1254,6 +1477,8 @@ namespace RemoteMonitorSlave
                 AutoCopyFramePng = sample == null ? autoCopyFrame : sample.FailureFrame,
                 AutoCopyLastFailure = sample == null ? autoCopyFailure : sample.Failure,
                 Notes = "자동 복사 위치: 매번 자동 탐색" +
+                    (sample?.Fallback == null ? "" : " / 비전 실패 대체 복사: " + sample.Fallback +
+                        (sample.Route == null ? " 실패" : " 성공 " + sample.Route)) +
                     " / 자동 복사 설정: " +
                     (visionSettings.AutoCopyEnabled ? "사용" : "꺼짐") + " / 전체 텍스트: " +
                     (buffer == null ? "없음" : buffer.Code + " " + buffer.Method + " " + buffer.Detail) +
@@ -1637,6 +1862,124 @@ namespace RemoteMonitorSlave
             catch (InvalidDataException error) { Need(error.Message == "SC_PENDING" && pendingProbes == 1); }
             Need(report.Targets[0].ProcessName == sample.Process.FullName);
             Console.WriteLine("PASS: Pending stops collection; evidence projection, full names, partial deadlines and report failures");
+        }
+
+        // Report projection of the vision-failure fallback. Pure (no window, no Win32); OutputAnchorStore.SelfTest calls it.
+        internal static void FallbackProjectionSelfTest()
+        {
+            void Need(bool value, string name) { if (!value) throw new InvalidOperationException("Fallback projection self-test: " + name); }
+            var now = new DateTime(2026, 10, 3, 1, 2, 3, DateTimeKind.Utc);
+            const string Copied = "AFS Current Frequency ( MHz ) = 38.000\r\nAFS Finished\r\nTotal Sampling Points = 12";
+            int nextPid = 500;
+            OutputSample Sample(string visionCode)
+            {
+                var vision = PowerSiObservation.VisionUnavailable(visionCode);
+                vision.LocalFailure = "LOCATE_OUTPUT_FAILED";
+                var created = new OutputSample { Process = new ProcessState { Pid = ++nextPid, Name = "powersi", FullName = "PowerSI",
+                    StartUtcTicks = now.AddHours(-1).Ticks }, SessionId = 1, ReceivedUtc = now, Vision = vision, FallbackVision = visionCode };
+                created.Runs.Add(vision);
+                return created;
+            }
+            OutputBufferResult Copy() { return new OutputBufferResult { Code = "AUTO_COPY_READ", Method = "AUTO_CLIPBOARD",
+                Detail = "A2|609|673|317|393|585|560|1000|900|B2|1920|1009|12|1|3|4|1|2|1|CLEAN_FRAME|1", Text = Copied,
+                CharacterCount = Copied.Length, LineCount = 3 }; }
+            var targets = new List<PowerSiTargetReport>();
+            var chains = new Dictionary<string, string> {
+                { "ANCHOR", OutputAnchorStore.FallbackDetail("X", "AUTO_COPY_READ", null, null) },
+                { "SCOPE", OutputAnchorStore.FallbackDetail("X", "AUTO_COPY_BODY_MOVED", "AUTO_COPY_READ", null) },
+                { "LAYOUT", OutputAnchorStore.FallbackDetail("X", null, "AUTO_COPY_SCOPE_UNCONFIRMED", "AUTO_COPY_READ") } };
+            foreach (var route in new[] { "ANCHOR", "SCOPE", "LAYOUT" })
+                foreach (var visionCode in new[] { "VISION_SERVER_UNAVAILABLE", "VISION_TIMEOUT", "OUTPUT_UNAVAILABLE", "VISION_BUSY" })
+                {
+                    var routed = Sample(visionCode);
+                    routed.Buffer = Copy(); routed.Route = route; routed.Fallback = chains[route];
+                    var read = ProjectReportTarget(routed);
+                    read.Validate();
+                    Need(read.State == "READ" && read.Source == "AUTO_COPY" && read.Code == "AUTO_COPY_" + route + "_READ" &&
+                        read.BufferCode == "AUTO_COPY_READ" && read.VisionCode == visionCode && read.OutputText == Copied &&
+                        read.OcrText == "" && read.OcrCapturedUtc == null && read.CapturedUtc == now, "fallback read " + route + " " + visionCode);
+                    Need(routed.ToString().Contains("대체 복사 " + route) &&
+                        FallbackSummary(routed) == "비전 실패(" + visionCode + ") → " + OutputAnchorStore.RouteCaption(route) + " 복사 성공",
+                        "route shown in the PID list and status line");
+                    targets.Add(read);
+                }
+            // Even a valid OCR transcript never rides along with a fallback copy, and a vision copy stays AUTO_COPY_READ.
+            var withOcr = Sample("VISION_TIMEOUT");
+            withOcr.Buffer = Copy(); withOcr.Route = "SCOPE"; withOcr.Fallback = chains["SCOPE"];
+            withOcr.Vision = PowerSiObservation.VisionLogExcerpt("AFS Finished", now);
+            withOcr.Vision.LocalEvidence = "AFS Finished";
+            var noOcr = ProjectReportTarget(withOcr);
+            noOcr.Validate();
+            Need(noOcr.Code == "AUTO_COPY_SCOPE_READ" && noOcr.OcrText == "" && noOcr.OcrCapturedUtc == null, "no OCR after a fallback copy");
+            withOcr.Route = null; withOcr.Fallback = null;
+            Need(ProjectReportTarget(withOcr).Code == "AUTO_COPY_READ" && ProjectReportTarget(withOcr).OcrText == "AFS Finished",
+                "vision copy projection unchanged");
+            withOcr.Route = "ELSEWHERE";
+            Need(ProjectReportTarget(withOcr).Code == "AUTO_COPY_READ", "only the three routes become route codes");
+
+            // Every route failed: the last route's code, the model code beside it, and no TIMEOUT for the model's own timeout.
+            foreach (var failure in new[] { new[] { "VISION_TIMEOUT", "AUTO_COPY_OCCLUDED" }, new[] { "VISION_SERVER_UNAVAILABLE", "AUTO_COPY_BODY_MOVED" },
+                new[] { "OUTPUT_REGION_UNCONFIRMED", "AUTO_COPY_ANCHOR_CONTINUITY" }, new[] { "VISION_MODEL_UNAVAILABLE", "SC_WINDOW_UNAVAILABLE" } })
+            {
+                var failed = Sample(failure[0]);
+                failed.Fallback = OutputAnchorStore.FallbackDetail(failure[0], "AUTO_COPY_BODY_MOVED", "AUTO_COPY_SCOPE_UNCONFIRMED", failure[1]);
+                failed.Buffer = new OutputBufferResult { Code = failure[1], Method = "NONE", Detail = failed.Fallback };
+                var unavailable = ProjectReportTarget(failed);
+                unavailable.Validate();
+                Need(unavailable.State == "UNAVAILABLE" && unavailable.Source == "NONE" && unavailable.Code == failure[1] &&
+                    unavailable.BufferCode == failure[1] && unavailable.VisionCode == failure[0] && unavailable.OutputText == "" &&
+                    unavailable.CapturedUtc == null, "all routes failed: " + failure[0] + " " + failure[1]);
+                Need(OutputBufferCapture.LogMetadata(failed.Buffer).EndsWith(" detail=" + failed.Fallback, StringComparison.Ordinal) &&
+                    failed.ToString().Contains("대체 복사 실패") && FallbackSummary(failed).EndsWith("대체 복사 실패(" + failure[1] + ")", StringComparison.Ordinal),
+                    "chain detail passes the OB1/log validation and is shown");
+                targets.Add(unavailable);
+            }
+            // Without a fallback the projection is exactly today's.
+            var today = Sample("VISION_TIMEOUT");
+            today.Buffer = new OutputBufferResult { Code = "AUTO_COPY_REGION_UNCONFIRMED", Method = "NONE", Detail = "LOCATE_OUTPUT_TIMEOUT" };
+            var timedOut = ProjectReportTarget(today);
+            timedOut.Validate();
+            Need(timedOut.State == "TIMEOUT" && timedOut.Code == "TARGET_TIMEOUT" && FallbackSummary(today) == null &&
+                !today.ToString().Contains("대체 복사"), "no fallback: model timeout is still TARGET_TIMEOUT");
+            targets.Add(timedOut);
+            var unconfirmed = Sample("VISION_SERVER_UNAVAILABLE");
+            unconfirmed.Buffer = new OutputBufferResult { Code = "AUTO_COPY_REGION_UNCONFIRMED", Method = "NONE", Detail = "NONE" };
+            var plain = ProjectReportTarget(unconfirmed);
+            Need(plain.State == "UNAVAILABLE" && plain.Code == "AUTO_COPY_REGION_UNCONFIRMED" && plain.VisionCode == "VISION_SERVER_UNAVAILABLE",
+                "no fallback: region unconfirmed unchanged");
+            // The target deadline during a fallback is still a target timeout; Pending still suppresses an accepted copy.
+            var interrupted = Sample("VISION_TIMEOUT");
+            interrupted.Fallback = OutputAnchorStore.FallbackDetail("VISION_TIMEOUT", "AUTO_COPY_BODY_MOVED", null, null);
+            interrupted.Buffer = new OutputBufferResult { Code = "AUTO_COPY_BODY_MOVED", Method = "NONE", Detail = interrupted.Fallback };
+            RecordTargetFailure(interrupted, "TARGET_TIMEOUT");
+            var deadlineHit = ProjectReportTarget(interrupted);
+            deadlineHit.Validate();
+            Need(deadlineHit.State == "TIMEOUT" && deadlineHit.Code == "TARGET_TIMEOUT", "target deadline inside a fallback is TIMEOUT");
+            var copiedThenLate = Sample("VISION_TIMEOUT");
+            copiedThenLate.Buffer = Copy(); copiedThenLate.Route = "ANCHOR"; copiedThenLate.Fallback = chains["ANCHOR"];
+            RecordTargetFailure(copiedThenLate, "TARGET_TIMEOUT");
+            Need(ProjectReportTarget(copiedThenLate).Code == "AUTO_COPY_ANCHOR_READ" &&
+                ProjectReportTarget(copiedThenLate).VisionCode == "VISION_TIMEOUT", "an accepted fallback copy survives a later deadline");
+            RecordTargetFailure(copiedThenLate, "SC_PENDING");
+            var pending = ProjectReportTarget(copiedThenLate);
+            pending.Validate();
+            Need(pending.State == "PENDING" && pending.OutputText == "" && pending.Source == "NONE", "Pending suppresses a fallback copy");
+
+            // The new codes cross the PS4 frame unchanged (protocol 0.3.0: no new state, source or field).
+            var report = new PowerSiReport { CapturedUtc = now, SessionId = 1, Partial = true, Code = "OK", Targets = targets.ToArray() };
+            report.Validate();
+            PowerSiReport received;
+            using (var stream = new MemoryStream())
+            {
+                report.WriteFramedAsync(stream, CancellationToken.None).GetAwaiter().GetResult();
+                stream.Position = 0;
+                received = PowerSiReport.ReadFramedAsync(new LinkProtocol.LineReader(stream), CancellationToken.None).GetAwaiter().GetResult();
+            }
+            Need(received.Targets.Length == targets.Count && received.Targets.Zip(targets, (left, right) =>
+                left.Pid == right.Pid && left.State == right.State && left.Source == right.Source && left.Code == right.Code &&
+                left.BufferCode == right.BufferCode && left.VisionCode == right.VisionCode && left.OutputText == right.OutputText &&
+                left.OcrText == right.OcrText && left.CapturedUtc == right.CapturedUtc).All(same => same), "PS4 framed round trip");
+            Console.WriteLine("PASS: vision-failure fallback projection (ANCHOR/SCOPE/LAYOUT reads, all-failed chain, PS4 round trip)");
         }
 
         internal static void SelfTest()
@@ -2101,6 +2444,15 @@ namespace RemoteMonitorSlave
                     form.UpdateAnchorState();
                     if (!form.anchorState.Text.Contains("최근 결과: AUTO_COPY_OCCLUDED"))
                         throw new InvalidOperationException("Status line did not show the last auto copy outcome.");
+                    if (!form.anchorState.Text.Contains("저장 위치 0개") || form.anchorState.Text.Contains("최근 대체 복사"))
+                        throw new InvalidOperationException("Status line did not show the stored Output position count.");
+                    form.lastFallbackResult = "비전 실패(VISION_SERVER_UNAVAILABLE) → 저장 위치 복사 성공";
+                    form.UpdateAnchorState();
+                    if (!form.anchorState.Text.Contains("최근 대체 복사: 비전 실패(VISION_SERVER_UNAVAILABLE) → 저장 위치 복사 성공") ||
+                        !form.anchorState.Text.Contains("PENDING"))
+                        throw new InvalidOperationException("Status line did not show the last vision-failure fallback.");
+                    form.lastFallbackResult = null;
+                    form.UpdateAnchorState();
                     var bundle = form.BuildBundleContent(new[] { anchorVision });
                     if (bundle.FullText != copiedBuffer.Text || bundle.BufferReceivedUtc != form.lastBufferReceivedUtc ||
                         bundle.LogFilePath != form.log.Path || bundle.Runs.Count != 1 ||
@@ -2213,6 +2565,14 @@ namespace RemoteMonitorSlave
                         first.Runs[0].LocalFailure != null || TranscriptOf(first.Runs[0]) == null)
                         throw new InvalidOperationException("Later OCR failure discarded independently collected full text, kept a valid transcript, or restamped a stored run.");
                     Console.WriteLine("PASS: two-target selection, independent comparisons/ZIP payloads, pending and Stop preservation");
+                    var routedSample = new OutputSample { Process = new ProcessState { Pid = 303, StartUtcTicks = 3003 }, SessionId = 1,
+                        Buffer = new OutputBufferResult { Code = "AUTO_COPY_READ", Method = "AUTO_CLIPBOARD", Text = "ROUTED 1", CharacterCount = 8, LineCount = 1 },
+                        Vision = PowerSiObservation.VisionUnavailable("VISION_TIMEOUT"), ReceivedUtc = DateTime.UtcNow, Route = "SCOPE",
+                        Fallback = OutputAnchorStore.FallbackDetail("VISION_TIMEOUT", null, "AUTO_COPY_READ", null), FallbackVision = "VISION_TIMEOUT" };
+                    form.SelectOutputSample(routedSample);
+                    if (!form.powerSi.Text.Contains("비전 실패(VISION_TIMEOUT) → Output 창 영역 복사 성공") ||
+                        !routedSample.ToString().Contains("대체 복사 SCOPE") || !form.BuildBundleContent(null, routedSample).Notes.Contains("FB|VISION=VISION_TIMEOUT"))
+                        throw new InvalidOperationException("The fallback route was not shown for the selected PID.");
                     form.ClearPowerSi();
                     using (var reader = new FileStream(form.log.Path, FileMode.Open, FileAccess.Read, FileShare.None))
                         if (reader.Length == 0) throw new InvalidOperationException("Slave log unavailable while form alive.");

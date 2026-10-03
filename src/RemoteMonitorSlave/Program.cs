@@ -22,6 +22,7 @@ namespace RemoteMonitorSlave
                 try
                 {
                     LinkSelfTest.Run(); PowerSiOutputBuffer.SelfTest(); OutputBufferCapture.SelfTest();
+                    OutputAnchorStore.SelfTest(); // Vision-failure fallback: store, route table and report projection.
                     Console.WriteLine(DiagnosticBundle.SelfTest());
                     SlaveForm.SelfTest();
                     Console.WriteLine("PASS: Slave status link and UI checks");

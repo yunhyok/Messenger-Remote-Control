@@ -33,6 +33,9 @@ namespace RemoteMonitorSlave
     //       phase 2 must confirm it with OutputPaneImage.FindBodyAt on the run's frame before storing it.
     //   OutputAnchor AnchorFromVision(ProcessInventory, PowerSiObservation)
     //       Builds a confirmed A2 anchor from a successful local-only LOCATE_ONLY result; no cursor sample or input.
+    //   OutputAnchor AnchorFromScope(PowerSiFrame, Rectangle scopeRectClient, ProcessInventory, CancellationToken)
+    //       Same A2 anchor without the model: the flat-body search runs on the Output scope HWND rectangle the buffer
+    //       worker reported. Used only by the vision-failure fallback (route SCOPE); null when the body is unconfirmed.
     //   OutputBufferResult RunWorker(string[] args)
     //       Worker body, dispatched from OutputBufferCapture.TryRunWorker. Never throws for known failures; returns
     //       Code=AUTO_COPY_* / Method=NONE / Detail=<metadata or NONE>. Success: Code=AUTO_COPY_READ,
@@ -234,6 +237,48 @@ namespace RemoteMonitorSlave
             }
             catch { return null; }
         }
+
+        // LLM-free counterpart of AnchorFromVision for the vision-failure fallback. scopeRectClient is the single
+        // Output scope HWND rectangle the buffer worker reported (PowerSiOutputBuffer.TryScopeRect), in the root's
+        // client pixels of this DPI-unaware process. The prepared frame is that same root's client area (PrintWindow
+        // PW_CLIENTONLY), so client coordinates are frame pixels exactly as AnchorFromVision treats LocalOutputBody;
+        // the scope rectangle simply takes the place of the model's box in the same flat-body search. The body must
+        // stay inside the scope window (a flat area leaking out of it is a neighbouring pane). No cursor sample or input.
+        internal static OutputAnchor AnchorFromScope(PowerSiFrame frame, Rectangle scopeRectClient, ProcessInventory inventory,
+            CancellationToken cancellation)
+        {
+            try
+            {
+                if (inventory == null || frame == null || frame.Png == null) return null;
+                inventory.Validate();
+                if (inventory.Items.Length != 1 || inventory.Omitted != 0) return null;
+                var identity = inventory.Items[0];
+                var size = frame.PixelSize;
+                if (!ProcessInventory.IsPowerSiName(identity.Name) || !identity.StartUtcTicks.HasValue ||
+                    identity.StartUtcTicks.Value < 1 || size.Width < 1 || size.Height < 1 ||
+                    frame.CapturedUtc.Kind != DateTimeKind.Utc || frame.CapturedUtc.Ticks < 1 ||
+                    scopeRectClient.X < 0 || scopeRectClient.Y < 0 || scopeRectClient.Width < 1 || scopeRectClient.Height < 1 ||
+                    scopeRectClient.Width > size.Width || scopeRectClient.Height > size.Height ||
+                    scopeRectClient.X > size.Width - scopeRectClient.Width || scopeRectClient.Y > size.Height - scopeRectClient.Height)
+                    return null;
+                Rectangle body;
+                try { body = OutputPaneImage.FindBody(frame, scopeRectClient, cancellation); }
+                catch (LocalVisionException) { return null; }
+                var center = new Point(body.X + body.Width / 2, body.Y + body.Height / 2);
+                if (!Rectangle.Inflate(scopeRectClient, ScopeTolerance, ScopeTolerance).Contains(body) ||
+                    !scopeRectClient.Contains(center)) return null;
+                var anchor = new OutputAnchor { Pid = identity.Pid, StartUtcTicks = identity.StartUtcTicks.Value,
+                    SessionId = inventory.SessionId, ClientPoint = center, ClientSize = size,
+                    LearnedUtc = frame.CapturedUtc, Body = body };
+                OutputAnchor parsed;
+                return OutputAnchor.TryParse(anchor.Serialize(), out parsed) && parsed.Matches(anchor) && parsed.Body == body
+                    ? parsed : null;
+            }
+            catch (OperationCanceledException) { throw; }
+            catch { return null; }
+        }
+
+        private const int ScopeTolerance = 2; // Client pixels a body may touch beyond the scope window's own rectangle.
 
         // Worker capture that travels in the optional 6th OB1 field; never a log or network payload.
         internal static void AttachFrame(OutputBufferResult result, byte[] png)
@@ -687,6 +732,7 @@ namespace RemoteMonitorSlave
         {
             AnchorSelfTest();
             VisionAnchorSelfTest();
+            ScopeAnchorSelfTest(); // Pure image work: stays ahead of the Win32-dependent parts below.
             DetailSelfTest();
             LayoutSelfTest();
             PreflightSelfTest();
@@ -830,6 +876,66 @@ namespace RemoteMonitorSlave
                 AnchorFromVision(Inventory(new ProcessState { Pid = 4321, Name = "powersi" }), located) == null &&
                 AnchorFromVision(Inventory(new ProcessState { Pid = 4321, Name = "other", StartUtcTicks = identity.StartUtcTicks }), located) == null,
                 "non-singleton or incomplete PowerSI identity rejected");
+        }
+
+        // Synthetic PowerSI client frame in the style of PreflightSelfTest: an Output dock (coloured caption strip over a
+        // flat light body with text lines), a second flat pane beside it and a noisy region. No window or input.
+        private static void ScopeAnchorSelfTest()
+        {
+            var captured = new DateTime(2026, 10, 3, 1, 2, 3, DateTimeKind.Utc);
+            var body = new Rectangle(20, 50, 380, 340);
+            var scope = new Rectangle(20, 30, 380, 360);
+            var noisy = new Rectangle(420, 260, 160, 140);
+            PowerSiFrame frame;
+            using (var bitmap = new Bitmap(600, 420, System.Drawing.Imaging.PixelFormat.Format24bppRgb))
+            {
+                using (var graphics = Graphics.FromImage(bitmap))
+                using (var light = new SolidBrush(Color.FromArgb(232, 232, 232)))
+                {
+                    graphics.Clear(Color.DarkBlue);
+                    graphics.FillRectangle(Brushes.SteelBlue, new Rectangle(scope.X, scope.Y, scope.Width, body.Y - scope.Y));
+                    graphics.FillRectangle(light, body);
+                    for (int y = body.Y + 15; y < body.Bottom - 10; y += 16) graphics.FillRectangle(Brushes.Black, body.X + 10, y, 300, 2);
+                    graphics.FillRectangle(light, new Rectangle(420, 40, 160, 200));
+                }
+                var random = new Random(7);
+                for (int y = noisy.Y; y < noisy.Bottom; y++)
+                    for (int x = noisy.X; x < noisy.Right; x++)
+                        bitmap.SetPixel(x, y, Color.FromArgb(random.Next(256), random.Next(256), random.Next(256)));
+                using (var png = new MemoryStream())
+                {
+                    bitmap.Save(png, System.Drawing.Imaging.ImageFormat.Png);
+                    frame = new PowerSiFrame { Png = png.ToArray(), PixelSize = bitmap.Size, CapturedUtc = captured };
+                }
+            }
+            var identity = new ProcessState { Pid = 4321, Name = "powersi", FullName = "PowerSI", StartUtcTicks = 638000000000000000L };
+            var inventory = new ProcessInventory { SessionId = 2, Items = new[] { identity } };
+            var anchor = AnchorFromScope(frame, scope, inventory, CancellationToken.None);
+            Need(anchor != null && anchor.HasBody && anchor.Body == body && anchor.ClientPoint == new Point(210, 220) &&
+                anchor.ClientSize == frame.PixelSize && anchor.Pid == 4321 && anchor.StartUtcTicks == identity.StartUtcTicks &&
+                anchor.SessionId == 2 && anchor.LearnedUtc == captured && anchor.Serialize().StartsWith("A2|", StringComparison.Ordinal),
+                "scope rectangle over a flat body becomes a validated A2 centre anchor");
+            Need(AnchorFromScope(frame, noisy, inventory, CancellationToken.None) == null, "noisy scope region yields no anchor");
+            Need(AnchorFromScope(frame, new Rectangle(20, 30, 200, 360), inventory, CancellationToken.None) == null,
+                "a body leaking out of the scope window is refused");
+            Need(AnchorFromScope(frame, new Rectangle(500, 300, 200, 200), inventory, CancellationToken.None) == null &&
+                AnchorFromScope(frame, new Rectangle(0, 0, 600, 420), inventory, CancellationToken.None) == null &&
+                AnchorFromScope(frame, Rectangle.Empty, inventory, CancellationToken.None) == null &&
+                AnchorFromScope(null, scope, inventory, CancellationToken.None) == null, "outside, whole-frame and missing input refused");
+            Need(AnchorFromScope(frame, scope, new ProcessInventory { SessionId = 2, Items = new[] { new ProcessState { Pid = 4321,
+                    Name = "notepad", FullName = "notepad", StartUtcTicks = 1 } } }, CancellationToken.None) == null &&
+                AnchorFromScope(frame, scope, new ProcessInventory { SessionId = 2, Items = new[] { new ProcessState { Pid = 4321,
+                    Name = "powersi", FullName = "PowerSI" } } }, CancellationToken.None) == null &&
+                AnchorFromScope(frame, scope, null, CancellationToken.None) == null, "scope anchor needs a full PowerSI identity");
+            using (var cancelled = new CancellationTokenSource())
+            {
+                cancelled.Cancel();
+                var stopped = false;
+                try { AnchorFromScope(frame, scope, inventory, cancelled.Token); }
+                catch (OperationCanceledException) { stopped = true; }
+                Need(stopped, "cancellation is not swallowed as an unconfirmed body");
+            }
+            Console.WriteLine("PASS: scope anchor (flat body inside the Output scope rectangle; noise, leak, identity refused)");
         }
 
         private static void DetailSelfTest()
