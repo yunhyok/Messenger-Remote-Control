@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Windows.Automation;
 
@@ -190,11 +191,17 @@ namespace RemoteMonitorMaster
             Need(before != null && before.PlainCommands && before.ReadyRow < 0, "RECEIVE_READY_BASELINE_REQUIRED");
             RequireReadyAbsent(before.Snapshot, before.Marker);
             var selected = ValidateContinuity(before, current);
-            // A completed local Ready send starts a new admission interval. Old bodies are never requests.
-            RequireHistoryPrefix(before.Selection, selected, log, int.MaxValue);
-            var ready = ReadyRow(selected, before.Marker);
-            if (ready < 0) return null; // The caller waits read-only within the existing 15-second phase budget.
-            Need(ready >= HistoryRows(before.Selection).Count, "RECEIVE_READY_NOT_APPENDED");
+            // A full history list may evict its oldest rows as Ready is appended; ShiftedReadyBinding accepts only the
+            // bounded exact shape and otherwise returns -1, leaving every check below exactly as before.
+            var ready = ShiftedReadyBinding(before, selected, log);
+            if (ready < 0)
+            {
+                // A completed local Ready send starts a new admission interval. Old bodies are never requests.
+                RequireHistoryPrefix(before.Selection, selected, log, int.MaxValue);
+                ready = ReadyRow(selected, before.Marker);
+                if (ready < 0) return null; // The caller waits read-only within the existing 15-second phase budget.
+                Need(ready >= HistoryRows(before.Selection).Count, "RECEIVE_READY_NOT_APPENDED");
+            }
             log?.Write("INFO", "RECEIVE_READY_BOUNDARY", AuditLog.Field("ready_row", ready),
                 AuditLog.Field("earlier_rows_ignored", ready), AuditLog.Field("clock_is_order_key", false));
             return CreateBaseline(current, before.Marker, true, ready);
@@ -223,18 +230,20 @@ namespace RemoteMonitorMaster
             return EvaluateCore(baseline, current, log, true, out blocked);
         }
 
+        // shift > 0 only from ReobserveCandidate, after the bound Ready body was found that many rows higher (re-anchor).
         private static ProbeNode EvaluateCore(Baseline baseline, ProbeSnapshot current, AuditLog log, bool requireVisible,
-            out bool blocked)
+            out bool blocked, int shift = 0)
         {
             blocked = false;
             var selected = ValidateContinuity(baseline, current);
             if (baseline.PlainCommands)
             {
-                ValidatePlainHistoryPrefix(baseline.Snapshot, current, log, baseline, acceptedRequest: !requireVisible);
+                if (shift > 0) RequireShiftedPrefix(baseline.Selection, 0, selected, shift, baseline.ReadyRow, log);
+                else ValidatePlainHistoryPrefix(baseline.Snapshot, current, log, baseline, acceptedRequest: !requireVisible);
                 // A request is one complete new message row. After removing one validated clock sibling,
                 // split reply/LLM Text nodes and command fragments can never become a request.
                 var rows = HistoryRows(selected);
-                var oldCount = baseline.ReadyRow >= 0 ? baseline.ReadyRow + 1 : HistoryRows(baseline.Selection).Count;
+                var oldCount = baseline.ReadyRow >= 0 ? baseline.ReadyRow - shift + 1 : HistoryRows(baseline.Selection).Count;
                 var firstCommandRow = baseline.ReadyRow >= 0 ? FirstCommandRow(rows, oldCount) : rows.Count;
                 var appendedRows = rows.Skip(oldCount).Take(firstCommandRow - oldCount + 1).ToArray();
                 var appended = appendedRows.Select(row =>
@@ -254,10 +263,12 @@ namespace RemoteMonitorMaster
                         AuditLog.Field("new_texts", newContent.Length),
                         AuditLog.Field("new_name_lengths", string.Join(",", newContent.Take(8).Select(n => n.Identity.NameLength))),
                         AuditLog.Field("new_name_formats", string.Join(",", newContent.Take(8).Select(n => n.CommandNameFormat ?? "UNAVAILABLE"))),
-                        AuditLog.Field("candidate_visible", appended.Length == 1 ? (object)appended[0].Visible : "NOT_UNIQUE"),
-                        AuditLog.Field("candidate_enabled", appended.Length == 1 ? (object)appended[0].Enabled : "NOT_UNIQUE"),
+                        AuditLog.Field("candidate_visible", appended.Length == 1 ? (object)appended[0].Visible :
+                            appended.Length == 0 ? "NONE" : "NOT_UNIQUE"),
+                        AuditLog.Field("candidate_enabled", appended.Length == 1 ? (object)appended[0].Enabled :
+                            appended.Length == 0 ? "NONE" : "NOT_UNIQUE"),
                         AuditLog.Field("observation_mode", requireVisible ? "FRESH_ADMISSION" : "ACCEPTED_REOBSERVATION"),
-                        AuditLog.Field("details_truncated", newContent.Length > 8));
+                        AuditLog.Field("details_truncated", newContent.Length > 8), AuditLog.Field("history_shift", shift));
                 }
                 Need(appended.Length <= 1, "RECEIVE_COMMAND_NOT_UNIQUE");
                 var admissible = appended.Length == 1 && appended[0].Enabled && (!requireVisible || appended[0].Visible);
@@ -273,11 +284,40 @@ namespace RemoteMonitorMaster
         {
             Need(accepted != null && accepted.Baseline != null && accepted.Baseline.PlainCommands &&
                 accepted.Final != null && accepted.Candidate != null, "RECEIVE_ACCEPTED_PROOF_REQUIRED");
-            bool blocked;
-            var candidate = EvaluateCore(accepted.Baseline, current, log, false, out blocked);
-            Need(SameCandidate(accepted.Final, accepted.Candidate, current, candidate),
-                "RECEIVE_ACCEPTED_CANDIDATE_CHANGED");
+            string reason;
+            var candidate = Reobserve(accepted, current, log, out reason);
+            if (candidate == null) log?.Write("INFO", "RECEIVE_ACCEPTED_CANDIDATE_LOST", LostFields(accepted, current, reason));
+            Need(candidate != null, "RECEIVE_ACCEPTED_CANDIDATE_CHANGED");
             return candidate;
+        }
+
+        // Null (with a content-free reason) when the accepted command is not re-observed; the caller stops the send.
+        private static ProbeNode Reobserve(ObservationProof accepted, ProbeSnapshot current, AuditLog log, out string reason)
+        {
+            var baseline = accepted.Baseline;
+            var trail = TrailFor(accepted);
+            // The identity path stays first for every snapshot whose bound Ready body has not visibly moved up. A unique
+            // exact Ready body above its bound row means recycled slots, where an identity "match" is some other row.
+            var ready = trail == null ? -1 : LocateRow(HistoryRows(SelectHistory(current)), trail.Ready);
+            bool blocked;
+            if (ready >= 0 && ready < baseline.ReadyRow)
+            {
+                var shift = baseline.ReadyRow - ready;
+                var shifted = EvaluateCore(baseline, current, log, false, out blocked, shift);
+                return Reanchor(trail, current, shift, shifted, log, out reason) == null ? null : shifted;
+            }
+            var candidate = EvaluateCore(baseline, current, log, false, out blocked);
+            var same = SameIdentity(accepted.Final, accepted.Candidate, current, candidate);
+            // After a re-anchor, positional ids alone no longer name the accepted row; Ready must be back at its bound row.
+            if (same && (trail == null || !trail.Shifted || ready == baseline.ReadyRow))
+            {
+                if (trail != null) NoteObservation(trail, current, candidate);
+                reason = "NONE";
+                return candidate;
+            }
+            reason = same ? "READY_NOT_ANCHORED" : trail != null ? "IDENTITY_CHANGED" :
+                baseline.ReadyRow < 0 ? "NOT_READY_BOUND" : "TRAIL_UNAVAILABLE";
+            return null;
         }
 
         internal static void ValidatePlainHistoryPrefix(ProbeSnapshot previous, ProbeSnapshot current, AuditLog log = null,
@@ -290,6 +330,14 @@ namespace RemoteMonitorMaster
                 if (!acceptedRequest)
                     Need(IsReadyRow(before, baseline.Marker, baseline.ReadyRow) &&
                         IsReadyRow(after, baseline.Marker, baseline.ReadyRow), "RECEIVE_READY_BOUNDARY_CHANGED");
+                // A snapshot that ReobserveCandidate re-anchored keeps the accepted range at its recorded offset.
+                var previousShift = acceptedRequest ? RecordedShift(previous, baseline) : 0;
+                var currentShift = acceptedRequest ? RecordedShift(current, baseline) : 0;
+                if (previousShift != 0 || currentShift != 0)
+                {
+                    RequireShiftedPrefix(before, previousShift, after, currentShift, baseline.ReadyRow, log);
+                    return;
+                }
                 // After admission, Ready's display body is historical. Its row identity/order still stays exact,
                 // and ReobserveCandidate binds every current whole-message result to the accepted command.
                 RequireHistoryPrefix(before, after, log, baseline.ReadyRow + (acceptedRequest ? 1 : 0),
@@ -442,8 +490,25 @@ namespace RemoteMonitorMaster
 
         internal static bool SameCandidate(ProbeSnapshot previous, ProbeNode before, ProbeSnapshot current, ProbeNode after)
         {
+            var old = Recorded(previous);
+            var fresh = Recorded(current);
+            var trail = old != null && old.Shift > 0 ? old.Trail : fresh != null && fresh.Shift > 0 ? fresh.Trail : null;
+            if (trail == null) return SameIdentity(previous, before, current, after);
+            // Recycled slots reuse ids, so a re-anchored snapshot names the accepted message only through its anchor.
+            return before != null && after != null && Anchored(trail, previous, before, old) &&
+                Anchored(trail, current, after, fresh) && SameShape(before, after);
+        }
+
+        private static bool SameIdentity(ProbeSnapshot previous, ProbeNode before, ProbeSnapshot current, ProbeNode after)
+        {
             return before != null && after != null && before.NativeHwnd == after.NativeHwnd && before.Identity.Equals(after.Identity) &&
                 PathKey(SelectHistory(previous), before) == PathKey(SelectHistory(current), after);
+        }
+
+        private static bool Anchored(HistoryTrail trail, ProbeSnapshot snapshot, ProbeNode node, HistoryAnchor anchor)
+        {
+            if (anchor != null && anchor.Shift > 0) return anchor.Trail == trail && ReferenceEquals(anchor.Candidate, node);
+            return SameIdentity(trail.AcceptedFinal, trail.Accepted, snapshot, node);
         }
 
         private static string PathKey(HistorySelection selection, ProbeNode node)
@@ -456,6 +521,472 @@ namespace RemoteMonitorMaster
                 node = selection.ByNode[node.Parent];
             }
             return string.Join("/", parts);
+        }
+
+        // ---- Accepted-request history shift (re-anchor) ----------------------------------------------------------------
+        // Field shape (Master 0.3.10, KI-Messenger): once the history list is full, appending a tall reply part evicts its
+        // oldest row while recycled row nodes keep positional runtime ids. Older rows still pass the slot-by-slot identity
+        // check, but the accepted command now sits higher under another id. Only an already accepted request may follow it,
+        // and only by exact content: the bound Ready row's whole body found uniquely above its bound row and at most
+        // MaxEvictedRows rows above the previous observation's Ready row; the accepted command's whole body, shape and
+        // enabled state at its accepted offset after Ready; and every row after Ready unchanged and in order, with at most
+        // the one part just sent appended. Fresh admission never uses this. Only lengths, SHA-256 name hashes and flags are
+        // kept, and nothing about bodies is logged.
+        internal const int MaxEvictedRows = 8;
+
+        private sealed class HistoryTrail
+        {
+            internal ProbeSnapshot BaselineSnapshot, AcceptedFinal;
+            internal ProbeNode Ready, Accepted; // Bound Ready Text and accepted command Text; only identity/hash/length are read.
+            internal string MarkerHash;
+            internal int ReadyRow, CommandOffset, AcceptedDepth, LastReadyRow;
+            internal List<string> Rows; // Rows after Ready as last observed: one "length:sha256|..." signature per row.
+            internal bool Shifted;
+
+            internal bool Matches(Baseline baseline)
+            {
+                return baseline != null && ReferenceEquals(BaselineSnapshot, baseline.Snapshot) && ReadyRow == baseline.ReadyRow &&
+                    string.Equals(MarkerHash, baseline.MarkerHash, StringComparison.Ordinal);
+            }
+        }
+
+        private sealed class HistoryAnchor
+        {
+            internal HistoryTrail Trail;
+            internal ProbeNode Candidate;
+            internal int Shift, ReadyBefore, ReadyAfter, RowsAfterReady, AppendedRows; // Shift is relative to the bound Ready row.
+        }
+
+        private static readonly object TrailGate = new object();
+        private static readonly ConditionalWeakTable<Baseline, HistoryTrail> Trails = new ConditionalWeakTable<Baseline, HistoryTrail>();
+        private static readonly ConditionalWeakTable<ProbeSnapshot, HistoryAnchor> Anchors =
+            new ConditionalWeakTable<ProbeSnapshot, HistoryAnchor>();
+
+        // One trail per Ready-bound accepted request, derived from its unshifted accepted observation. Null disables the
+        // re-anchor (the identity rule then stands alone), e.g. before Ready binding or when the shape cannot be derived.
+        private static HistoryTrail TrailFor(ObservationProof accepted)
+        {
+            var baseline = accepted.Baseline;
+            if (!baseline.PlainCommands || baseline.ReadyRow < 0) return null;
+            lock (TrailGate)
+            {
+                HistoryTrail trail;
+                if (Trails.TryGetValue(baseline, out trail) && SameName(trail.Accepted, accepted.Candidate)) return trail;
+                trail = NewTrail(accepted);
+                Trails.Remove(baseline);
+                if (trail != null) Trails.Add(baseline, trail);
+                return trail;
+            }
+        }
+
+        private static HistoryTrail NewTrail(ObservationProof accepted)
+        {
+            var baseline = accepted.Baseline;
+            try
+            {
+                var bound = HistoryRows(baseline.Selection);
+                var ready = baseline.ReadyRow < bound.Count ? SafeContent(bound[baseline.ReadyRow]) : null;
+                if (ready == null || ready.Length != 1) return null;
+                var final = SelectHistory(accepted.Final);
+                var rows = HistoryRows(final);
+                if (LocateRow(rows, ready[0]) != baseline.ReadyRow) return null;
+                var command = rows.FindIndex(row =>
+                {
+                    var content = SafeContent(row);
+                    return content != null && content.Length == 1 && ReferenceEquals(content[0], accepted.Candidate);
+                });
+                if (command <= baseline.ReadyRow) return null;
+                return new HistoryTrail { BaselineSnapshot = baseline.Snapshot, AcceptedFinal = accepted.Final, Ready = ready[0],
+                    Accepted = accepted.Candidate, MarkerHash = baseline.MarkerHash, ReadyRow = baseline.ReadyRow,
+                    CommandOffset = command - baseline.ReadyRow - 1, AcceptedDepth = Depth(final, accepted.Candidate),
+                    LastReadyRow = baseline.ReadyRow, Rows = Signatures(rows, baseline.ReadyRow + 1) };
+            }
+            catch (MonitorException) { return null; }
+        }
+
+        // Index of the one row whose whole content is exactly this Text's body (length + hash); -1 none, -2 ambiguous.
+        private static int LocateRow(List<ProbeNode[]> rows, ProbeNode text)
+        {
+            var found = -1;
+            for (var i = 0; i < rows.Count; i++)
+            {
+                if (!rows[i].Any(node => SameName(node, text))) continue;
+                var content = SafeContent(rows[i]);
+                if (content == null || content.Length != 1 || !SameName(content[0], text)) continue;
+                if (found >= 0) return -2;
+                found = i;
+            }
+            return found;
+        }
+
+        private static ProbeNode[] SafeContent(ProbeNode[] row)
+        {
+            try { return RowContent(row); }
+            catch (MonitorException) { return null; }
+        }
+
+        private static bool SameName(ProbeNode a, ProbeNode b)
+        {
+            return a != null && b != null && a.Identity.NameLength == b.Identity.NameLength &&
+                string.Equals(a.Identity.NameHash, b.Identity.NameHash, StringComparison.Ordinal);
+        }
+
+        // Everything but the recycled runtime id: native hwnd, process, automation id, type, class, framework, patterns, body.
+        private static bool SameShape(ProbeNode a, ProbeNode b)
+        {
+            var x = a.Identity;
+            var y = b.Identity;
+            return a.NativeHwnd == b.NativeHwnd && x.ProcessId == y.ProcessId &&
+                string.Equals(x.AutomationId, y.AutomationId, StringComparison.Ordinal) &&
+                string.Equals(x.ControlType, y.ControlType, StringComparison.Ordinal) &&
+                string.Equals(x.ClassName, y.ClassName, StringComparison.Ordinal) &&
+                string.Equals(x.FrameworkId, y.FrameworkId, StringComparison.Ordinal) &&
+                string.Equals(x.Patterns, y.Patterns, StringComparison.Ordinal) && SameName(a, b);
+        }
+
+        private static int Depth(HistorySelection selection, ProbeNode text)
+        {
+            var depth = 0;
+            for (var node = text; node.Parent != selection.History.Node; node = selection.ByNode[node.Parent]) depth++;
+            return depth;
+        }
+
+        private static List<string> Signatures(List<ProbeNode[]> rows, int start)
+        {
+            var result = new List<string>();
+            for (var i = start; i < rows.Count; i++)
+                result.Add(string.Join("|", RowContent(rows[i]).Select(n => n.Identity.NameLength + ":" + n.Identity.NameHash)));
+            return result;
+        }
+
+        private static HistoryAnchor Recorded(ProbeSnapshot snapshot)
+        {
+            HistoryAnchor anchor;
+            return snapshot != null && Anchors.TryGetValue(snapshot, out anchor) ? anchor : null;
+        }
+
+        private static int RecordedShift(ProbeSnapshot snapshot, Baseline baseline)
+        {
+            var anchor = Recorded(snapshot);
+            return anchor != null && anchor.Trail.Matches(baseline) ? anchor.Shift : 0;
+        }
+
+        private static void Remember(ProbeSnapshot snapshot, HistoryAnchor anchor)
+        {
+            lock (TrailGate)
+            {
+                Anchors.Remove(snapshot);
+                Anchors.Add(snapshot, anchor);
+            }
+        }
+
+        // First sight of an identity-path snapshot records its rows after Ready. It never rejects anything.
+        private static void NoteObservation(HistoryTrail trail, ProbeSnapshot current, ProbeNode candidate)
+        {
+            lock (trail)
+            {
+                var known = Recorded(current);
+                if (known != null && known.Trail == trail) return;
+                List<string> rows;
+                try { rows = Signatures(HistoryRows(SelectHistory(current)), trail.ReadyRow + 1); }
+                catch (MonitorException) { return; } // Keeps the previous record, so a later shift cannot be accepted from it.
+                Remember(current, new HistoryAnchor { Trail = trail, Candidate = candidate, ReadyBefore = trail.LastReadyRow,
+                    ReadyAfter = trail.ReadyRow, RowsAfterReady = rows.Count, AppendedRows = rows.Count - trail.Rows.Count });
+                trail.Rows = rows;
+                trail.LastReadyRow = trail.ReadyRow;
+            }
+        }
+
+        // Accepts a snapshot whose bound Ready body sits `shift` rows above the bound row, or returns null with the reason.
+        // A snapshot is compared with the trail once, at first sight; re-evaluating it (the handoff re-checks the same two
+        // snapshots) reuses that result after the structural checks, so the order of re-checks cannot change the outcome.
+        private static HistoryAnchor Reanchor(HistoryTrail trail, ProbeSnapshot current, int shift, ProbeNode candidate,
+            AuditLog log, out string reason)
+        {
+            var selection = SelectHistory(current);
+            var rows = HistoryRows(selection);
+            var ready = trail.ReadyRow - shift;
+            var commandRow = ready + 1 + trail.CommandOffset;
+            var content = commandRow < rows.Count ? SafeContent(rows[commandRow]) : null;
+            var command = content != null && content.Length == 1 ? content[0] : null;
+            string ignored;
+            if (command == null || !ReadOnlyCommands.TryMatchNode(command, out ignored)) reason = "COMMAND_MISSING";
+            else if (!SameShape(trail.Accepted, command) || Depth(selection, command) != trail.AcceptedDepth) reason = "COMMAND_CHANGED";
+            else if (command.Enabled != trail.Accepted.Enabled) reason = "COMMAND_DISABLED";
+            else if (!ReferenceEquals(command, candidate)) reason = "COMMAND_NOT_FIRST";
+            else reason = null;
+            if (reason != null) return null;
+            lock (trail)
+            {
+                var known = Recorded(current);
+                if (known != null && known.Trail == trail)
+                {
+                    var same = known.Shift == shift && ReferenceEquals(known.Candidate, candidate);
+                    reason = same ? "NONE" : "ANCHOR_CHANGED";
+                    return same ? known : null;
+                }
+                var step = trail.LastReadyRow - ready;
+                List<string> after = null;
+                if (step < 0) reason = "SHIFT_REVERSED";
+                else if (step > MaxEvictedRows) reason = "SHIFT_OUT_OF_RANGE";
+                else
+                {
+                    try { after = Signatures(rows, ready + 1); }
+                    catch (MonitorException) { reason = "ROW_UNREADABLE"; }
+                }
+                if (reason == null)
+                {
+                    // Rows after Ready keep order and bodies; only the one part just sent may be appended at the end.
+                    var before = trail.Rows;
+                    if (after.Count < before.Count) reason = "ROWS_LOST";
+                    else if (after.Count > before.Count + 1) reason = "ROWS_APPENDED_EXCESS";
+                    else if (!before.SequenceEqual(after.Take(before.Count), StringComparer.Ordinal)) reason = "ROWS_CHANGED";
+                }
+                if (reason != null) return null;
+                var anchor = new HistoryAnchor { Trail = trail, Candidate = candidate, Shift = shift, ReadyBefore = trail.LastReadyRow,
+                    ReadyAfter = ready, RowsAfterReady = after.Count, AppendedRows = after.Count - trail.Rows.Count };
+                Remember(current, anchor);
+                trail.Rows = after;
+                trail.LastReadyRow = ready;
+                trail.Shifted = true;
+                reason = "NONE";
+                log?.Write("INFO", "RECEIVE_HISTORY_SHIFTED", ShiftedFields(anchor));
+                return anchor;
+            }
+        }
+
+        // Row identity/order stays positional (recycled slots keep their ids), so every exposed row is still compared slot
+        // by slot; the protected Ready..command range moves with the re-anchored Ready row and is compared by content.
+        private static void RequireShiftedPrefix(HistorySelection previous, int previousShift, HistorySelection current,
+            int currentShift, int readyRow, AuditLog log)
+        {
+            RequireHistoryPrefix(previous, current, log, int.MaxValue);
+            var before = HistoryRows(previous);
+            var after = HistoryRows(current);
+            var oldReady = readyRow - previousShift;
+            var newReady = readyRow - currentShift;
+            var end = Math.Min(FirstCommandRow(before, oldReady + 1), before.Count - 1);
+            for (var row = oldReady + 1; row <= end; row++)
+            {
+                var target = row - oldReady + newReady;
+                var oldContent = RowContent(before[row]);
+                var newContent = target < after.Count ? RowContent(after[target]) : null;
+                if (newContent != null && oldContent.Length == newContent.Length &&
+                    oldContent.Select((node, index) => SameShape(node, newContent[index])).All(same => same)) continue;
+                log?.Write("INFO", "RECEIVE_HISTORY_REJECTED", AuditLog.Field("reason", "RECEIVE_HISTORY_CONTENT_CHANGED"),
+                    AuditLog.Field("comparison", "SHIFTED_CONTENT"), AuditLog.Field("row_index", row),
+                    AuditLog.Field("target_row_index", target), AuditLog.Field("before_shift", previousShift),
+                    AuditLog.Field("after_shift", currentShift), AuditLog.Field("before_rows", before.Count),
+                    AuditLog.Field("after_rows", after.Count));
+                Need(false, "RECEIVE_HISTORY_CONTENT_CHANGED");
+            }
+        }
+
+        private static AuditLog.LogField[] ShiftedFields(HistoryAnchor anchor)
+        {
+            return new[] {
+                AuditLog.Field("shift", anchor.ReadyBefore - anchor.ReadyAfter), AuditLog.Field("total_shift", anchor.Shift),
+                AuditLog.Field("bound_ready_row", anchor.Trail.ReadyRow), AuditLog.Field("ready_row_before", anchor.ReadyBefore),
+                AuditLog.Field("ready_row_after", anchor.ReadyAfter), AuditLog.Field("rows_after_ready", anchor.RowsAfterReady),
+                AuditLog.Field("appended_rows", anchor.AppendedRows), AuditLog.Field("command_offset", anchor.Trail.CommandOffset),
+                AuditLog.Field("content_compared", "LENGTH_SHA256_ONLY") };
+        }
+
+        // Content-free description of where the accepted command went; never a name, body or title.
+        private static AuditLog.LogField[] LostFields(ObservationProof accepted, ProbeSnapshot current, string reason)
+        {
+            var baseline = accepted.Baseline;
+            var name = accepted.Candidate;
+            int runtimeRow = -1, exactRows = 0, readyNow = -1, rowCount = -1;
+            bool nameEqual = false, readyAtBound = false;
+            HistoryTrail trail;
+            int last;
+            lock (TrailGate) last = Trails.TryGetValue(baseline, out trail) ? trail.LastReadyRow : baseline.ReadyRow;
+            try
+            {
+                var selection = SelectHistory(current);
+                var rows = HistoryRows(selection);
+                rowCount = rows.Count;
+                for (var i = 0; i < rows.Count; i++)
+                {
+                    if (runtimeRow < 0 && rows[i].Any(n => string.Equals(n.Identity.RuntimeId, name.Identity.RuntimeId,
+                        StringComparison.Ordinal))) runtimeRow = i;
+                    if (!rows[i].Any(n => SameName(n, name))) continue;
+                    nameEqual = true;
+                    var content = SafeContent(rows[i]);
+                    if (content != null && content.Length == 1 && SameName(content[0], name)) exactRows++;
+                }
+                if (baseline.ReadyRow >= 0)
+                {
+                    try { readyAtBound = IsReadyRow(selection, baseline.Marker, baseline.ReadyRow); }
+                    catch (MonitorException) { }
+                    var bound = HistoryRows(baseline.Selection);
+                    var ready = baseline.ReadyRow < bound.Count ? SafeContent(bound[baseline.ReadyRow]) : null;
+                    if (ready != null && ready.Length == 1) readyNow = LocateRow(rows, ready[0]);
+                }
+            }
+            catch (MonitorException) { } // Diagnostics only; the rejection stands either way.
+            return new[] {
+                AuditLog.Field("reanchor_result", reason), AuditLog.Field("accepted_runtime_present", runtimeRow >= 0),
+                AuditLog.Field("accepted_runtime_row", runtimeRow), AuditLog.Field("accepted_name_equal", nameEqual),
+                AuditLog.Field("exact_name_rows", exactRows), AuditLog.Field("bound_ready_row", baseline.ReadyRow),
+                AuditLog.Field("last_ready_row", last), AuditLog.Field("ready_at_bound_row", readyAtBound),
+                AuditLog.Field("ready_row_now", readyNow), AuditLog.Field("current_rows", rowCount),
+                AuditLog.Field("rows_after_ready", readyNow >= 0 ? rowCount - readyNow - 1 : -1),
+                AuditLog.Field("shift_candidate", readyNow >= 0 && readyNow <= last ? last - readyNow : -1),
+                AuditLog.Field("max_evicted_rows", MaxEvictedRows) };
+        }
+
+        // ---- Ready binding / fresh admission across a top eviction ---------------------------------------------------
+        // The same KI-Messenger list behaviour before a command is accepted: appending Ready (or a user's message while
+        // waiting) evicts the oldest rows of a full window. Only this exact shape moves the binding: Ready found uniquely
+        // by content, 1..MaxEvictedRows rows higher than the rows it replaces, every row before it equal (length:SHA-256 per
+        // Text, clock siblings excluded as today) to the older snapshot's rows shifted by that amount, and the slot-by-slot
+        // row identity the recycled list keeps. Anything else returns "no shift" and today's checks decide unchanged.
+
+        // E1. Ready newly appended as the LAST row while `shift` top rows left: its index, or -1 (today's rules then apply).
+        private static int ShiftedReadyBinding(Baseline before, HistorySelection selected, AuditLog log)
+        {
+            var preRows = HistoryRows(before.Selection);
+            var rows = HistoryRows(selected);
+            int ready;
+            try { ready = ReadyRow(selected, before.Marker); }
+            catch (MonitorException) { return -1; } // An ambiguous Ready keeps today's reason.
+            if (ready < 0 || ready >= preRows.Count || ready != rows.Count - 1) return -1;
+            var shift = preRows.Count - ready;
+            if (shift > MaxEvictedRows || !SameSlots(before.Selection, selected) || !SameRows(preRows, shift, rows, 0, ready))
+                return -1;
+            log?.Write("INFO", "RECEIVE_READY_SHIFTED", ReadyShiftedFields("READY_BIND", shift, preRows.Count, rows.Count, ready, -1));
+            return ready;
+        }
+
+        // E2. Fresh admission only: when the bound Ready row moved up by a top eviction, the Ready-bound baseline re-bound
+        // at its new index, checked against the bound snapshot and the previous poll; null when Ready did not move this
+        // way, so today's checks (RECEIVE_READY_BOUNDARY_CHANGED etc.) decide unchanged.
+        internal static Baseline RebaseReady(Baseline bound, ProbeSnapshot previous, ProbeSnapshot current, AuditLog log = null,
+            string mode = "FRESH_ADMISSION")
+        {
+            if (bound == null || !bound.PlainCommands || bound.ReadyRow < 0 || current == null) return null;
+            var after = ValidateContinuity(bound, current);
+            if (SafeIsReadyRow(after, bound.Marker, bound.ReadyRow)) return null;
+            var boundRows = HistoryRows(bound.Selection);
+            var readyText = bound.ReadyRow < boundRows.Count ? SafeContent(boundRows[bound.ReadyRow]) : null;
+            if (readyText == null || readyText.Length != 1) return null;
+            var rows = HistoryRows(after);
+            var ready = LocateRow(rows, readyText[0]);
+            int readyByNotice;
+            try { readyByNotice = ReadyRow(after, bound.Marker); }
+            catch (MonitorException) { return null; }
+            if (ready < 0 || ready != readyByNotice || !ShiftedReadyRows(bound.Selection, bound.ReadyRow, after, ready)) return null;
+            if (previous != null && !ReferenceEquals(previous, bound.Snapshot) &&
+                !ShiftedReadyRows(SelectHistory(previous), bound.ReadyRow, after, ready)) return null;
+            log?.Write("INFO", "RECEIVE_READY_SHIFTED", ReadyShiftedFields(mode, bound.ReadyRow - ready,
+                boundRows.Count, rows.Count, ready, bound.ReadyRow));
+            return CreateBaseline(current, bound.Marker, true, ready);
+        }
+
+        // E4. The command wait's Ready binding, carried across a watchdog yield. Keyed by the wait's pre-Ready baseline,
+        // which StatusSession keeps for a re-entered wait; a new Ready (SendReady) starts a new key.
+        private static readonly ConditionalWeakTable<Baseline, Baseline> Waits = new ConditionalWeakTable<Baseline, Baseline>();
+
+        internal static void RememberWait(Baseline preReady, Baseline bound)
+        {
+            if (preReady == null || bound == null || preReady.ReadyRow >= 0 || bound.ReadyRow < 0) return;
+            lock (TrailGate)
+            {
+                Waits.Remove(preReady);
+                Waits.Add(preReady, bound);
+            }
+        }
+
+        // Binds the wait's Ready row. The first entry binds from the pre-Ready snapshot (BindReadyBoundary). A re-entry
+        // after a yield, or a watchdog notice's pending-command check, first continues from the wait's last bound Ready
+        // row: the same row with today's poll-to-poll rule, or RebaseReady's bounded rule when a top eviction moved it up
+        // (mode YIELD_REENTRY). Whenever that does not hold, today's re-binding from the pre-Ready snapshot decides.
+        internal static Baseline RebindWait(Baseline preReady, ProbeSnapshot current, AuditLog log = null)
+        {
+            Need(preReady != null && preReady.PlainCommands && preReady.ReadyRow < 0, "RECEIVE_READY_BASELINE_REQUIRED");
+            Baseline carried;
+            lock (TrailGate) Waits.TryGetValue(preReady, out carried);
+            var bound = (carried == null ? null : ContinueWait(preReady, carried, current, log)) ??
+                BindReadyBoundary(preReady, current, log);
+            RememberWait(preReady, bound);
+            return bound;
+        }
+
+        private static Baseline ContinueWait(Baseline preReady, Baseline carried, ProbeSnapshot current, AuditLog log)
+        {
+            try
+            {
+                RequireReadyAbsent(preReady.Snapshot, preReady.Marker);
+                var after = ValidateContinuity(carried, current);
+                if (!SafeIsReadyRow(after, carried.Marker, carried.ReadyRow))
+                    return RebaseReady(carried, null, current, log, "YIELD_REENTRY");
+                // Same row: still the one Ready of this code, and today's poll-to-poll rule against the carried binding.
+                if (ReadyRow(after, carried.Marker) != carried.ReadyRow) return null;
+                ValidatePlainHistoryPrefix(carried.Snapshot, current, null, carried, acceptedRequest: false);
+                return CreateBaseline(current, carried.Marker, true, carried.ReadyRow);
+            }
+            catch (MonitorException) { return null; } // Today's re-binding decides, with its own reason.
+        }
+
+        // The older snapshot's rows before Ready, Ready itself and the rows after it that today's check protects (up to
+        // its first command row) reappear `olderReady - newerReady` rows higher, and no row after Ready was lost.
+        private static bool ShiftedReadyRows(HistorySelection older, int olderReady, HistorySelection newer, int newerReady)
+        {
+            var before = HistoryRows(older);
+            var after = HistoryRows(newer);
+            var shift = olderReady - newerReady;
+            if (shift < 1 || shift > MaxEvictedRows || newerReady < 0 || olderReady >= before.Count ||
+                after.Count - newerReady < before.Count - olderReady) return false;
+            int end;
+            try { end = Math.Min(FirstCommandRow(before, olderReady + 1), before.Count - 1); }
+            catch (MonitorException) { return false; }
+            return SameSlots(older, newer) && SameRows(before, shift, after, 0, newerReady) &&
+                SameRows(before, olderReady, after, newerReady, end - olderReady + 1);
+        }
+
+        // Slot-by-slot row identity over the slots both snapshots expose; recycled list rows keep their slot's id.
+        private static bool SameSlots(HistorySelection older, HistorySelection newer)
+        {
+            var before = HistoryRows(older);
+            var after = HistoryRows(newer);
+            for (var i = 0; i < Math.Min(before.Count, after.Count); i++)
+            {
+                var oldRoot = RowRoot(older, before[i][0]);
+                var newRoot = RowRoot(newer, after[i][0]);
+                if (oldRoot.NativeHwnd != newRoot.NativeHwnd || !oldRoot.Identity.Matches(newRoot.Identity, false) ||
+                    PathKey(older, oldRoot) != PathKey(newer, newRoot)) return false;
+            }
+            return true;
+        }
+
+        // Whole-row content of `count` rows: older[olderStart..] against newer[newerStart..], same order, nothing inserted.
+        private static bool SameRows(List<ProbeNode[]> older, int olderStart, List<ProbeNode[]> newer, int newerStart, int count)
+        {
+            if (count < 0 || olderStart < 0 || newerStart < 0 || olderStart + count > older.Count || newerStart + count > newer.Count)
+                return false;
+            try
+            {
+                return Signatures(older.GetRange(olderStart, count), 0)
+                    .SequenceEqual(Signatures(newer.GetRange(newerStart, count), 0), StringComparer.Ordinal);
+            }
+            catch (MonitorException) { return false; }
+        }
+
+        private static bool SafeIsReadyRow(HistorySelection selection, string marker, int index)
+        {
+            try { return IsReadyRow(selection, marker, index); }
+            catch (MonitorException) { return false; }
+        }
+
+        private static AuditLog.LogField[] ReadyShiftedFields(string mode, int shift, int preRows, int postRows, int readyRow,
+            int readyRowBefore)
+        {
+            return new[] {
+                AuditLog.Field("mode", mode), AuditLog.Field("shift", shift), AuditLog.Field("pre_rows", preRows),
+                AuditLog.Field("post_rows", postRows), AuditLog.Field("ready_row", readyRow),
+                AuditLog.Field("ready_row_before", readyRowBefore), AuditLog.Field("content_compared", "LENGTH_SHA256_ONLY") };
         }
 
         // ---- Cheap idle change trigger -------------------------------------------------------------------------
@@ -765,7 +1296,7 @@ namespace RemoteMonitorMaster
                 {
                     Baseline ready;
                     var readyWait = Stopwatch.StartNew();
-                    while ((ready = BindReadyBoundary(baseline, firstSnapshot, log)) == null)
+                    while ((ready = RebindWait(baseline, firstSnapshot, log)) == null)
                     {
                         phaseClock.Restart(); // Each retry capture gets its own snapshot budget; the wait is bounded below.
                         Alive();
@@ -872,7 +1403,17 @@ namespace RemoteMonitorMaster
                     SetPhase("POLLING");
                     var current = Capture();
                     polls++;
-                    if (plainCommands && previous != null)
+                    // Fresh admission only: a top eviction that moved the bound Ready row up re-binds it at its new index
+                    // (RebaseReady checks this snapshot against both the bound and the previous one). A candidate pair
+                    // never spans the move, so the command still needs two observations at the new index.
+                    var rebased = plainCommands && acceptedProof == null ? RebaseReady(baseline, previous, current, log) : null;
+                    if (rebased != null)
+                    {
+                        baseline = rebased;
+                        previousCandidate = null;
+                        if (continuousWait) RememberWait(suppliedBaseline, rebased); // A yield re-enters from this row.
+                    }
+                    else if (plainCommands && previous != null)
                         ValidatePlainHistoryPrefix(previous, current, log, baseline, acceptedRequest: acceptedProof != null);
                     var candidate = Candidate(current);
                     inspectSnapshot?.Invoke("POLL", current);
@@ -1359,6 +1900,7 @@ namespace RemoteMonitorMaster
             RunClockSiblingSelfTest();
             RunLongHistorySelfTest();
             RunReadyBoundarySelfTest();
+            RunHistoryShiftSelfTest();
         }
 
         private static void RunReadyBoundarySelfTest()
@@ -1461,6 +2003,383 @@ namespace RemoteMonitorMaster
                 AppendTestHistoryText(invalid, readyText); AppendTestHistoryText(invalid, "pwrsi");
                 mutate(invalid); Reject(() => Evaluate(bound, invalid));
             }
+        }
+
+        // Field shape (Master 0.3.10, 2026-10-04): a 40-part pwrsi reply with ReadyRow 29 in a 43-row window. From part 13
+        // on, each appended part evicted the oldest row and the recycled slots kept positional runtime ids, so the command
+        // was no longer at/after slot 30. These cases cover the bounded content re-anchor and the refusals it must keep.
+        private static void RunHistoryShiftSelfTest()
+        {
+            const string marker = "M234567";
+            var readyText = SupervisedSendTest.ReadyText("D234567");
+            var parts = new string[41];
+            for (var i = 1; i < parts.Length; i++)
+                parts[i] = i == 1 ? new string('a', 781) : ("PART " + i.ToString("D3") + " ").PadRight(1000, (char)('a' + i % 26));
+            parts[3] = parts[2]; // KI-Messenger's 1,000-character Name cap can make separate parts identical.
+            parts[10] = parts[9];
+            List<string> Old() { return Enumerable.Range(0, 29).Select(i => "old message " + i).ToList(); }
+            // 29 old rows, Ready (row 29), the command (row 30), then the busy notice and reply parts 1..replyParts.
+            List<string> Rows(int replyParts, bool command = true, string ready = null, string commandText = "pwrsi")
+            {
+                var rows = Old();
+                rows.Add(ready ?? readyText);
+                if (command) rows.Add(commandText);
+                if (replyParts >= 0) rows.Add(SupervisedSendTest.PowerSiBusyNotice);
+                for (var i = 1; i <= replyParts; i++) rows.Add(parts[i]);
+                return rows;
+            }
+            List<string> Swap(List<string> rows, int a, int b) { var copy = rows.ToList(); copy[a] = rows[b]; copy[b] = rows[a]; return copy; }
+            List<string> Without(List<string> rows, int index) { var copy = rows.ToList(); copy.RemoveAt(index); return copy; }
+            ProbeSnapshot Window(IList<string> rows, bool commandVisible = false)
+            {
+                var snapshot = CreateTestSnapshot();
+                var texts = SelectHistory(snapshot).Texts;
+                SetTestName(texts[0], rows[0]);
+                SetTestName(texts[1], rows[1]);
+                for (var i = 2; i < rows.Count; i++) AppendTestHistoryText(snapshot, rows[i]);
+                foreach (var node in snapshot.Nodes.Where(n => n.PlainCommand != null)) node.Visible = commandVisible;
+                return snapshot;
+            }
+            void RemoveRow(ProbeSnapshot snapshot, int index)
+            {
+                var selection = SelectHistory(snapshot);
+                var row = HistoryRows(selection)[index];
+                var root = RowRoot(selection, row[0]);
+                snapshot.Nodes.RemoveAll(n => n == root || row.Contains(n));
+            }
+            // The window drops `evicted` top rows; `edit` runs next; then every slot takes the runtime ids of the same slot
+            // in an unshifted window of the same size, as recycled list rows do. Names, hashes and lengths are unchanged.
+            ProbeSnapshot Shifted(IList<string> rows, int evicted, Action<ProbeSnapshot> edit = null, bool commandVisible = false)
+            {
+                var snapshot = Window(rows, commandVisible);
+                for (var i = 0; i < evicted; i++) RemoveRow(snapshot, 0);
+                edit?.Invoke(snapshot);
+                Rekey(snapshot, Window(Enumerable.Repeat("slot", HistoryRows(SelectHistory(snapshot)).Count).ToList()));
+                return snapshot;
+            }
+            ProbeNode Slot(ProbeSnapshot snapshot, int row) { return HistoryRows(SelectHistory(snapshot))[row][0]; }
+            bool Logged(AuditLog.LogField[] fields, params object[] expected)
+            {
+                for (var i = 0; i + 1 < expected.Length; i += 2)
+                    if (!Equals(fields.Single(f => f.Key == (string)expected[i]).Value, expected[i + 1])) return false;
+                return true;
+            }
+            ObservationProof Accept()
+            {
+                var preReady = CreateBaseline(Window(Old()), marker, true);
+                var bound = BindReadyBoundary(preReady, Window(Rows(-1, command: false)));
+                var previous = Window(Rows(-1), true);
+                var final = Window(Rows(-1), true);
+                var first = Evaluate(bound, previous);
+                var second = Evaluate(bound, final);
+                Need(bound != null && bound.ReadyRow == 29 && first != null && SameCandidate(previous, first, final, second),
+                    "RECEIVE_SELF_TEST_SHIFT_ACCEPTED");
+                return new ObservationProof(new object(), new IntPtr(final.Process.WindowHandle), new NativeMethods.WindowRectangle(),
+                    bound, previous, first, final, second);
+            }
+            // The ReceiveProbe calls one reply part makes: Observe(singleRefresh), then RoundTripTest's
+            // CompleteRefreshedProof/SelectRefreshedProof and AuthorizeHandoffCore with the sender's fresh snapshot.
+            ProbeNode Handoff(ObservationProof original, ProbeSnapshot first, ProbeSnapshot fresh)
+            {
+                var baseline = original.Baseline;
+                var single = ReobserveCandidate(original, first);
+                ValidatePlainHistoryPrefix(original.Final, first, null, baseline, acceptedRequest: true);
+                Need(ReferenceEquals(ReobserveCandidate(original, first), single), "RECEIVE_SELF_TEST_SHIFT_SINGLE");
+                var final = ReobserveCandidate(original, fresh);
+                var refreshed = new ObservationProof(original.Owner, original.Window, original.Bounds, baseline, first, single,
+                    fresh, final);
+                ValidatePlainHistoryPrefix(original.Final, first, baseline: baseline, acceptedRequest: true);
+                ValidatePlainHistoryPrefix(first, fresh, baseline: baseline, acceptedRequest: true);
+                Need(SameCandidate(original.Final, original.Candidate, first, single) &&
+                    SameCandidate(original.Final, original.Candidate, fresh, final), "RECEIVE_SELF_TEST_SHIFT_REFRESHED");
+                var rebound = CreateBaseline(baseline.Snapshot, marker, true, baseline.ReadyRow);
+                Need(ReferenceEquals(ReobserveCandidate(refreshed, first), single) &&
+                    ReferenceEquals(ReobserveCandidate(refreshed, fresh), final), "RECEIVE_SELF_TEST_SHIFT_HANDOFF_REPEAT");
+                ValidatePlainHistoryPrefix(first, fresh, null, rebound, acceptedRequest: true);
+                ValidatePlainHistoryPrefix(fresh, fresh, null, rebound, acceptedRequest: true);
+                var current = ReobserveCandidate(refreshed, fresh);
+                Need(SameCandidate(first, single, fresh, final) && SameCandidate(fresh, final, fresh, current),
+                    "RECEIVE_SELF_TEST_SHIFT_HANDOFF");
+                return final;
+            }
+            ObservationProof Primed()
+            {
+                var proof = Accept();
+                Handoff(proof, Window(Rows(11)), Window(Rows(11))); // Part 12, unshifted: 43 rows, Ready 29, command 30.
+                return proof;
+            }
+            void Lost(ObservationProof proof, ProbeSnapshot changed, string expected)
+            {
+                string reason;
+                Need(Reobserve(proof, changed, null, out reason) == null && reason == expected,
+                    "RECEIVE_SELF_TEST_SHIFT_REFUSED_" + expected);
+                try { ReobserveCandidate(proof, changed); }
+                catch (MonitorException ex) when (ex.ReasonCode == "RECEIVE_ACCEPTED_CANDIDATE_CHANGED") { return; }
+                throw new InvalidOperationException("Unsafe history shift was re-anchored.");
+            }
+
+            // No shift: long, capped and identical parts alone never disturb the accepted command (parts 1..13).
+            var steady = Accept();
+            for (var part = 1; part <= 13; part++)
+            {
+                var first = Window(Rows(part - 1));
+                var fresh = Window(Rows(part - 1));
+                Need(Handoff(steady, first, fresh) == Slot(fresh, 30) && Recorded(fresh).Shift == 0 &&
+                    Recorded(fresh).RowsAfterReady == part + 1, "RECEIVE_SELF_TEST_SHIFT_NONE");
+            }
+
+            // The field sequence: part 12 unshifted, then from part 13 one eviction per part (43 rows each, Ready 28..1).
+            var field = Accept();
+            Handoff(field, Window(Rows(11)), Window(Rows(11)));
+            ProbeSnapshot lastShifted = null;
+            for (var part = 13; part <= 40; part++)
+            {
+                var evicted = part - 12;
+                var first = Shifted(Rows(part - 1), evicted);
+                var fresh = Shifted(Rows(part - 1), evicted);
+                Need(Handoff(field, first, fresh) == Slot(fresh, 30 - evicted) && HistoryRows(SelectHistory(fresh)).Count == 43 &&
+                    Logged(ShiftedFields(Recorded(first)), "shift", 1, "total_shift", evicted, "ready_row_before", 30 - evicted,
+                        "ready_row_after", 29 - evicted, "rows_after_ready", part + 1, "appended_rows", 1) &&
+                    Logged(ShiftedFields(Recorded(fresh)), "shift", 0, "total_shift", evicted, "ready_row_after", 29 - evicted,
+                        "appended_rows", 0), "RECEIVE_SELF_TEST_SHIFT_FIELD_SEQUENCE");
+                lastShifted = fresh;
+            }
+            // A re-anchored snapshot is never fresh admission evidence; the Ready boundary stays strict there.
+            try { Evaluate(field.Baseline, lastShifted); throw new InvalidOperationException("A shifted window was admitted."); }
+            catch (MonitorException ex) when (ex.ReasonCode == "RECEIVE_READY_BOUNDARY_CHANGED") { }
+            // Ready itself evicted: nothing anchors the request, and recycled ids alone are not trusted after a shift.
+            Lost(field, Shifted(Rows(40), 30), "IDENTITY_CHANGED");
+
+            // Bounded jumps of 3 and 8 rows with the one part just sent appended.
+            foreach (var evicted in new[] { 3, MaxEvictedRows })
+            {
+                var proof = Primed();
+                var first = Shifted(Rows(12), evicted);
+                var fresh = Shifted(Rows(12), evicted);
+                Need(Handoff(proof, first, fresh) == Slot(fresh, 30 - evicted) &&
+                    Logged(ShiftedFields(Recorded(first)), "shift", evicted, "total_shift", evicted, "ready_row_before", 29,
+                        "ready_row_after", 29 - evicted, "rows_after_ready", 14, "appended_rows", 1),
+                    "RECEIVE_SELF_TEST_SHIFT_BOUNDED_JUMP");
+            }
+
+            // An ignored "pwrsi" typed during the reply lands in the accepted command's old slot after two evictions: its
+            // recycled ids equal the accepted ones, yet only the re-anchored row is the accepted command.
+            List<string> WithUser(int replyParts) { var rows = Rows(replyParts); rows.Insert(32, "pwrsi"); return rows; }
+            var duplicate = Accept();
+            Handoff(duplicate, Window(WithUser(11)), Window(WithUser(11)));
+            var recycled = Shifted(WithUser(12), 2);
+            var recycledFresh = Shifted(WithUser(12), 2);
+            Need(Handoff(duplicate, recycled, recycledFresh) == Slot(recycledFresh, 28) &&
+                Slot(recycled, 30).PlainCommand == "pwrsi" &&
+                SameIdentity(duplicate.Final, duplicate.Candidate, recycled, Slot(recycled, 30)) &&
+                !SameCandidate(duplicate.Final, duplicate.Candidate, recycled, Slot(recycled, 30)),
+                "RECEIVE_SELF_TEST_SHIFT_RECYCLED_DUPLICATE");
+
+            // Refusals: each stops the send with RECEIVE_ACCEPTED_CANDIDATE_CHANGED and a content-free reason.
+            Lost(Primed(), Shifted(Rows(12), 1, s => RemoveRow(s, 29)), "COMMAND_MISSING");
+            Lost(Primed(), Shifted(Rows(12), 1, s =>
+            {
+                var selection = SelectHistory(s);
+                var rows = HistoryRows(selection);
+                var command = rows[29][0];
+                var commandRoot = RowRoot(selection, command);
+                command.Parent = RowRoot(selection, rows[28][0]).Node;
+                Rekey(command, "merged-command-text"); // A second Text in the Ready row keeps an id of its own.
+                s.Nodes.Remove(commandRoot);
+            }), "IDENTITY_CHANGED"); // Command Text merged under the Ready row root: Ready is no longer a whole row.
+            Lost(Primed(), Shifted(Rows(12), MaxEvictedRows + 1), "SHIFT_OUT_OF_RANGE");
+            var changedProof = Primed();
+            var changedBody = Shifted(Rows(12, commandText: "pwrsi "), 1);
+            Lost(changedProof, changedBody, "COMMAND_CHANGED");
+            Need(Logged(LostFields(changedProof, changedBody, "COMMAND_CHANGED"), "reanchor_result", "COMMAND_CHANGED",
+                "accepted_runtime_present", true, "accepted_runtime_row", 30, "accepted_name_equal", false, "exact_name_rows", 0,
+                "ready_at_bound_row", false, "ready_row_now", 28, "rows_after_ready", 14, "shift_candidate", 1),
+                "RECEIVE_SELF_TEST_SHIFT_LOST_FIELDS");
+            Lost(Primed(), Shifted(Rows(12), 1, s => Slot(s, 29).Enabled = false), "COMMAND_DISABLED");
+            Lost(Primed(), Shifted(Swap(Rows(12), 31 + 5, 31 + 6), 1), "ROWS_CHANGED");
+            Lost(Primed(), Shifted(Without(Rows(12), 31 + 7), 1), "ROWS_CHANGED");
+            Lost(Primed(), Shifted(Rows(12, ready: SupervisedSendTest.ReadyText("D345678")), 1), "IDENTITY_CHANGED");
+            Lost(Primed(), Shifted(Rows(13), 1), "ROWS_APPENDED_EXCESS");
+
+            // ---- Ready binding and fresh admission in a full 43-row window (the next round after a long reply).
+            const int slots = 43;
+            List<string> Previous() // 43 rows: 29 old rows and the tail of an earlier reply; no Ready of this round.
+            {
+                var rows = Old();
+                for (var i = 0; i < 14; i++) rows.Add("earlier reply part " + i);
+                return rows;
+            }
+            List<string> Plus(List<string> rows, params string[] more) { var copy = rows.ToList(); copy.AddRange(more); return copy; }
+            ProbeSnapshot Tail(List<string> logical, int keep = slots, Action<ProbeSnapshot> edit = null, bool commandVisible = true)
+            {
+                return Shifted(logical, Math.Max(0, logical.Count - keep), edit, commandVisible);
+            }
+            void Refused(Action action, params string[] reasons)
+            {
+                try { action(); }
+                catch (MonitorException ex) when (reasons.Contains(ex.ReasonCode)) { return; }
+                throw new InvalidOperationException("Unsafe shifted Ready binding was accepted.");
+            }
+            var preWindow = Window(Previous());
+            var pre = CreateBaseline(preWindow, marker, true);
+            // E1: Ready appended last while one (or up to MaxEvictedRows) top rows left the window.
+            var bindFull = BindReadyBoundary(pre, Tail(Plus(Previous(), readyText)));
+            Need(bindFull != null && bindFull.ReadyRow == slots - 1, "RECEIVE_SELF_TEST_READY_SHIFT_BIND");
+            var bindEight = BindReadyBoundary(pre, Tail(Plus(Previous(), readyText), slots - MaxEvictedRows + 1));
+            Need(bindEight != null && bindEight.ReadyRow == slots - MaxEvictedRows, "RECEIVE_SELF_TEST_READY_SHIFT_BIND_BOUND");
+            Refused(() => BindReadyBoundary(pre, Tail(Plus(Previous(), readyText), slots - MaxEvictedRows)), "RECEIVE_HISTORY_PRUNED");
+            Refused(() => BindReadyBoundary(pre, Tail(Plus(Previous(), readyText, "later message"))), "RECEIVE_READY_NOT_APPENDED");
+            var changedEarlier = Previous();
+            changedEarlier[35] = "changed earlier reply part";
+            Refused(() => BindReadyBoundary(pre, Tail(Plus(changedEarlier, readyText))), "RECEIVE_READY_NOT_APPENDED");
+            var olderReady = Previous();
+            olderReady[30] = readyText; // An identical Ready already in the window is never this round's boundary.
+            Refused(() => BindReadyBoundary(CreateBaseline(Window(olderReady), marker, true), Tail(Plus(olderReady, readyText))),
+                "RECEIVE_READY_ALREADY_PRESENT");
+            Refused(() => BindReadyBoundary(pre, Tail(Plus(Previous(), readyText, readyText))), "RECEIVE_READY_BOUNDARY_AMBIGUOUS");
+
+            // E2: the Observe poll step (RebaseReady, otherwise today's poll-to-poll prefix check, then Evaluate).
+            ProbeNode Poll(ref Baseline bound, ProbeSnapshot previous, ProbeSnapshot current)
+            {
+                var rebased = RebaseReady(bound, previous, current);
+                if (rebased != null) bound = rebased;
+                else ValidatePlainHistoryPrefix(previous, current, null, bound, acceptedRequest: false);
+                return Evaluate(bound, current);
+            }
+            var boundSnapshot = Tail(Plus(Previous(), readyText));
+            var admitting = BindReadyBoundary(pre, boundSnapshot);
+            var withCommand = Plus(Previous(), readyText, "pwrsi");
+            var firstPoll = Tail(withCommand);
+            var secondPoll = Tail(withCommand);
+            var firstHit = Poll(ref admitting, boundSnapshot, firstPoll);
+            var rebasedBound = admitting;
+            var secondHit = Poll(ref admitting, firstPoll, secondPoll);
+            Need(rebasedBound.ReadyRow == slots - 2 && ReferenceEquals(admitting, rebasedBound) &&
+                firstHit == Slot(firstPoll, slots - 1) && secondHit == Slot(secondPoll, slots - 1) &&
+                SameCandidate(firstPoll, firstHit, secondPoll, secondHit), "RECEIVE_SELF_TEST_READY_SHIFT_ADMISSION");
+            // Once accepted, the reply's own per-part re-anchor takes over (busy notice, then parts, one eviction each).
+            var admitted = new ObservationProof(new object(), new IntPtr(secondPoll.Process.WindowHandle),
+                new NativeMethods.WindowRectangle(), admitting, firstPoll, firstHit, secondPoll, secondHit);
+            var reply = Plus(withCommand, SupervisedSendTest.PowerSiBusyNotice);
+            for (var part = 1; part <= 6; part++)
+            {
+                var first = Tail(reply, slots, null, false);
+                var fresh = Tail(reply, slots, null, false);
+                Need(Handoff(admitted, first, fresh) == Slot(fresh, slots - 1 - part) && Recorded(first).Shift == part,
+                    "RECEIVE_SELF_TEST_READY_SHIFT_ADMITTED_REPLY");
+                reply.Add(parts[part]);
+            }
+            // Why a candidate pair never spans the move: the window grew to 44 rows with the command in slot 43, then a
+            // second "pwrsi" arrived and evicted a row, so slot 43 now shows the second message under the same recycled id.
+            var grown = BindReadyBoundary(pre, boundSnapshot);
+            var beforeMove = Tail(Plus(Previous(), readyText, "pwrsi"), slots + 1);
+            var pinned = Poll(ref grown, boundSnapshot, beforeMove);
+            var twice = Tail(Plus(Previous(), readyText, "pwrsi", "pwrsi"), slots + 1);
+            var moved = Poll(ref grown, beforeMove, twice);
+            Need(pinned == Slot(beforeMove, slots) && grown.ReadyRow == slots - 2 && moved == Slot(twice, slots - 1) &&
+                SameIdentity(beforeMove, pinned, twice, Slot(twice, slots)) && !SameCandidate(beforeMove, pinned, twice, moved),
+                "RECEIVE_SELF_TEST_READY_SHIFT_NO_CROSS_PAIR");
+            // Refusals keep today's RECEIVE_READY_BOUNDARY_CHANGED: Ready body differs, Ready ambiguous, an earlier row differs.
+            foreach (var invalid in new[] {
+                Tail(Plus(Previous(), SupervisedSendTest.ReadyText("D345678"), "pwrsi")),
+                Tail(Plus(Previous(), readyText, "pwrsi", readyText, "after the copy")),
+                Tail(Plus(changedEarlier, readyText, "pwrsi")) })
+            {
+                var waiting = BindReadyBoundary(pre, boundSnapshot);
+                Refused(() => Poll(ref waiting, boundSnapshot, invalid), "RECEIVE_READY_BOUNDARY_CHANGED");
+            }
+            // A row between the shifted Ready and the command is handled exactly as today without a shift: the first exact
+            // command row after Ready is the candidate, the other row is ignored traffic.
+            var between = Plus(Previous(), readyText, "hello", "pwrsi");
+            var plain = BindReadyBoundary(pre, Tail(Plus(Previous(), readyText), slots + 3));
+            var plainWindow = Tail(between, slots + 3);
+            var movedBound = BindReadyBoundary(pre, boundSnapshot);
+            var movedWindow = Tail(between);
+            var movedHit = Poll(ref movedBound, boundSnapshot, movedWindow);
+            Need(Evaluate(plain, plainWindow) == Slot(plainWindow, slots + 2) && movedBound.ReadyRow == slots - 3 &&
+                movedHit == Slot(movedWindow, slots - 1), "RECEIVE_SELF_TEST_READY_SHIFT_TODAY_RULE");
+
+            // ---- Watchdog yield re-entry (the wait's binding is carried across the yield; StatusSession keeps the same
+            // pre-Ready baseline object for a re-entered wait, and RebindWait continues from its last bound Ready row).
+            Baseline FreshWait()
+            {
+                var waitBaseline = CreateBaseline(Window(Previous()), marker, true);
+                var first = RebindWait(waitBaseline, Tail(Plus(Previous(), readyText)));
+                Need(first != null && first.ReadyRow == slots - 1, "RECEIVE_SELF_TEST_YIELD_SHIFT_FIRST_BIND");
+                return waitBaseline;
+            }
+            List<string> Chat(List<string> rows, int messages)
+            {
+                var copy = rows.ToList();
+                for (var i = 0; i < messages; i++) copy.Add("chat while checking " + i);
+                return copy;
+            }
+            foreach (var evicted in new[] { 1, MaxEvictedRows })
+            {
+                var waitBaseline = FreshWait();
+                var during = Chat(Plus(Previous(), readyText), evicted); // Each ignored message evicted one top row.
+                var reentry = RebindWait(waitBaseline, Tail(during));
+                Need(reentry != null && reentry.ReadyRow == slots - 1 - evicted, "RECEIVE_SELF_TEST_YIELD_SHIFT_REENTRY");
+                // The command that follows (one more eviction) is admitted as today: two observations, first command row.
+                var command = Plus(during, "pwrsi");
+                var p1 = Tail(command);
+                var p2 = Tail(command);
+                var waiting = reentry;
+                var c1 = Poll(ref waiting, reentry.Snapshot, p1);
+                var c2 = Poll(ref waiting, p1, p2);
+                Need(c1 == Slot(p1, slots - 1) && c2 == Slot(p2, slots - 1) && SameCandidate(p1, c1, p2, c2) &&
+                    waiting.ReadyRow == slots - 2 - evicted, "RECEIVE_SELF_TEST_YIELD_SHIFT_COMMAND");
+            }
+            // Re-entry with rows after Ready and no further eviction keeps the carried row (today's re-binding alone fails).
+            var grownWait = FreshWait();
+            var grownWindow = Tail(Chat(Plus(Previous(), readyText), 1), slots + 1);
+            Refused(() => BindReadyBoundary(grownWait, grownWindow), "RECEIVE_READY_NOT_APPENDED");
+            var grownReentry = RebindWait(grownWait, grownWindow);
+            Need(grownReentry != null && grownReentry.ReadyRow == slots - 1, "RECEIVE_SELF_TEST_YIELD_SHIFT_SAME_ROW");
+            // Refusals keep today's re-binding and its reason: 9 rows in one step, an earlier row changed, a second Ready.
+            Refused(() => RebindWait(FreshWait(), Tail(Chat(Plus(Previous(), readyText), MaxEvictedRows + 1))),
+                "RECEIVE_READY_NOT_APPENDED");
+            Refused(() => RebindWait(FreshWait(), Tail(Chat(Plus(changedEarlier, readyText), 1))), "RECEIVE_READY_NOT_APPENDED");
+            Refused(() => RebindWait(FreshWait(), Tail(Plus(Chat(Plus(Previous(), readyText), 1), readyText))),
+                "RECEIVE_READY_BOUNDARY_AMBIGUOUS");
+
+            // Yield, one eviction before the notice, a two-part watchdog notice (each part evicts a row), then SendReady.
+            var noticeWait = FreshWait();
+            var beforeNotice = Chat(Plus(Previous(), readyText), 1);
+            var notice1 = "WATCHDOG D456789 | 완료 알림 | PART 001/002";
+            var notice2 = "WATCHDOG D456789 | 완료 알림 | PART 002/002";
+            StatusSession.RequireNoPendingCommand(noticeWait, Tail(beforeNotice)); // Before: RECEIVE_READY_NOT_APPENDED.
+            StatusSession.RequireNoPendingCommand(noticeWait, Tail(Plus(beforeNotice, notice1)));
+            Refused(() => StatusSession.RequireNoPendingCommand(noticeWait, Tail(Plus(beforeNotice, notice1, "pwrsi"))),
+                "WATCHDOG_NOTICE_COMMAND_PENDING"); // A command that arrived first is still handled first.
+            // SendReady's pre-Ready baseline is the Ready send's own current capture; the new Ready lands last, one row evicted.
+            var afterNotices = Plus(beforeNotice, notice1, notice2);
+            var nextWait = CreateBaseline(Tail(afterNotices), "M345678", true);
+            var nextBound = RebindWait(nextWait, Tail(Plus(afterNotices, SupervisedSendTest.ReadyText("D345678"))));
+            Need(nextBound != null && nextBound.ReadyRow == slots - 1, "RECEIVE_SELF_TEST_YIELD_SHIFT_NOTICE_READY");
+        }
+
+        // Test-only: give each history row (root and Texts) the runtime id found at the same index of an unshifted
+        // reference window, as recycled list slots do. Name hash and length stay the same.
+        private static void Rekey(ProbeSnapshot snapshot, ProbeSnapshot reference)
+        {
+            var selection = SelectHistory(snapshot);
+            var rows = HistoryRows(selection);
+            var expected = SelectHistory(reference);
+            var slots = HistoryRows(expected);
+            Need(rows.Count == slots.Count, "RECEIVE_SELF_TEST_REKEY_SHAPE");
+            for (var i = 0; i < rows.Count; i++)
+            {
+                Rekey(RowRoot(selection, rows[i][0]), RowRoot(expected, slots[i][0]).Identity.RuntimeId);
+                for (var j = 0; j < Math.Min(rows[i].Length, slots[i].Length); j++) Rekey(rows[i][j], slots[i][j].Identity.RuntimeId);
+            }
+        }
+
+        private static void Rekey(ProbeNode node, string runtime)
+        {
+            var id = node.Identity;
+            node.Identity = new ElementIdentity(runtime, id.ProcessId, id.AutomationId, id.ControlType, id.ClassName,
+                id.FrameworkId, id.Patterns, id.NameLength, id.NameHash, id.SafeName);
         }
 
         private static void RunLongHistorySelfTest()

@@ -23,17 +23,76 @@ namespace RemoteMonitorMaster
         internal sealed class Outcome
         {
             internal readonly string Message;
+            // The last send outcome of this round. After an exception it may belong to an earlier clean part.
             internal readonly SupervisedSendTest.Outcome Send;
             private readonly bool cleanCompletion;
             internal bool CleanCompletion { get { return cleanCompletion; } }
             // The idle wait was handed back to the session before any request was observed: not a completion, not an
             // abort. Only an outcome without a send can be yielded.
             internal bool Yielded { get; }
+            // The reason this round ended (receive, guard or send code); null only when nothing reported one.
+            internal string Reason { get; }
+            // Reply parts recorded clean in order, parts prepared, and the 1-based part that stopped the sequence (0 when
+            // the round did not stop inside the reply-part loop).
+            internal int Confirmed { get; }
+            internal int Prepared { get; }
+            internal int FailedPart { get; }
+            // Unknown counts as attempted; meaningful only when FailedPart > 0.
+            internal bool FailedPartInputAttempted { get; }
+            // Every earlier part was sent cleanly and the failing part never moved, wrote or clicked (IsCleanPrefixUntouched).
+            // The session still cross-checks the consent before it resumes on this.
+            internal bool CleanPrefixUntouchedPart { get; }
             internal Outcome(string message, SupervisedSendTest.Outcome send = null, bool? clean = null, bool yielded = false)
+                : this(message, send, clean, yielded, null, 0, 0, 0, true, false) { }
+            private Outcome(string message, SupervisedSendTest.Outcome send, bool? clean, bool yielded, string reason,
+                int confirmed, int prepared, int failedPart, bool failedPartInputAttempted, bool cleanPrefixUntouchedPart)
             {
                 Message = message; Send = send; cleanCompletion = clean ?? (send != null && send.CleanCompletion);
                 Yielded = yielded && send == null && !cleanCompletion;
+                Reason = reason ?? send?.Reason;
+                Confirmed = Math.Max(0, confirmed);
+                Prepared = Math.Max(0, prepared);
+                FailedPart = Math.Max(0, failedPart);
+                FailedPartInputAttempted = failedPartInputAttempted;
+                CleanPrefixUntouchedPart = cleanPrefixUntouchedPart && !cleanCompletion && !Yielded && !failedPartInputAttempted &&
+                    FailedPart >= 2 && Confirmed == FailedPart - 1 && Prepared >= FailedPart;
             }
+
+            // A round that ended after the receive stage. failedPartState is the failing part's consent input state
+            // (Consent.PartInputState, -1 when unknown); failedPartSend is that part's own send outcome, null when the
+            // part was never handed to the sender.
+            internal static Outcome Ended(string message, SupervisedSendTest.Outcome send, bool clean, string reason,
+                int confirmed, int prepared, int failedPart, int failedPartState = -1, SupervisedSendTest.Outcome failedPartSend = null)
+            {
+                return new Outcome(message, send, clean, false, reason, confirmed, prepared, failedPart,
+                    !PartUntouched(failedPart, failedPartState, failedPartSend),
+                    IsCleanPrefixUntouched(failedPart, confirmed, prepared, failedPartState, failedPartSend));
+            }
+        }
+
+        // The failing part never moved the cursor, wrote or clicked. A part never handed to the sender must still be
+        // unconsumed (state 0); a part the sender rejected may be consumed (state 1) but must report no input attempt.
+        private static bool PartUntouched(int failedPart, int failedPartState, SupervisedSendTest.Outcome failedPartSend)
+        {
+            if (failedPart < 1) return false;
+            return failedPartSend == null ? failedPartState == 0 :
+                !failedPartSend.CleanCompletion && !failedPartSend.InputAttempted && failedPartState >= 0 && failedPartState <= 1;
+        }
+
+        // Pure clean-prefix rule: parts 1..failedPart-1 were all recorded clean (so at least one exists), the failing
+        // part and everything after it are abandoned, and the failing part is untouched. Anything else keeps the stop rule.
+        internal static bool IsCleanPrefixUntouched(int failedPart, int confirmed, int prepared, int failedPartState,
+            SupervisedSendTest.Outcome failedPartSend)
+        {
+            return failedPart >= 2 && confirmed == failedPart - 1 && prepared >= failedPart &&
+                PartUntouched(failedPart, failedPartState, failedPartSend);
+        }
+
+        // Input state of the failing part for the clean-prefix rule; -1 (unknown) when it cannot be read.
+        private static int FailedPartState(SupervisedSendTest.Consent consent, int failedPart)
+        {
+            try { return consent != null && consent.IsPlainCommands && failedPart > 0 ? consent.PartInputState(failedPart - 1) : -1; }
+            catch (MonitorException) { return -1; }
         }
 
         public static string Run(IntPtr window, AuditLog log, string incomingMarker, SupervisedSendTest.Consent consent,
@@ -63,6 +122,7 @@ namespace RemoteMonitorMaster
             var confirmedReplyCount = 0;
             var failedPart = 0;
             SupervisedSendTest.Outcome sent = null;
+            SupervisedSendTest.Outcome failedPartSent = null; // The failing part's own outcome once its send returned.
             try
             {
                 Need(log != null && stop != null && progress != null, "ROUNDTRIP_REQUEST_INVALID");
@@ -94,7 +154,7 @@ namespace RemoteMonitorMaster
                 {
                     Result(log, received.Status, received.Reason, false, false, preparedReplyCount,
                         confirmedReplyCount, failedPart);
-                    return new Outcome(received.Message);
+                    return Outcome.Ended(received.Message, null, false, received.Reason, 0, 0, 0);
                 }
                 Need(received.Status == "CANDIDATE_OBSERVED" && received.Reason == "NONE", "ROUNDTRIP_OBSERVATION_INVALID");
                 Need(ReferenceEquals(received.Proof.Owner, owner) && received.Proof.Baseline != null &&
@@ -153,7 +213,8 @@ namespace RemoteMonitorMaster
                         SupervisedSendTest.PowerSiBusyNotice : SupervisedSendTest.StatusBusyNotice);
                     sent = SendPrepared(notice.NoticeText, notice, 0, 0);
                     if (!sent.CleanCompletion)
-                        return new Outcome("Progress notice was not confirmed. No Slave query was started. " + sent.Message, sent, false);
+                        return Outcome.Ended("Progress notice was not confirmed. No Slave query was started. " + sent.Message, sent, false,
+                            sent.Reason, 0, 0, 0);
                     log.Write("INFO", "MASTER_NOTICE_SENT", AuditLog.Field("stage", "BUSY"), AuditLog.Field("delivery_verified", false));
                 }
                 phase = "PREPARE_REPLY";
@@ -192,17 +253,22 @@ namespace RemoteMonitorMaster
                     progress("ROUNDTRIP_SENDING:" + partNumber + "/" + replies.Length);
                     Alive();
                     failedPart = partNumber;
+                    failedPartSent = null;
                     sent = SendPrepared(replies[index], partConsent, partNumber, replies.Length);
+                    failedPartSent = sent;
                     sendMessages.Add("PART " + partNumber + "/" + replies.Length + Environment.NewLine + sent.Message);
                     if (!sent.CleanCompletion)
                     {
                         Result(log, "SEND_STAGE_FINISHED", "PART_UNCERTAIN_ABORTED", reserved, true,
                             preparedReplyCount, confirmedReplyCount, failedPart);
-                        return new Outcome("ROUNDTRIP_SEND_STAGE_FINISHED - Reply sequence stopped after an uncertain part; delivery is NOT verified." +
-                            Environment.NewLine + string.Join(Environment.NewLine, sendMessages), sent, false);
+                        // A part the sender rejected before any input may still be the untouched tail of a clean prefix.
+                        return Outcome.Ended("ROUNDTRIP_SEND_STAGE_FINISHED - Reply sequence stopped after an uncertain part; delivery is NOT verified." +
+                            Environment.NewLine + string.Join(Environment.NewLine, sendMessages), sent, false, sent.Reason,
+                            confirmedReplyCount, preparedReplyCount, failedPart, FailedPartState(consent, failedPart), sent);
                     }
                     confirmedReplyCount++;
                     failedPart = 0;
+                    failedPartSent = null;
                     if (consent.IsPcStatus) consent.RecordPreparedPartOutcome(index, sent);
                 }
                 var historySaved = !consent.IsPcStatus || consent.CommitPreparedOutput();
@@ -210,9 +276,10 @@ namespace RemoteMonitorMaster
                 // RunBound already supplies its action/result details. Never parse that text into a success or delivery claim.
                 Result(log, "SEND_STAGE_FINISHED", "SEE_SUPERVISED_SEND_RESULT", reserved, true,
                     preparedReplyCount, confirmedReplyCount, failedPart);
-                return new Outcome("ROUNDTRIP_SEND_STAGE_FINISHED - The approved reply stage has ended; delivery is NOT verified." +
+                return Outcome.Ended("ROUNDTRIP_SEND_STAGE_FINISHED - The approved reply stage has ended; delivery is NOT verified." +
                     (historySaved ? string.Empty : " Output history could not be saved; the next request may repeat content.") +
-                    Environment.NewLine + string.Join(Environment.NewLine, sendMessages), sent, true);
+                    Environment.NewLine + string.Join(Environment.NewLine, sendMessages), sent, true, sent?.Reason,
+                    confirmedReplyCount, preparedReplyCount, 0);
             }
             catch (Exception ex)
             {
@@ -229,9 +296,12 @@ namespace RemoteMonitorMaster
                 catch { }
                 // Carry the last send outcome so the caller can tell a pre-input rejection from an uncertain send.
                 // A null Send after the send stage was entered stays unknown and must be treated as attempted.
-                return new Outcome((sendStageEntered ? "UNKNOWN" : "REJECTED") + " - " + reason +
+                // Send may be an earlier clean part: Reason is this failure, and the clean-prefix flag needs the failing
+                // part itself unconsumed (or, if its send returned, that outcome showing no input).
+                return Outcome.Ended((sendStageEntered ? "UNKNOWN" : "REJECTED") + " - " + reason +
                     ". This one-run confirmation is consumed. Do not retry; inspect the result and collect the log." +
-                    (sent == null ? "" : Environment.NewLine + sent.Message), sent, false);
+                    (sent == null ? "" : Environment.NewLine + sent.Message), sent, false, reason, confirmedReplyCount,
+                    preparedReplyCount, failedPart, FailedPartState(consent, failedPart), failedPartSent);
             }
             finally
             {
@@ -386,6 +456,7 @@ namespace RemoteMonitorMaster
                 new Outcome("yielded", null, false, true).Yielded && !new Outcome("yielded", null, false, true).CleanCompletion &&
                 !new Outcome("sent", rejectedSend, false, true).Yielded && !new Outcome("clean", null, true, true).Yielded,
                 "ROUNDTRIP_SELF_TEST_YIELD_OUTCOME");
+            RunCleanPrefixSelfTest();
             // Watchdog commands share help's reply path: never a BUSY notice or PC status sample; pwrsi/total status still do.
             Need(new[] { "watchdog on", "watchdog off", "watchdog on 4321", "watchdog off 42", "help watchdog", "help", "help pwrsi" }
                     .All(command => !SamplesPcStatus(true, true, command)) &&
@@ -469,6 +540,43 @@ namespace RemoteMonitorMaster
                 try { if (File.Exists(cancelPath)) File.Delete(cancelPath); } catch { }
                 try { if (Directory.Exists(blockedPath)) Directory.Delete(blockedPath); } catch { }
             }
+        }
+
+        // Pure clean-prefix table (field case: part 13 of 40 after 12 clean parts). Only an untouched failing part right
+        // after an all-clean prefix qualifies; the flag never survives a clean, yielded or attempted outcome.
+        private static void RunCleanPrefixSelfTest()
+        {
+            var clean = new SupervisedSendTest.Outcome("ACTION_RETURNED", "NONE", "test", true);
+            var preInput = new SupervisedSendTest.Outcome("REJECTED", "ROUNDTRIP_HANDOFF_CANDIDATE_CHANGED", "test", false, false);
+            var attempted = new SupervisedSendTest.Outcome("UNKNOWN", "SEND_TIME_LIMIT", "test", false);
+            var unknown = new SupervisedSendTest.Outcome("REJECTED", "SEND_CANCELLED", "test", false);
+            Need(IsCleanPrefixUntouched(13, 12, 40, 0, null) && IsCleanPrefixUntouched(13, 12, 40, 1, preInput) &&
+                IsCleanPrefixUntouched(13, 12, 40, 0, preInput) && IsCleanPrefixUntouched(2, 1, 2, 0, null) &&
+                IsCleanPrefixUntouched(40, 39, 40, 0, null), "ROUNDTRIP_SELF_TEST_CLEAN_PREFIX_ACCEPTS");
+            Need(!IsCleanPrefixUntouched(13, 12, 40, 3, null) && !IsCleanPrefixUntouched(13, 12, 40, 3, preInput) &&
+                !IsCleanPrefixUntouched(13, 12, 40, 2, preInput) && !IsCleanPrefixUntouched(13, 12, 40, 4, null) &&
+                !IsCleanPrefixUntouched(13, 12, 40, 1, null) && !IsCleanPrefixUntouched(13, 12, 40, -1, null) &&
+                !IsCleanPrefixUntouched(13, 12, 40, 1, attempted) && !IsCleanPrefixUntouched(13, 12, 40, 0, unknown) &&
+                !IsCleanPrefixUntouched(13, 12, 40, 0, clean) && !IsCleanPrefixUntouched(13, 11, 40, 0, null) &&
+                !IsCleanPrefixUntouched(13, 13, 40, 0, null) && !IsCleanPrefixUntouched(13, 12, 12, 0, null) &&
+                !IsCleanPrefixUntouched(1, 0, 40, 0, null) && !IsCleanPrefixUntouched(0, 0, 40, 0, null) &&
+                !IsCleanPrefixUntouched(0, 12, 40, 0, null), "ROUNDTRIP_SELF_TEST_CLEAN_PREFIX_REJECTS");
+            // The catch shape of the field log: Send is part 12's clean outcome, Reason is the real failure.
+            const string reason = "ROUNDTRIP_REOBSERVATION_FAILED_RECEIVE_ACCEPTED_CANDIDATE_CHANGED";
+            var field = Outcome.Ended("UNKNOWN", clean, false, reason, 12, 40, 13, 0, null);
+            Need(field.CleanPrefixUntouchedPart && !field.FailedPartInputAttempted && !field.CleanCompletion && !field.Yielded &&
+                field.Reason == reason && field.Send.Reason == "NONE" && field.Confirmed == 12 && field.Prepared == 40 &&
+                field.FailedPart == 13, "ROUNDTRIP_SELF_TEST_CLEAN_PREFIX_FIELD_CASE");
+            var rejected = Outcome.Ended("STOPPED", preInput, false, preInput.Reason, 12, 40, 13, 1, preInput);
+            Need(rejected.CleanPrefixUntouchedPart && rejected.Reason == preInput.Reason, "ROUNDTRIP_SELF_TEST_CLEAN_PREFIX_REJECTED_PART");
+            var touched = Outcome.Ended("STOPPED", attempted, false, attempted.Reason, 12, 40, 13, 3, attempted);
+            Need(!touched.CleanPrefixUntouchedPart && touched.FailedPartInputAttempted, "ROUNDTRIP_SELF_TEST_CLEAN_PREFIX_TOUCHED");
+            Need(!Outcome.Ended("CLEAN", clean, true, "NONE", 40, 40, 0).CleanPrefixUntouchedPart &&
+                !Outcome.Ended("NOTICE", preInput, false, preInput.Reason, 0, 0, 0).CleanPrefixUntouchedPart &&
+                !Outcome.Ended("FIRST", preInput, false, preInput.Reason, 0, 40, 1, 1, preInput).CleanPrefixUntouchedPart &&
+                !new Outcome("legacy", clean, false).CleanPrefixUntouchedPart && new Outcome("legacy", clean, false).Reason == "NONE" &&
+                new Outcome("legacy").Reason == null && new Outcome("legacy").FailedPartInputAttempted,
+                "ROUNDTRIP_SELF_TEST_CLEAN_PREFIX_OTHER_OUTCOMES");
         }
 
         private static void RunOperationalHandoffSelfTest(string directory)

@@ -24,6 +24,24 @@ namespace RemoteMonitorMaster
             return ReadyNotice + " [" + marker + "]";
         }
 
+        // Sent once after a clean-prefix abort (StatusSession): parts 1..confirmed of prepared were sent cleanly and the
+        // rest are abandoned, never resent. No code and no "Master Ready" token, so it is neither a command nor a Ready.
+        // Neutral wording: the abort reason is not always a receive failure (idle gate, guard or proof checks also stop it).
+        internal static string ReportAbortNotice(int confirmed, int prepared)
+        {
+            Need(IsAbortNoticeCount(confirmed, prepared), "SEND_NOTICE_INVALID");
+            return "보고 전송을 중단했습니다 (" +
+                confirmed.ToString(System.Globalization.CultureInfo.InvariantCulture) + "/" +
+                prepared.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                " 전송됨). 남은 부분은 보내지 않으며 새 Ready 이후의 명령만 처리합니다.";
+        }
+
+        // A clean prefix needs at least one confirmed part and at least one abandoned part.
+        private static bool IsAbortNoticeCount(int confirmed, int prepared)
+        {
+            return confirmed > 0 && confirmed < prepared && prepared <= ReadOnlyCommands.MaxReportParts;
+        }
+
         internal sealed class Outcome
         {
             internal readonly string Status, Reason, Message;
@@ -56,6 +74,9 @@ namespace RemoteMonitorMaster
             // Watchdog wiring: the session attaches its WatchdogState so a watchdog command reply can arm/disarm it,
             // and a watchdog notice consent authorizes exactly one prepared WATCHDOG text (one use, like Ready).
             private bool isWatchdogNotice;
+            // An abort notice authorizes exactly ReportAbortNotice(abortConfirmed, abortPrepared), once.
+            private bool isAbortNotice;
+            private int abortConfirmed, abortPrepared;
             internal WatchdogState Watchdog { get; private set; }
             internal void AttachWatchdog(WatchdogState state)
             {
@@ -120,6 +141,14 @@ namespace RemoteMonitorMaster
             {
                 Need(IsValidMarker(marker) && IsWatchdogNoticeText(marker, text), "SEND_NOTICE_INVALID");
                 return new Consent(marker, true) { isNotice = true, isWatchdogNotice = true, preparedReply = text };
+            }
+
+            // One-use consent for the abort notice of a clean-prefix abort; mirrors ForWatchdogNotice.
+            internal static Consent ForAbortNotice(string marker, int confirmed, int prepared)
+            {
+                Need(IsValidMarker(marker) && IsAbortNoticeCount(confirmed, prepared), "SEND_NOTICE_INVALID");
+                return new Consent(marker, true) { isNotice = true, isAbortNotice = true, abortConfirmed = confirmed,
+                    abortPrepared = prepared, preparedReply = ReportAbortNotice(confirmed, prepared) };
             }
 
             // The marker must be the notice header's own marker ("WATCHDOG <marker> | ..."), not merely appear in the body,
@@ -220,10 +249,29 @@ namespace RemoteMonitorMaster
                 return index == 0 ? this : Volatile.Read(ref preparedParts)[index - 1];
             }
 
+            // Input progress of one prepared part: 0 untouched, 1 consumed, 2 cursor move, 3 write, 4 click committed.
+            // Cancellation (bit 8) is not input and is masked off, so a mismatched consume reads 0 (nothing was typed).
+            internal int PartInputState(int index) { return Volatile.Read(ref GetPreparedPart(index).state) & 7; }
+
+            // Parts recorded clean by RecordPreparedPartOutcome, in order.
+            internal int ConfirmedPartCount { get { return Volatile.Read(ref confirmedReplyParts); } }
+
+            // Input state of the BUSY progress notice (same encoding as PartInputState), or -1 when none was created.
+            internal int ProgressNoticeInputState
+            {
+                get
+                {
+                    var notice = Volatile.Read(ref progressNotice);
+                    return notice == null ? -1 : Volatile.Read(ref notice.state) & 7;
+                }
+            }
+
             internal bool IsAuthorizedReply(string text)
             {
                 return text != null && text == Volatile.Read(ref preparedReply) &&
-                    (isNotice ? (isWatchdogNotice ? IsWatchdogNoticeText(Marker, text) : text == ReadyText(Marker) || text == PowerSiBusyNotice || text == StatusBusyNotice) :
+                    (isNotice ? (isWatchdogNotice ? IsWatchdogNoticeText(Marker, text) :
+                        isAbortNotice ? IsAbortNoticeCount(abortConfirmed, abortPrepared) && text == ReportAbortNotice(abortConfirmed, abortPrepared) :
+                        text == ReadyText(Marker) || text == PowerSiBusyNotice || text == StatusBusyNotice) :
                     IsPlainCommands ? ReadOnlyCommands.IsReplyPart(text, Volatile.Read(ref command), Marker, replyPartIndex, replyPartCount) :
                         IsSlaveStatus ? PcStatusReport.IsSlaveReply(text, Marker, nextMarker) :
                         IsPcStatus ? PcStatusReport.IsReply(text, Marker, nextMarker) : IsValidMarker(text));
@@ -800,6 +848,7 @@ namespace RemoteMonitorMaster
                 ReadyText("D234567").Length <= 128 && !ReadOnlyCommands.IsCommand(ReadyNotice) &&
                 !ReadOnlyCommands.IsCommand(ReadyText("D234567")), "SEND_SELF_TEST_READY_TEXT");
             RunWatchdogNoticeSelfTest();
+            RunAbortNoticeSelfTest(); // Pure; before the first Win32-backed status capture below.
             const string marker = "D234567";
             var observedPointer = new NativeMethods.ScreenPoint { X = -10, Y = 20 };
             Need(PointerFailure(true, observedPointer, new Point(-10, 20)) == null &&
@@ -1003,6 +1052,61 @@ namespace RemoteMonitorMaster
             try { Consent.ForWatchdogNotice(marker, warning[0]).AttachWatchdog(state); throw new InvalidOperationException("Notice took a watchdog."); }
             catch (MonitorException) { }
             try { Consent.ForNotice(marker, warning[0]); throw new InvalidOperationException("Watchdog text became a fixed notice."); }
+            catch (MonitorException) { }
+        }
+
+        // Pure: the clean-prefix abort notice is one fixed, count-bound text with an exact one-use consent.
+        private static void RunAbortNoticeSelfTest()
+        {
+            const string marker = "D234567";
+            var text = ReportAbortNotice(12, 40);
+            Need(text == "보고 전송을 중단했습니다 (12/40 전송됨). 남은 부분은 보내지 않으며 새 Ready 이후의 명령만 처리합니다." &&
+                text.Length <= PcStatusReport.MaxPhoneLength && !ReadOnlyCommands.IsCommand(text) &&
+                !ReadOnlyCommands.IsCommand(text.Trim()) && text != ReadyText(marker) && text != ReadyNotice &&
+                !text.StartsWith("Master Ready", StringComparison.Ordinal) && !text.Contains(marker) && !WatchdogText.IsNotice(text) &&
+                ReportAbortNotice(1, 2) != text, "ABORT_NOTICE_SELF_TEST_TEXT");
+            Need(ReportAbortNotice(ReadOnlyCommands.MaxReportParts - 1, ReadOnlyCommands.MaxReportParts).Length <=
+                PcStatusReport.MaxPhoneLength, "ABORT_NOTICE_SELF_TEST_LENGTH");
+            var notice = Consent.ForAbortNotice(marker, 12, 40);
+            Need(notice.IsOperational && notice.NoticeText == text && notice.IsAuthorizedReply(text) &&
+                !notice.IsAuthorizedReply(text + " ") && !notice.IsAuthorizedReply(text.TrimEnd('.')) &&
+                !notice.IsAuthorizedReply(ReportAbortNotice(11, 40)) && !notice.IsAuthorizedReply(ReportAbortNotice(12, 41)) &&
+                !notice.IsAuthorizedReply(ReadyText(marker)) && !notice.IsAuthorizedReply(PowerSiBusyNotice) &&
+                !notice.IsAuthorizedReply(null), "ABORT_NOTICE_SELF_TEST_EXACT");
+            Need(!notice.TryConsume(ReportAbortNotice(11, 40)) && notice.Cancelled && !notice.TryConsume(text) &&
+                !notice.TryCommitMove(), "ABORT_NOTICE_SELF_TEST_MISMATCH_CONSUMES");
+            var once = Consent.ForAbortNotice(marker, 12, 40);
+            Need(once.TryConsume(text) && !once.TryConsume(text) && once.TryCommitMove() && once.TryCommitWrite() &&
+                once.TryCommit() && !once.TryCommit() && once.Attempted, "ABORT_NOTICE_SELF_TEST_ONCE");
+            var cancelled = Consent.ForAbortNotice(marker, 12, 40);
+            cancelled.Cancel();
+            Need(!cancelled.TryConsume(text) && !cancelled.TryCommitMove(), "ABORT_NOTICE_SELF_TEST_CANCELLED");
+            // Fixed notices and watchdog notices never authorize the abort text, and the abort consent takes no watchdog.
+            Need(!Consent.ForNotice(marker, ReadyNotice).IsAuthorizedReply(text) &&
+                !Consent.ForNotice(marker, PowerSiBusyNotice).IsAuthorizedReply(text), "ABORT_NOTICE_SELF_TEST_NOT_FIXED_NOTICE");
+            foreach (var counts in new[] { new[] { 0, 40 }, new[] { -1, 40 }, new[] { 40, 40 }, new[] { 41, 40 }, new[] { 1, 1 },
+                new[] { 0, 0 }, new[] { 1, ReadOnlyCommands.MaxReportParts + 1 } })
+            {
+                try { Consent.ForAbortNotice(marker, counts[0], counts[1]); }
+                catch (MonitorException)
+                {
+                    try { ReportAbortNotice(counts[0], counts[1]); }
+                    catch (MonitorException) { continue; }
+                }
+                throw new InvalidOperationException("An abort notice without a clean prefix and an abandoned part was authorized.");
+            }
+            foreach (var invalidMarker in new[] { null, "M234567", "D123456", "d234567" })
+            {
+                try { Consent.ForAbortNotice(invalidMarker, 12, 40); }
+                catch (MonitorException) { continue; }
+                throw new InvalidOperationException("An abort notice with an invalid consent marker was authorized.");
+            }
+            try { Consent.ForNotice(marker, text); throw new InvalidOperationException("Abort text became a fixed notice."); }
+            catch (MonitorException) { }
+            try { Consent.ForWatchdogNotice(marker, text); throw new InvalidOperationException("Abort text became a watchdog notice."); }
+            catch (MonitorException) { }
+            try { Consent.ForAbortNotice(marker, 12, 40).AttachWatchdog(new WatchdogState(TimeSpan.FromMinutes(30)));
+                throw new InvalidOperationException("Abort notice took a watchdog."); }
             catch (MonitorException) { }
         }
 

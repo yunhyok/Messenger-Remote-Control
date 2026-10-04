@@ -20,6 +20,15 @@ namespace RemoteMonitorMaster
         private static readonly string[] Commands = { "help", "help help", "help total status", "help pwrsi", "total status", "pwrsi" };
         private static readonly string[] Hashes = Commands.Select(TokenStore.Hash).ToArray();
         internal const int MaxReportParts = 9999999;
+        // Rendering only: each Output text (whole FIRST/REPLACED text or APPENDED delta) shows at most its last 3,000
+        // characters after one omission line. The output history still commits the full text's length and SHA-256.
+        internal const int MaxRenderedOutputCharacters = 3000;
+        private const int RenderedOutputLineSearch = 200; // A cut moves to the first line start within this many characters.
+        private const string PowerDcModeCode = "TARGET_MODE_POWERDC";
+        private const string UnknownAdvice = "수집 미확인; Slave의 대상 창과 로컬 설정을 확인하세요";
+        // PWRSI_TARGET verdict values. FINISH_PENDING: AFS Finished without its Total Sampling Points line yet.
+        private const string VerdictCompleted = "COMPLETED", VerdictInProgress = "IN_PROGRESS", VerdictFinishPending = "FINISH_PENDING",
+            VerdictNoMarker = "NO_MARKER", VerdictNotJudged = "NOT_JUDGED";
 
         // The fixed phrases above plus the exact watchdog grammar (watchdog on|off [PID], help watchdog); nothing else.
         internal static bool IsCommand(string command)
@@ -205,6 +214,29 @@ namespace RemoteMonitorMaster
                 AuditLog.Field("delivery_verified", false));
         }
 
+        // One PWRSI_TARGET record per target after the pwrsi reply is prepared: validated codes, counts and kinds only,
+        // never process names, Output text or the nonce. No command-log scope means no record.
+        private static void LogPowerSiTargets(IEnumerable<AuditLog.LogField[]> records)
+        {
+            var log = commandLog;
+            if (log == null) return;
+            foreach (var fields in records) log.Write("INFO", "PWRSI_TARGET", fields);
+        }
+
+        private static AuditLog.LogField[] PowerSiTargetFields(PowerSiTargetReport target, OutputPlan primary, string verdict)
+        {
+            return new[]
+            {
+                AuditLog.Field("pid", target.Pid), AuditLog.Field("state", target.State), AuditLog.Field("source", target.Source),
+                AuditLog.Field("target_code", target.Code), AuditLog.Field("buffer_code", target.BufferCode ?? string.Empty),
+                AuditLog.Field("vision_code", target.VisionCode ?? string.Empty),
+                AuditLog.Field("output_length", (target.OutputText ?? string.Empty).Length),
+                AuditLog.Field("delta", primary == null ? "NONE" : primary.Kind),
+                AuditLog.Field("rendered_length", primary == null ? 0 : primary.RenderedLength),
+                AuditLog.Field("truncated", primary != null && primary.Truncated), AuditLog.Field("verdict", verdict)
+            };
+        }
+
         private static bool IsExpectedQueryFailure(Exception exception)
         {
             return exception is TimeoutException || exception is InvalidDataException || exception is IOException ||
@@ -221,7 +253,7 @@ namespace RemoteMonitorMaster
                 case "help help": body = "help는 허용 명령을 표시합니다. help 다음에 명령을 쓰면 해당 설명을 표시합니다."; break;
                 case "help total status": body = "total status는 Slave 시각, 가동 시간, RAM, 버전과 최대 8개 프로세스의 이름·PID·CPU·RAM·경과 시간을 표시합니다. CPU는 시뮬레이션 진행률이 아닙니다."; break;
                 case "help watchdog": return "HELP " + nonce + "\r\n" + WatchdogText.HelpBody() + "\r\n" + WatchdogText.HelpUsage();
-                case "help pwrsi": body = "pwrsi는 모든 PowerSI를 한 번 수집합니다. 처음에는 수집된 Output 전체, 이후에는 마지막 전송 이후 추가분을 보냅니다. 변동이 없으면 알립니다. 조회·답장 준비는 최대 120초이며, 긴 답장은 여러 메시지로 나뉩니다. 다음 Master Ready까지 기다리세요. 답장 머리글의 PWRSI REPORT 번호는 Master Ready의 대괄호 번호와 같은 숫자이며, 같은 보고서의 PART는 001/003처럼 이어집니다."; break;
+                case "help pwrsi": body = "pwrsi는 모든 PowerSI를 한 번 수집합니다. 처음에는 수집된 Output 전체, 이후에는 마지막 전송 이후 추가분을 보내며, 어느 쪽이든 3,000자를 넘으면 끝 3,000자만 표시하고 생략한 글자 수를 알립니다. 변동이 없으면 알립니다. 버퍼·자동 복사로 읽은 Output은 AFS Finished와 Total Sampling Points 줄로 완료 여부를 표시합니다. PowerDC 모드 창은 Output 수집 대상이 아니어서 읽기·입력·복사 없이 제외 사실만 표시합니다. 조회·답장 준비는 최대 120초이며, 긴 답장은 여러 메시지로 나뉩니다. 다음 Master Ready까지 기다리세요. 답장 머리글의 PWRSI REPORT 번호는 Master Ready의 대괄호 번호와 같은 숫자이며, 같은 보고서의 PART는 001/003처럼 이어집니다."; break;
                 default: throw new MonitorException("COMMAND_INVALID", "Unknown read-only command.");
             }
             return "HELP " + nonce + "\r\n" + body + "\r\n명령은 표시된 소문자로 입력하세요. pwrsi에는 공백이 없고 total status와 watchdog on/off <PID>의 단어 사이는 한 칸입니다. 바깥 공백은 허용하며 답장을 확인한 뒤 다음 명령을 보내세요.";
@@ -304,35 +336,52 @@ namespace RemoteMonitorMaster
                 blocks.Add(new ReportBlock(target.State == "PENDING" ? full + " — Pending" :
                     full + " — " + StateName(target.State), string.Empty, new string[0]));
             }
+            var records = new List<AuditLog.LogField[]>(report.Targets.Length);
             for (var index = 0; index < report.Targets.Length; index++)
             {
                 var target = report.Targets[index];
-                if (target.State == "PENDING") continue;
+                if (target.State == "PENDING")
+                {
+                    records.Add(PowerSiTargetFields(target, null, VerdictNotJudged)); // Codes only; the reply stays name+PID+Pending.
+                    continue;
+                }
+                checkPreparation?.Invoke();
                 var repeat = Abbreviate(target.ProcessName) + " (PID " + target.Pid.ToString(CultureInfo.InvariantCulture) + ")";
 
                 // A READ/AUTO_COPY copied by an LLM-free fallback route names that route; its VisionCode is always the
                 // LLM locate failure (OUTPUT_* included), so the LLM line is never suppressed for it.
                 var route = target.State == "READ" && target.Source == "AUTO_COPY" ? FallbackRoute(target.Code) : null;
+                string verdict;
+                var completion = CompletionLine(target, out verdict);
                 var lines = new List<string>
                 {
                     "상태: " + StateName(target.State) + " | 출처: " +
-                        (route == null ? SourceName(target.Source) : "자동 복사(LLM 위치 확인 실패 → " + route + ")"),
+                        (route == null ? SourceName(target.Source) : "자동 복사(" + LocateFailureName(target.VisionCode) + " → " + route + ")"),
                     "대상 수집 UTC: " + (target.CapturedUtc.HasValue ? Utc(target.CapturedUtc.Value) : "확인 불가"),
                     "설명: " + StateExplanation(target.State, target.Source) + " [code " + target.Code + "]"
                 };
+                if (completion != null) lines.Add(completion);
                 var captured = target.State == "READ" || target.State == "VISIBLE_EMPTY";
+                // A PowerDC-mode window is refused before any read, input or copy: its RecoveryAdvice line is the only advice.
+                var powerDc = !captured && target.Code == PowerDcModeCode;
                 if (!captured) lines.Add(RecoveryAdvice(target.Code));
-                if (route != null && !string.IsNullOrEmpty(target.VisionCode))
-                    lines.Add("로컬 LLM: " + LocateAdvice(target.VisionCode) + " [code " + target.VisionCode + "]");
-                else if (!string.IsNullOrEmpty(target.VisionCode) && target.VisionCode.StartsWith("VISION_", StringComparison.Ordinal))
-                    lines.Add("로컬 LLM: " + RecoveryAdvice(target.VisionCode) + " [code " + target.VisionCode + "]");
+                if (!captured && !powerDc && !string.IsNullOrEmpty(target.BufferCode) && target.BufferCode != target.Code)
+                    lines.Add(DirectReadLine(target.BufferCode));
+                // When the LLM code is the target code its advice is already the line above; never repeat it.
+                var vision = powerDc || (!captured && target.VisionCode == target.Code) ? null : target.VisionCode;
+                if (route != null && !string.IsNullOrEmpty(vision))
+                    lines.Add("로컬 LLM: " + LocateAdvice(vision) + " [code " + vision + "]");
+                else if (!string.IsNullOrEmpty(vision) && vision.StartsWith("VISION_", StringComparison.Ordinal))
+                    lines.Add("로컬 LLM: " + RecoveryAdvice(vision) + " [code " + vision + "]");
                 var chain = FallbackChainAdvice(target);
                 if (chain != null) lines.Add(chain);
                 // Every required status line is in place before Output; order must not depend on lazy evaluation.
                 IEnumerable<string> details = lines;
+                OutputPlan primary = null;
                 if (captured)
                 {
-                    details = details.Concat(OutputLines(prepared?.Primary[index], target.OutputText, target.Source == "OCR"));
+                    primary = OutputPlan.For(prepared?.Primary[index], target.OutputText);
+                    details = details.Concat(OutputLines(primary, target.Source == "OCR"));
                     // Same predicate as Validate and the output history: whitespace-only OCR carries no capture time.
                     if (target.OcrCapturedUtc.HasValue && !string.IsNullOrWhiteSpace(target.OcrText))
                     {
@@ -340,29 +389,77 @@ namespace RemoteMonitorMaster
                             .Concat(OutputLines(prepared?.Secondary[index], target.OcrText, true));
                     }
                 }
+                records.Add(PowerSiTargetFields(target, primary, verdict));
                 blocks.Add(new ReportBlock("증거: " + repeat, "증거 계속: " + repeat, details));
             }
-            return PackReport(nonce, blocks, checkPreparation);
+            var replies = PackReport(nonce, blocks, checkPreparation);
+            LogPowerSiTargets(records);
+            return replies;
+        }
+
+        // One Output text as the reply renders it: the history decides the kind and the text (whole text or APPENDED delta);
+        // rendering starts at Start so that at most MaxRenderedOutputCharacters are shown. The history is never changed here.
+        private sealed class OutputPlan
+        {
+            internal readonly string Kind, Text;
+            internal readonly int Start;
+
+            private OutputPlan(string kind, string text) { Kind = kind; Text = text; Start = RenderedOutputStart(text); }
+
+            internal static OutputPlan For(PowerSiOutputDelta delta, string fullText)
+            {
+                var kind = delta?.Kind ?? PowerSiOutputDelta.First;
+                return new OutputPlan(kind, kind == PowerSiOutputDelta.Unchanged ? string.Empty : delta?.Text ?? fullText ?? string.Empty);
+            }
+
+            internal int RenderedLength { get { return Text.Length - Start; } }
+            internal bool Truncated { get { return Start > 0; } }
+        }
+
+        // First rendered index of an Output text: 0 up to the cap; otherwise the last MaxRenderedOutputCharacters, moved
+        // forward past a surrogate pair's low half and then to the first line start within RenderedOutputLineSearch.
+        internal static int RenderedOutputStart(string text)
+        {
+            if (text == null || text.Length <= MaxRenderedOutputCharacters) return 0;
+            var start = text.Length - MaxRenderedOutputCharacters;
+            if (char.IsLowSurrogate(text[start]) && char.IsHighSurrogate(text[start - 1])) start++;
+            var previous = text[start - 1];
+            if (previous == '\n' || (previous == '\r' && text[start] != '\n')) return start; // Already a line start.
+            var limit = Math.Min(text.Length, start + RenderedOutputLineSearch);
+            for (var i = start; i < limit; i++)
+            {
+                if (text[i] != '\r' && text[i] != '\n') continue;
+                return i + (text[i] == '\r' && i + 1 < text.Length && text[i + 1] == '\n' ? 2 : 1);
+            }
+            return start;
         }
 
         private static IEnumerable<string> OutputLines(PowerSiOutputDelta delta, string fullText, bool ocr)
+        { return OutputLines(OutputPlan.For(delta, fullText), ocr); }
+
+        private static IEnumerable<string> OutputLines(OutputPlan plan, bool ocr)
         {
             if (ocr) yield return "LLM 전사본: 화면에 보인 내용이며 문자·숫자 정확도는 미검증입니다.";
-            var kind = delta?.Kind ?? "FIRST";
-            if (kind == "UNCHANGED")
+            var kind = plan.Kind;
+            if (kind == PowerSiOutputDelta.Unchanged)
             {
                 yield return "추가된 Output이 없어 보고할 변동이 없습니다. 수집된 내용 기준이며 실제 계산 정지를 뜻하지 않습니다.";
                 yield break;
             }
-            var text = delta?.Text ?? fullText ?? string.Empty;
-            yield return kind == "APPENDED" ? "이전 전송 이후 추가된 Output:" :
-                kind == "REPLACED" ? "Output이 교체·초기화되었거나 기존 내용이 변경되어 현재 수집 내용 전체를 보냅니다:" :
-                "수집된 Output 전체:";
+            var text = plan.Text;
+            // A truncated text never says "전체": its header names the tail, and the omission line below gives exact counts.
+            var tail = string.Format(CultureInfo.InvariantCulture, "마지막 {0:N0}자", MaxRenderedOutputCharacters);
+            yield return kind == PowerSiOutputDelta.Appended ? (plan.Truncated ? "추가된 Output " + tail + ":" : "이전 전송 이후 추가된 Output:") :
+                kind == PowerSiOutputDelta.Replaced ? "Output이 교체·초기화되었거나 기존 내용이 변경되어 현재 수집 내용" +
+                    (plan.Truncated ? "의 " + tail + "를 보냅니다:" : " 전체를 보냅니다:") :
+                plan.Truncated ? "수집된 Output " + tail + ":" : "수집된 Output 전체:";
             if (text.Length == 0) { yield return "(Output 내용 없음)"; yield break; }
+            if (plan.Truncated)
+                yield return string.Format(CultureInfo.InvariantCulture, "…(앞 {0}자 생략, 전체 {1}자)", plan.Start, text.Length);
             // Messenger text cannot carry control characters. Spell them out, preserving their exact code points.
             // Enumerate bounded lines instead of allocating millions of strings for a large newline-only buffer.
             var line = new StringBuilder(1024);
-            for (var i = 0; i < text.Length; i++)
+            for (var i = plan.Start; i < text.Length; i++)
             {
                 var c = text[i];
                 if (c == '\r' || c == '\n')
@@ -372,14 +469,53 @@ namespace RemoteMonitorMaster
                     continue;
                 }
                 if (line.Length >= 1000) { yield return "  " + line; line.Clear(); }
-                if (char.IsControl(c) && c != '\t') line.Append("\\u").Append(((int)c).ToString("X4", CultureInfo.InvariantCulture));
-                else
-                {
-                    line.Append(c);
-                    if (char.IsHighSurrogate(c) && i + 1 < text.Length) line.Append(text[++i]);
-                }
+                if (char.IsHighSurrogate(c) && i + 1 < text.Length) line.Append(c).Append(text[++i]);
+                else AppendLiteral(line, c);
             }
             yield return "  " + line;
+        }
+
+        private static void AppendLiteral(StringBuilder text, char c)
+        {
+            if (char.IsControl(c) && c != '\t') text.Append("\\u").Append(((int)c).ToString("X4", CultureInfo.InvariantCulture));
+            else text.Append(c);
+        }
+
+        // Display only (no history, no Pending change): the watchdog's rule, last marker block of the full READ text from
+        // a direct source (BUFFER/AUTO_COPY). OCR and other sources are never judged.
+        private static string CompletionLine(PowerSiTargetReport target, out string verdict)
+        {
+            verdict = VerdictNotJudged;
+            if (target.State != "READ") return null;
+            if (!PowerSiCompletion.IsJudgeableSource(target.Source))
+                return "완료 판정: 하지 않음 (출처 " + target.Source + ": 판정 대상 아님)";
+            var result = PowerSiCompletion.Evaluate(target.OutputText);
+            switch (result.State)
+            {
+                case PowerSiCompletionState.Finished:
+                    verdict = VerdictCompleted;
+                    return "완료 판정: 완료 (AFS Finished, Total Sampling Points = " +
+                        result.SamplingPoints.ToString(CultureInfo.InvariantCulture) + ")";
+                case PowerSiCompletionState.Running:
+                    verdict = VerdictInProgress;
+                    var last = new StringBuilder(result.LastFrequencyLine.Length); // Output text: reply only, never logged.
+                    foreach (var c in result.LastFrequencyLine) AppendLiteral(last, c);
+                    return "완료 판정: 진행 중 (마지막 AFS Current Frequency 줄: " + last + ", 표지 줄 " +
+                        result.MarkerLines.ToString(CultureInfo.InvariantCulture) + "개)";
+                case PowerSiCompletionState.FinishPending:
+                    verdict = VerdictFinishPending;
+                    return "완료 판정: 완료 대기 (AFS Finished 뒤 Total Sampling Points 줄 없음)";
+                default:
+                    verdict = VerdictNoMarker;
+                    return "완료 판정: 표지 없음";
+            }
+        }
+
+        // The direct WM_GETTEXT read's own code when another step decided the target code; advice only when specific.
+        private static string DirectReadLine(string bufferCode)
+        {
+            var advice = RecoveryAdvice(bufferCode);
+            return "직접 읽기: " + (advice == UnknownAdvice ? string.Empty : advice + " ") + "[code " + bufferCode + "]";
         }
 
         internal static string[] FormatQueryFailure(string command, string nonce, Exception exception)
@@ -518,7 +654,29 @@ namespace RemoteMonitorMaster
                 case "AUTO_COPY_BODY_MOVED": return "Output 본문 위치가 확인한 위치와 달라져 자동 입력을 생략했습니다";
                 case "AUTO_COPY_OCCLUDED": return "다른 창이 Output을 가리고 있어 자동 입력을 생략했습니다";
                 case "AUTO_COPY_ANCHOR_CONTINUITY": return "저장 위치의 텍스트가 이전과 이어지지 않아 복사 결과를 버렸습니다";
-                default: return "수집 미확인; Slave의 대상 창과 로컬 설정을 확인하세요";
+                case "BUFFER_RICHEDIT_UNSTABLE": return "Output 창 텍스트가 읽는 동안 바뀌어 직접 읽기를 보류했습니다. 잠시 후 다시 시도하세요.";
+                case "BUFFER_OUTPUT_NO_HWND": return "Output 창은 찾았지만 표준 텍스트 컨트롤이 없어 직접 읽지 못했습니다. 창 구조(SCOPE)로 대체 복사를 시도합니다.";
+                case PowerDcModeCode: return "PowerDC 모드 창: Output 수집 대상이 아닙니다 (읽기·입력·복사 없음)";
+                default: return UnknownAdvice;
+            }
+        }
+
+        // The LLM side of a fallback route: a missing setting, server or model and a refused region are named; other locate
+        // failures stay generic. OUTPUT_REGION_UNCONFIRMED is the Slave's one code for a located region the check refused.
+        private static string LocateFailureName(string visionCode)
+        {
+            return NamedLocateFailure(visionCode) ?? "LLM 위치 확인 실패";
+        }
+
+        private static string NamedLocateFailure(string visionCode)
+        {
+            switch (visionCode)
+            {
+                case "VISION_NOT_CONFIGURED": return "LLM 미설정";
+                case "VISION_SERVER_UNAVAILABLE": return "LLM 서버 없음";
+                case "VISION_MODEL_UNAVAILABLE": return "LLM 모델 미적재";
+                case "OUTPUT_REGION_UNCONFIRMED": return "LLM이 지목한 위치가 검증에서 거부됨";
+                default: return null;
             }
         }
 
@@ -555,9 +713,11 @@ namespace RemoteMonitorMaster
             var vision = target.VisionCode ?? string.Empty;
             if (target.State != "UNAVAILABLE" || target.Code == null || !target.Code.StartsWith("AUTO_COPY_", StringComparison.Ordinal) ||
                 !(vision.StartsWith("VISION_", StringComparison.Ordinal) || vision == "OUTPUT_REGION_UNCONFIRMED")) return null;
-            return "LLM 위치 확인(" + vision + ")과 대체 복사(" +
-                (target.Code == "AUTO_COPY_REGION_UNCONFIRMED" ? "사용할 위치 없음" : "마지막 결과: " + target.Code) +
-                ")가 모두 실패했습니다. LM Studio와 모델 상태를 확인하거나 Slave에서 PowerSI 전체 수집을 한 번 실행해 위치를 다시 저장하세요.";
+            var copy = "대체 복사(" + (target.Code == "AUTO_COPY_REGION_UNCONFIRMED" ? "사용할 위치 없음" : "마지막 결과: " + target.Code) + ")";
+            var named = NamedLocateFailure(vision);
+            return (named == null ? "LLM 위치 확인(" + vision + ")과 " + copy + "가 모두 실패했습니다. " :
+                named + "(" + vision + "), " + copy + "도 실패했습니다. ") +
+                "LM Studio와 모델 상태를 확인하거나 Slave에서 PowerSI 전체 수집을 한 번 실행해 위치를 다시 저장하세요.";
         }
 
         private static string BatchExplanation(string code, int targets)
@@ -586,7 +746,8 @@ namespace RemoteMonitorMaster
         {
             switch (state)
             {
-                case "READ": return "Output 증거를 읽었습니다. 완료 여부나 진행률은 판정하지 않습니다.";
+                case "READ": return PowerSiCompletion.IsJudgeableSource(source) ? "Output 증거를 읽었습니다. 진행률은 판정하지 않습니다." :
+                    "Output 증거를 읽었습니다. 완료 여부나 진행률은 판정하지 않습니다.";
                 case "VISIBLE_EMPTY": return source == "BUFFER" ? "직접 읽은 Output 버퍼가 비어 있었습니다." :
                     source == "AUTO_COPY" ? "자동 복사로 읽은 Output 내용이 비어 있었습니다." :
                     "화면에서 보이는 Output 영역이 비어 있었습니다. 전체 버퍼 상태를 추정하지 않습니다.";
@@ -868,11 +1029,11 @@ namespace RemoteMonitorMaster
                 Fallback(42, "READ", "AUTO_COPY_SCOPE_READ", "OUTPUT_UNAVAILABLE"),
                 Fallback(43, "READ", "AUTO_COPY_LAYOUT_READ", "OUTPUT_REGION_UNCONFIRMED"),
                 Fallback(44, "READ", "AUTO_COPY_READ", "OUTPUT_UNAVAILABLE"));
-            Need(routes.Contains("상태: 읽음 | 출처: 자동 복사(LLM 위치 확인 실패 → 저장 위치로 복사)") &&
+            Need(routes.Contains("상태: 읽음 | 출처: 자동 복사(LLM 서버 없음 → 저장 위치로 복사)") &&
                 routes.Contains("로컬 LLM: Slave의 LM Studio 로컬 서버 실행과 포트를 확인하세요 [code VISION_SERVER_UNAVAILABLE]") &&
                 routes.Contains("상태: 읽음 | 출처: 자동 복사(LLM 위치 확인 실패 → Output 창 구조로 복사)") &&
                 routes.Contains("로컬 LLM: Output 창 위치를 찾지 못했습니다 [code OUTPUT_UNAVAILABLE]") &&
-                routes.Contains("상태: 읽음 | 출처: 자동 복사(LLM 위치 확인 실패 → 같은 창 크기의 저장 레이아웃으로 복사)") &&
+                routes.Contains("상태: 읽음 | 출처: 자동 복사(LLM이 지목한 위치가 검증에서 거부됨 → 같은 창 크기의 저장 레이아웃으로 복사)") &&
                 routes.Contains("로컬 LLM: 찾은 Output 위치를 확인하지 못했습니다 [code OUTPUT_REGION_UNCONFIRMED]") &&
                 routes.Contains("[code AUTO_COPY_SCOPE_READ]") && routes.Contains("대체 본문 41") && routes.Contains("대체 본문 43") &&
                 Occurrences(routes, "출처: 자동 복사(") == 3 && Occurrences(routes, "로컬 LLM: ") == 3 &&
@@ -885,9 +1046,9 @@ namespace RemoteMonitorMaster
                 Fallback(56, "UNAVAILABLE", "VISION_SERVER_UNAVAILABLE", "VISION_SERVER_UNAVAILABLE"));
             var fallbackCodes = new[] { "AUTO_COPY_ANCHOR_CONTINUITY", "AUTO_COPY_BODY_MOVED", "AUTO_COPY_BODY_UNCONFIRMED", "AUTO_COPY_OCCLUDED" };
             Need(chains.Contains("LLM 위치 확인(VISION_TIMEOUT)과 대체 복사(마지막 결과: AUTO_COPY_BODY_MOVED)가 모두 실패했습니다. " + relearn) &&
-                chains.Contains("LLM 위치 확인(OUTPUT_REGION_UNCONFIRMED)과 대체 복사(사용할 위치 없음)가 모두 실패했습니다. " + relearn) &&
-                chains.Contains("LLM 위치 확인(VISION_MODEL_UNAVAILABLE)과 대체 복사(마지막 결과: AUTO_COPY_ANCHOR_CONTINUITY)가 모두 실패했습니다. ") &&
-                Occurrences(chains, "LLM 위치 확인(") == 3 && Occurrences(chains, relearn) == 3 &&
+                chains.Contains("LLM이 지목한 위치가 검증에서 거부됨(OUTPUT_REGION_UNCONFIRMED), 대체 복사(사용할 위치 없음)도 실패했습니다. " + relearn) &&
+                chains.Contains("LLM 모델 미적재(VISION_MODEL_UNAVAILABLE), 대체 복사(마지막 결과: AUTO_COPY_ANCHOR_CONTINUITY)도 실패했습니다. ") &&
+                Occurrences(chains, "LLM 위치 확인(") == 1 && Occurrences(chains, relearn) == 3 &&
                 chains.Contains("로컬 LLM: 제한 시간 내 수집하지 못했습니다 [code VISION_TIMEOUT]") && !chains.Contains("출처: 자동 복사") &&
                 chains.Contains("저장 위치의 텍스트가 이전과 이어지지 않아 복사 결과를 버렸습니다") &&
                 fallbackCodes.Select(RecoveryAdvice).Distinct().Count() == 4 &&
@@ -904,6 +1065,224 @@ namespace RemoteMonitorMaster
                 Need(routeHistory.Prepare(pin, direct).Primary[0].Kind == PowerSiOutputDelta.Unchanged);
             }
             finally { File.Delete(routeHistoryPath); }
+
+            // Rendered Output tail (rendering only): at most the last MaxRenderedOutputCharacters of each Output text after one
+            // omission line; the cut moves to a line start within 200 characters and never splits a surrogate pair.
+            void Check(bool condition, string reason)
+            { if (!condition) throw new InvalidOperationException("pwrsi rendering self-test failed: " + reason + "."); }
+            string Omission(int omitted, int all)
+            { return string.Format(CultureInfo.InvariantCulture, "…(앞 {0}자 생략, 전체 {1}자)", omitted, all); }
+            List<string> Lines(string output) { return OutputLines(null, output, false).ToList(); }
+            string Body(List<string> rendered) // Rendered Output characters without indentation or line breaks.
+            { return string.Concat(rendered.Where(l => l.StartsWith("  ", StringComparison.Ordinal)).Select(l => l.Substring(2))); }
+            string Flat(string output) { return output.Replace("\r", string.Empty).Replace("\n", string.Empty); }
+            foreach (var length in new[] { 2999, 3000 })
+            {
+                var edge = new string('a', length - 1) + "Z";
+                var edgeLines = Lines(edge);
+                Check(RenderedOutputStart(edge) == 0 && edgeLines[0] == "수집된 Output 전체:" &&
+                    !edgeLines.Any(l => l.StartsWith("…(", StringComparison.Ordinal)) && Body(edgeLines) == edge,
+                    "TAIL_AT_OR_UNDER_CAP_" + length.ToString(CultureInfo.InvariantCulture));
+            }
+            var over = "A" + new string('b', 2999) + "Z"; // 3,001
+            var overLines = Lines(over);
+            Check(RenderedOutputStart(over) == 1 && overLines[0] == "수집된 Output 마지막 3,000자:" && overLines[1] == Omission(1, 3001) &&
+                Body(overLines) == over.Substring(1) && Occurrences(string.Join("\n", overLines), "…(") == 1 &&
+                !overLines.Contains("수집된 Output 전체:"), "TAIL_3001");
+            // Truncated headers never say "전체"; untruncated APPENDED/REPLACED keep today's headers.
+            List<string> DeltaLines(string kind, string output) { return OutputLines(new PowerSiOutputDelta(kind, output), null, false).ToList(); }
+            Check(DeltaLines(PowerSiOutputDelta.Appended, over)[0] == "추가된 Output 마지막 3,000자:" &&
+                DeltaLines(PowerSiOutputDelta.Appended, "새 줄")[0] == "이전 전송 이후 추가된 Output:" &&
+                DeltaLines(PowerSiOutputDelta.Replaced, over)[0] ==
+                    "Output이 교체·초기화되었거나 기존 내용이 변경되어 현재 수집 내용의 마지막 3,000자를 보냅니다:" &&
+                DeltaLines(PowerSiOutputDelta.Replaced, "새 줄")[0] ==
+                    "Output이 교체·초기화되었거나 기존 내용이 변경되어 현재 수집 내용 전체를 보냅니다:" &&
+                DeltaLines(PowerSiOutputDelta.First, over)[1] == Omission(1, 3001) &&
+                DeltaLines(PowerSiOutputDelta.Appended, over)[1] == Omission(1, 3001), "TAIL_HEADERS");
+            var numbered = new StringBuilder();
+            for (var n = 0; numbered.Length < 10000; n++)
+                numbered.Append('L').Append(n.ToString("D4", CultureInfo.InvariantCulture)).Append(' ', 31).Append('\n'); // 37 per line
+            var ten = numbered.ToString(0, 10000);
+            var tenStart = ten.IndexOf('\n', 7000) + 1;
+            var tenLines = Lines(ten);
+            Check(tenStart > 7000 && tenStart <= 7200 && RenderedOutputStart(ten) == tenStart && tenLines[1] == Omission(tenStart, 10000) &&
+                tenLines[2].StartsWith("  L", StringComparison.Ordinal) && Flat(Body(tenLines)) == Flat(ten.Substring(tenStart)) &&
+                Occurrences(string.Join("\n", tenLines), "…(") == 1, "TAIL_10000_LINE_START");
+            var unbrokenTen = string.Concat(Enumerable.Range(0, 1000).Select(n => n.ToString("D10", CultureInfo.InvariantCulture)));
+            var unbrokenLines = Lines(unbrokenTen);
+            Check(unbrokenTen.Length == 10000 && RenderedOutputStart(unbrokenTen) == 7000 && unbrokenLines.Count == 5 &&
+                unbrokenLines[1] == Omission(7000, 10000) && Body(unbrokenLines) == unbrokenTen.Substring(7000), "TAIL_10000_LAST_3000");
+            var aligned = string.Concat(Enumerable.Range(0, 200).Select(n => n.ToString("D49", CultureInfo.InvariantCulture) + "\n"));
+            Check(aligned.Length == 10000 && RenderedOutputStart(aligned) == 7000 && Lines(aligned)[1] == Omission(7000, 10000),
+                "TAIL_ALREADY_LINE_START");
+            var split = new string('a', 100) + "😀" + new string('b', 2999); // 3,101: the plain cut would split the pair.
+            var splitLines = Lines(split);
+            Check(RenderedOutputStart(split) == 102 && splitLines[1] == Omission(102, 3101) && Body(splitLines) == new string('b', 2999) &&
+                splitLines.All(SafeReplyText), "TAIL_SURROGATE_SKIPPED");
+            var whole = new string('a', 100) + "😀" + new string('b', 2998); // 3,100: the cut lands on the high half; the pair stays.
+            var wholeLines = Lines(whole);
+            Check(RenderedOutputStart(whole) == 100 && wholeLines[1] == Omission(100, 3100) &&
+                Body(wholeLines) == "😀" + new string('b', 2998) && wholeLines.All(SafeReplyText), "TAIL_SURROGATE_KEPT");
+            var crlf = new string('x', 500) + "\r\n" + new string('y', 2999); // 3,501: the plain cut lands between CR and LF.
+            var crlfLines = Lines(crlf);
+            Check(RenderedOutputStart(crlf) == 502 && crlfLines[1] == Omission(502, 3501) && crlfLines[2] == "  " + new string('y', 1000) &&
+                !crlfLines.Contains("  ") && Body(crlfLines) == new string('y', 2999), "TAIL_CRLF_SPLIT");
+            var near = new string('x', 1050) + "\r\n" + new string('b', 2948); // 4,000: CRLF 50 characters into the window.
+            var far = new string('x', 1250) + "\r\n" + new string('b', 2748); // 4,000: no line break in the first 200 characters.
+            Check(RenderedOutputStart(near) == 1052 && Lines(near)[1] == Omission(1052, 4000) && Body(Lines(near)) == new string('b', 2948) &&
+                RenderedOutputStart(far) == 1000 && Lines(far)[1] == Omission(1000, 4000) &&
+                Body(Lines(far)) == new string('x', 250) + new string('b', 2748), "TAIL_CRLF_WINDOW");
+
+            // The history still commits the full text's length and SHA-256; FIRST/UNCHANGED/APPENDED are unchanged.
+            var capHistoryPath = Path.Combine(directory, "command-cap-history.txt");
+            try
+            {
+                var capHistory = new PowerSiOutputHistory(capHistoryPath);
+                var capTarget = Fallback(71, "READ", "BUFFER_READ", null);
+                capTarget.Source = "BUFFER"; capTarget.BufferCode = "BUFFER_READ"; capTarget.OutputText = ten;
+                state.PowerSiReport = new PowerSiReport { CapturedUtc = captured, SessionId = 7, Targets = new[] { capTarget } };
+                var capFirst = capHistory.Prepare(pin, state.PowerSiReport);
+                var firstReply = string.Join("\n", FormatPowerSi(nonce, state, capFirst));
+                Check(capFirst.Primary[0].Kind == PowerSiOutputDelta.First && capFirst.Primary[0].Text == ten &&
+                    firstReply.Contains("수집된 Output 마지막 3,000자:") && !firstReply.Contains("수집된 Output 전체:") &&
+                    firstReply.Contains(Omission(tenStart, 10000)) &&
+                    !firstReply.Contains("L0000") && firstReply.Contains("L0270") && capFirst.Commit(), "CAP_FIRST");
+                Check(File.ReadAllText(capHistoryPath).Contains("\t10000\t" + TokenStore.Hash(ten) + "\n"), "CAP_HISTORY_FULL_TEXT");
+                var capSame = capHistory.Prepare(pin, state.PowerSiReport);
+                var sameReply = string.Join("\n", FormatPowerSi(nonce, state, capSame));
+                Check(capSame.Primary[0].Kind == PowerSiOutputDelta.Unchanged && sameReply.Contains("추가된 Output이 없어") &&
+                    !sameReply.Contains("…(앞 ") && !sameReply.Contains("L0270") && sameReply.Contains("완료 판정: 표지 없음"), "CAP_UNCHANGED");
+                var appendix = string.Concat(Enumerable.Range(0, 125).Select(n =>
+                    "A" + n.ToString("D3", CultureInfo.InvariantCulture) + new string('.', 35) + "\n")); // 125 × 40
+                capTarget.OutputText = ten + appendix;
+                var capAppended = capHistory.Prepare(pin, state.PowerSiReport);
+                var appendedReply = string.Join("\n", FormatPowerSi(nonce, state, capAppended));
+                Check(capAppended.Primary[0].Kind == PowerSiOutputDelta.Appended && capAppended.Primary[0].Text == appendix &&
+                    RenderedOutputStart(appendix) == 2000 && appendedReply.Contains("추가된 Output 마지막 3,000자:") &&
+                    !appendedReply.Contains("이전 전송 이후 추가된 Output:") &&
+                    appendedReply.Contains(Omission(2000, 5000)) && !appendedReply.Contains("A049.") && appendedReply.Contains("A050.") &&
+                    appendedReply.Contains("A124.") && !appendedReply.Contains("L0270"), "CAP_APPENDED");
+                Check(capAppended.Commit() && File.ReadAllText(capHistoryPath).Contains("\t15000\t" + TokenStore.Hash(ten + appendix) + "\n") &&
+                    capHistory.Prepare(pin, state.PowerSiReport).Primary[0].Kind == PowerSiOutputDelta.Unchanged, "CAP_HISTORY_APPENDED");
+            }
+            finally { File.Delete(capHistoryPath); }
+
+            // Completion verdict (display only): the watchdog rule on the full READ text of a BUFFER/AUTO_COPY target.
+            var sweep = new StringBuilder("PowerSI solver started\r\nSweep setup complete\r\n");
+            foreach (var frequency in new[] { "AFS Current Frequency ( GHz ) = 1.515", "AFS Current Frequency ( MHz ) = 7.500",
+                "AFS Current Frequency ( GHz ) = 0.3847" })
+                sweep.Append(frequency).Append("\r\n  Solving matrix...\r\n");
+            var runningText = sweep.ToString();
+            var finishedText = runningText + "AFS Finished\r\nWriting results\r\nTotal Sampling Points = 118\r\n";
+            PowerSiTargetReport Judged(int pid, string source, string output)
+            {
+                var judged = Fallback(pid, "READ", source == "OCR" ? "OUTPUT_READ" : source + "_READ", null);
+                judged.Source = source; judged.BufferCode = source == "OCR" ? null : judged.Code; judged.OutputText = output;
+                return judged;
+            }
+            var verdicts = Rendered(Judged(81, "BUFFER", finishedText + new string('.', 5000)), Judged(82, "AUTO_COPY", runningText),
+                Judged(83, "BUFFER", "plain output\r\nno markers"), Judged(84, "OCR", finishedText),
+                Judged(85, "BUFFER", runningText + "AFS Finished\r\n"), Judged(86, "AUTO_COPY", "AFS\vCurrent Frequency ( GHz ) = 2.5\n"));
+            var completedLine = "완료 판정: 완료 (AFS Finished, Total Sampling Points = 118)";
+            Check(Occurrences(verdicts, completedLine) == 1 &&
+                verdicts.IndexOf(completedLine, StringComparison.Ordinal) < verdicts.IndexOf("…(앞 ", StringComparison.Ordinal) &&
+                Occurrences(verdicts, "Writing results") == 1 && Occurrences(verdicts, "…(앞 ") == 1 &&
+                verdicts.Contains("완료 판정: 진행 중 (마지막 AFS Current Frequency 줄: AFS Current Frequency ( GHz ) = 0.3847, 표지 줄 3개)") &&
+                verdicts.Contains("완료 판정: 표지 없음") && verdicts.Contains("완료 판정: 하지 않음 (출처 OCR: 판정 대상 아님)") &&
+                verdicts.Contains("완료 판정: 완료 대기 (AFS Finished 뒤 Total Sampling Points 줄 없음)") &&
+                verdicts.Contains("완료 판정: 진행 중 (마지막 AFS Current Frequency 줄: AFS\\u000BCurrent Frequency ( GHz ) = 2.5, 표지 줄 1개)") &&
+                Occurrences(verdicts, "완료 판정: ") == 6 && Occurrences(verdicts, "완료 여부나 진행률은 판정하지 않습니다.") == 1 &&
+                Occurrences(verdicts, "Output 증거를 읽었습니다. 진행률은 판정하지 않습니다.") == 5, "COMPLETION_VERDICTS");
+
+            // Diagnosability: one advice per code, the direct read's own code when another step decided the target code.
+            var unstable = RecoveryAdvice("BUFFER_RICHEDIT_UNSTABLE");
+            var serverAdvice = RecoveryAdvice("VISION_SERVER_UNAVAILABLE");
+            var sameVision = Fallback(91, "UNAVAILABLE", "VISION_SERVER_UNAVAILABLE", "VISION_SERVER_UNAVAILABLE");
+            sameVision.BufferCode = "BUFFER_RICHEDIT_UNSTABLE";
+            var opaque = Fallback(92, "UNAVAILABLE", "AUTO_COPY_OCCLUDED", "VISION_TIMEOUT");
+            opaque.BufferCode = "BUFFER_NOT_EXPOSED";
+            var diagnosed = Rendered(sameVision, opaque, Fallback(93, "UNAVAILABLE", "BUFFER_RICHEDIT_UNSTABLE", null),
+                Judged(94, "BUFFER", "본문 94"));
+            Check(unstable == "Output 창 텍스트가 읽는 동안 바뀌어 직접 읽기를 보류했습니다. 잠시 후 다시 시도하세요." &&
+                Occurrences(diagnosed, serverAdvice) == 1 && Occurrences(diagnosed, "로컬 LLM: ") == 1 &&
+                diagnosed.Contains("로컬 LLM: 제한 시간 내 수집하지 못했습니다 [code VISION_TIMEOUT]") &&
+                diagnosed.Contains("직접 읽기: " + unstable + " [code BUFFER_RICHEDIT_UNSTABLE]") &&
+                diagnosed.Contains("직접 읽기: [code BUFFER_NOT_EXPOSED]") && Occurrences(diagnosed, "직접 읽기: ") == 2 &&
+                Occurrences(diagnosed, unstable) == 2, "DIRECT_READ_AND_SINGLE_ADVICE");
+
+            // New Slave codes: a PowerDC-mode window gets one line and nothing else; a missing LLM setup names itself.
+            const string powerDcLine = "PowerDC 모드 창: Output 수집 대상이 아닙니다 (읽기·입력·복사 없음)";
+            var powerDcTarget = Fallback(95, "UNAVAILABLE", PowerDcModeCode, "VISION_TIMEOUT");
+            powerDcTarget.BufferCode = "BUFFER_NOT_EXPOSED";
+            var modes = Rendered(powerDcTarget, Fallback(96, "READ", "AUTO_COPY_SCOPE_READ", "VISION_NOT_CONFIGURED"),
+                Fallback(97, "READ", "AUTO_COPY_LAYOUT_READ", "VISION_MODEL_UNAVAILABLE"),
+                Fallback(98, "READ", "AUTO_COPY_ANCHOR_READ", "VISION_TIMEOUT"));
+            Check(Occurrences(modes, powerDcLine) == 1 && modes.Contains("[code TARGET_MODE_POWERDC]") && !modes.Contains("직접 읽기") &&
+                !modes.Contains("BUFFER_NOT_EXPOSED") && !modes.Contains(UnknownAdvice) && Occurrences(modes, "[code VISION_TIMEOUT]") == 1 &&
+                modes.Contains("상태: 읽음 | 출처: 자동 복사(LLM 미설정 → Output 창 구조로 복사)") &&
+                modes.Contains("상태: 읽음 | 출처: 자동 복사(LLM 모델 미적재 → 같은 창 크기의 저장 레이아웃으로 복사)") &&
+                modes.Contains("상태: 읽음 | 출처: 자동 복사(LLM 위치 확인 실패 → 저장 위치로 복사)") &&
+                modes.Contains("로컬 LLM: LM Studio 설정을 켜고 로드된 이미지 모델을 선택하세요 [code VISION_NOT_CONFIGURED]") &&
+                modes.Contains("로컬 LLM: Slave의 LM Studio에서 이미지 모델을 로드하세요 [code VISION_MODEL_UNAVAILABLE]") &&
+                Occurrences(modes, "로컬 LLM: ") == 3, "POWERDC_AND_ROUTE_NAMES");
+            // The Slave's actual PowerDC shape (BufferCode = Code, no LLM code), an Output dock without a native handle, and
+            // an all-failed chain without LLM setup.
+            const string noHwnd = "Output 창은 찾았지만 표준 텍스트 컨트롤이 없어 직접 읽지 못했습니다. 창 구조(SCOPE)로 대체 복사를 시도합니다.";
+            var dock = Fallback(87, "UNAVAILABLE", "AUTO_COPY_BODY_UNCONFIRMED", "VISION_NOT_CONFIGURED");
+            dock.BufferCode = "BUFFER_OUTPUT_NO_HWND";
+            var slaveShapes = Rendered(Fallback(89, "UNAVAILABLE", PowerDcModeCode, null), dock,
+                Fallback(88, "UNAVAILABLE", "BUFFER_OUTPUT_NO_HWND", null));
+            Check(RecoveryAdvice("BUFFER_OUTPUT_NO_HWND") == noHwnd && Occurrences(slaveShapes, powerDcLine) == 1 &&
+                Occurrences(slaveShapes, "직접 읽기: ") == 1 && slaveShapes.Contains("직접 읽기: " + noHwnd + " [code BUFFER_OUTPUT_NO_HWND]") &&
+                Occurrences(slaveShapes, noHwnd) == 2 &&
+                slaveShapes.Contains("LLM 미설정(VISION_NOT_CONFIGURED), 대체 복사(마지막 결과: AUTO_COPY_BODY_UNCONFIRMED)도 실패했습니다. " + relearn) &&
+                !slaveShapes.Contains("LLM 위치 확인(VISION_NOT_CONFIGURED)") && !slaveShapes.Contains(UnknownAdvice), "SLAVE_CODE_SHAPES");
+            Check(Help("help pwrsi", nonce).Contains("PowerDC 모드 창은 Output 수집 대상이 아니어서") &&
+                IsReply(Help("help pwrsi", nonce), "help pwrsi", nonce) &&
+                WatchdogText.HelpBody().Contains("PowerDC 모드 창은 Output 수집 대상이 아니어서 감시에서 제외하고 그 PID를 알립니다.") &&
+                IsReply(Help(WatchdogText.HelpWatchdog, nonce), WatchdogText.HelpWatchdog, nonce), "HELP_POWERDC");
+
+            // PWRSI_TARGET: one record per target inside the command-log scope only; codes, counts and kinds, no names or text.
+            var targetLogDirectory = Path.Combine(directory, "pwrsi-target-log");
+            var targetLog = new AuditLog(targetLogDirectory);
+            try
+            {
+                var pendingTarget = new PowerSiTargetReport { Pid = 99, StartUtcTicks = captured.Ticks,
+                    ProcessName = "PowerSI Pending " + new string('界', 200), State = "PENDING", Source = "NONE", Code = "SC_PENDING" };
+                var loggedTargets = new[] { Judged(81, "BUFFER", finishedText + new string('.', 5000)),
+                    Fallback(41, "READ", "AUTO_COPY_ANCHOR_READ", "VISION_SERVER_UNAVAILABLE"), pendingTarget, powerDcTarget,
+                    Judged(84, "OCR", finishedText) };
+                using (UseCommandLog(targetLog)) Rendered(loggedTargets);
+                Rendered(loggedTargets); // Outside the scope: no record.
+                targetLog.Dispose();
+                var logged = File.ReadAllText(targetLog.FilePath);
+                string Record(int pid, string targetState, string source, string code, string bufferCode, string visionCode, int length,
+                    string delta, int rendered, bool truncated, string verdict)
+                {
+                    return string.Format(CultureInfo.InvariantCulture, "code=\"PWRSI_TARGET\"\tpid=\"{0}\"\tstate=\"{1}\"\tsource=\"{2}\"\t" +
+                        "target_code=\"{3}\"\tbuffer_code=\"{4}\"\tvision_code=\"{5}\"\toutput_length=\"{6}\"\tdelta=\"{7}\"\trendered_length=\"{8}\"\t" +
+                        "truncated=\"{9}\"\tverdict=\"{10}\"", pid, targetState, source, code, bufferCode, visionCode, length, delta, rendered,
+                        truncated, verdict);
+                }
+                Check(Occurrences(logged, "code=\"PWRSI_TARGET\"") == 5 &&
+                    logged.Contains(Record(81, "READ", "BUFFER", "BUFFER_READ", "BUFFER_READ", "", finishedText.Length + 5000, "FIRST", 3000,
+                        true, "COMPLETED")) &&
+                    logged.Contains(Record(41, "READ", "AUTO_COPY", "AUTO_COPY_ANCHOR_READ", "AUTO_COPY_READ", "VISION_SERVER_UNAVAILABLE",
+                        "대체 본문 41".Length, "FIRST", "대체 본문 41".Length, false, "NO_MARKER")) &&
+                    logged.Contains(Record(99, "PENDING", "NONE", "SC_PENDING", "", "", 0, "NONE", 0, false, "NOT_JUDGED")) &&
+                    logged.Contains(Record(95, "UNAVAILABLE", "NONE", PowerDcModeCode, "BUFFER_NOT_EXPOSED", "VISION_TIMEOUT", 0, "NONE", 0,
+                        false, "NOT_JUDGED")) &&
+                    logged.Contains(Record(84, "READ", "OCR", "OUTPUT_READ", "", "", finishedText.Length, "FIRST", finishedText.Length, false,
+                        "NOT_JUDGED")), "PWRSI_TARGET_FIELDS");
+                Check(!logged.Contains("界") && !logged.Contains("대체 본문") && !logged.Contains("PowerSI") && !logged.Contains("AFS") &&
+                    !logged.Contains("Writing results") && !logged.Contains(nonce), "PWRSI_TARGET_NO_NAMES_OR_TEXT");
+            }
+            finally
+            {
+                targetLog.Dispose();
+                File.Delete(targetLog.FilePath);
+                Directory.Delete(targetLogDirectory);
+            }
 
             var mismatch = FormatQueryFailure("pwrsi", nonce, new LinkVersionMismatchException("0.1.58"));
             Need(mismatch.Length == 1 && IsReportPart(mismatch[0], nonce, 1, 1) && mismatch[0].Contains(LinkVersion.Value) &&

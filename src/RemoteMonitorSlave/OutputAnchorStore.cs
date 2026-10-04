@@ -32,7 +32,11 @@ namespace RemoteMonitorSlave
     //   PruneMissing(session, living, complete)   Removes this session's entries whose process is gone, only when
     //                                             the inventory is complete.
     //   static CheckContinuity(entry, text)       The new text starts with the stored prefix (hash of its first L).
-    //   static DecideFallbackRoute(...)           "ANCHOR" | "SCOPE" | "LAYOUT" | null, in that priority.
+    //   static DecideFallbackRoute(...)           "ANCHOR" | "SCOPE" | "LAYOUT" | null, in that priority. With vision
+    //                                             off the cause is VISION_NOT_CONFIGURED (no model call at all) and
+    //                                             the routes also need the blind_copy opt-in.
+    //   static DecideBlindFallback(...)           Vision off: whether a target is worth activation and capture.
+    //   static OffersLayout(scope)                LAYOUT only beside this window's own Output scope rectangle.
     //   static LocateFailureCode(observation)     The model failure that permits a fallback, null on today's paths.
     //   static DropsEntry / FallsThrough / IsTransient(code)   Failure handling table of one fallback copy.
     //   static Rekey(stored, target, clientSize)  A LAYOUT anchor re-keyed to the current process.
@@ -220,17 +224,55 @@ namespace RemoteMonitorSlave
             return located.Code;
         }
 
+        // The cause once the model answered but no copy position came of it: the model's own failure code (a region whose
+        // Output boundary PowerSiVision could not confirm is already OUTPUT_REGION_UNCONFIRMED, its LocalFailure
+        // CROP_OUTPUT_REGION_BOUNDARY_UNCONFIRMED), or OUTPUT_REGION_UNCONFIRMED as well for a success-shaped locate whose
+        // region AnchorFromVision refused. Null only for no observation or a visibly empty pane (no input then).
+        internal static string RejectedLocateCode(PowerSiObservation located)
+        {
+            if (located == null || located.LocalVisibleEmpty) return null;
+            return LocateFailureCode(located) ?? "OUTPUT_REGION_UNCONFIRMED";
+        }
+
         internal static bool IsVisionFailure(string code)
         {
             return code != null && VisionFailures.Contains(code, StringComparer.Ordinal);
         }
 
-        internal static string DecideFallbackRoute(bool visionEnabled, bool autoCopyEnabled, bool copyAllowed, string locateCode,
-            bool processAnchor, bool scopeRect, bool layoutAnchor)
+        // LLM enabled but failed (server/model unavailable, timeout, a refused region, ...): the routes run with auto copy
+        // alone, as in 0.3.10. LLM switched off: its only cause is VISION_NOT_CONFIGURED and the routes additionally need
+        // the explicit blind_copy opt-in, because they activate PowerSI and send Ctrl+A/C without any model call.
+        internal static string DecideFallbackRoute(bool visionEnabled, bool autoCopyEnabled, bool blindCopyEnabled, bool copyAllowed,
+            string locateCode, bool processAnchor, bool scopeRect, bool layoutAnchor)
         {
-            if (!visionEnabled || !autoCopyEnabled || !copyAllowed || !IsVisionFailure(locateCode)) return null;
+            if (!autoCopyEnabled || !copyAllowed || !IsVisionFailure(locateCode)) return null;
+            if (!visionEnabled && (locateCode != "VISION_NOT_CONFIGURED" || !blindCopyEnabled)) return null;
             return processAnchor ? "ANCHOR" : scopeRect ? "SCOPE" : layoutAnchor ? "LAYOUT" : null;
         }
+
+        // Whether a direct read failure may be followed by input at all: any BUFFER_* failure without text (the scope-rect
+        // codes and BUFFER_OUTPUT_NO_HWND alike), but never after a timed-out or failed provider or a size refusal.
+        internal static bool ReadPermitsInput(OutputBufferResult read)
+        {
+            return read != null && read.Text == null && read.Code != null && read.Code.StartsWith("BUFFER_", StringComparison.Ordinal) &&
+                read.Code != "BUFFER_TIMEOUT" && read.Code != "BUFFER_WORKER_FAILED" && read.Code != "BUFFER_SIZE" &&
+                read.Code != "BUFFER_TOO_LARGE";
+        }
+
+        // Vision off, before any activation or capture: only with auto copy AND the blind_copy opt-in, a read failure that
+        // permits input, and an aim that can exist at the window's current client size (from the mode worker): this
+        // process's stored position keyed to that exact size, or a buffer-read Output scope rectangle that fits it. LAYOUT
+        // needs that rectangle too (OffersLayout). An entry stored at another client size alone never activates PowerSI.
+        internal static bool DecideBlindFallback(bool visionEnabled, bool autoCopyEnabled, bool blindCopyEnabled, bool copyAllowed,
+            bool processAnchorAtSize, bool scopeRectAtSize)
+        {
+            return !visionEnabled && autoCopyEnabled && blindCopyEnabled && copyAllowed && (processAnchorAtSize || scopeRectAtSize);
+        }
+
+        // LAYOUT borrows another window's stored point: offered only when this window's own Output scope rectangle is
+        // known, so the borrowed point must also fall inside it (InsideScope). A same-size window of another product
+        // (a PowerDC window shares the executable name) can then never aim this one's copy at another pane.
+        internal static bool OffersLayout(Rectangle scope) { return !scope.IsEmpty; }
 
         internal static bool DropsEntry(string code) { return code != null && DropCodes.Contains(code, StringComparer.Ordinal); }
 
@@ -477,25 +519,95 @@ namespace RemoteMonitorSlave
             foreach (var code in new[] { "AUTO_COPY_SCOPE_UNCONFIRMED", "AUTO_COPY_REQUEST_INVALID", "AUTO_COPY_ANCHOR_STALE" })
                 Need(!DropsEntry(code) && FallsThrough(code), "pre-input refusal falls through without a drop: " + code);
 
-            // Route decision table.
+            // Route decision table: DecideFallbackRoute(vision, autoCopy, blindCopy, copyAllowed, cause, anchor, scope, layout).
+            const string NotConfigured = "VISION_NOT_CONFIGURED";
             foreach (var code in VisionFailures)
             {
-                Need(DecideFallbackRoute(true, true, true, code, true, true, true) == "ANCHOR" &&
-                    DecideFallbackRoute(true, true, true, code, false, true, true) == "SCOPE" &&
-                    DecideFallbackRoute(true, true, true, code, false, false, true) == "LAYOUT" &&
-                    DecideFallbackRoute(true, true, true, code, false, false, false) == null, "route priority: " + code);
-                Need(DecideFallbackRoute(false, true, true, code, true, true, true) == null &&
-                    DecideFallbackRoute(true, false, true, code, true, true, true) == null &&
-                    DecideFallbackRoute(true, true, false, code, true, true, true) == null, "disabled or refused copy: " + code);
+                foreach (bool blind in new[] { false, true }) // LLM enabled: blind_copy never matters.
+                    Need(DecideFallbackRoute(true, true, blind, true, code, true, true, true) == "ANCHOR" &&
+                        DecideFallbackRoute(true, true, blind, true, code, false, true, true) == "SCOPE" &&
+                        DecideFallbackRoute(true, true, blind, true, code, false, false, true) == "LAYOUT" &&
+                        DecideFallbackRoute(true, true, blind, true, code, false, false, false) == null, "route priority: " + code);
+                // LLM off: only its own cause VISION_NOT_CONFIGURED, and only with the blind_copy opt-in.
+                Need(DecideFallbackRoute(false, true, true, true, code, true, true, true) == (code == NotConfigured ? "ANCHOR" : null) &&
+                    DecideFallbackRoute(false, true, false, true, code, true, true, true) == null &&
+                    DecideFallbackRoute(true, false, true, true, code, true, true, true) == null &&
+                    DecideFallbackRoute(true, true, true, false, code, true, true, true) == null, "disabled, gated or refused copy: " + code);
             }
             foreach (var code in new[] { null, "", "OUTPUT_READ", "VISION_CAPTURE_FAILED", "SC_PENDING", "NOT_OBSERVED", "vision_timeout" })
-                Need(DecideFallbackRoute(true, true, true, code, true, true, true) == null, "no fallback after: " + (code ?? "null"));
+                Need(DecideFallbackRoute(true, true, true, true, code, true, true, true) == null &&
+                    DecideFallbackRoute(false, true, true, true, code, true, true, true) == null, "no fallback after: " + (code ?? "null"));
+            // VISION_NOT_CONFIGURED with the LLM off × blind_copy: the routes only with the opt-in (and auto copy, and input).
+            Need(DecideFallbackRoute(false, true, true, true, NotConfigured, true, true, true) == "ANCHOR" &&
+                DecideFallbackRoute(false, true, true, true, NotConfigured, false, true, true) == "SCOPE" &&
+                DecideFallbackRoute(false, true, true, true, NotConfigured, false, false, true) == "LAYOUT" &&
+                DecideFallbackRoute(false, true, true, true, NotConfigured, false, false, false) == null, "LLM off, blind_copy on: route priority");
+            Need(DecideFallbackRoute(false, true, false, true, NotConfigured, true, true, true) == null &&
+                DecideFallbackRoute(false, true, false, true, NotConfigured, false, true, false) == null &&
+                DecideFallbackRoute(false, true, false, true, NotConfigured, false, false, true) == null, "LLM off, blind_copy off: no route");
+            Need(DecideFallbackRoute(false, false, true, true, NotConfigured, true, true, true) == null &&
+                DecideFallbackRoute(false, true, true, false, NotConfigured, true, true, true) == null &&
+                DecideFallbackRoute(false, false, false, false, NotConfigured, true, true, true) == null, "LLM off: auto copy off or input refused");
+            // LLM enabled but failed (including an enabled LLM whose settings are unusable) keeps the 0.3.10 rule: auto copy alone.
+            foreach (var code in new[] { "VISION_SERVER_UNAVAILABLE", "VISION_MODEL_UNAVAILABLE", "OUTPUT_REGION_UNCONFIRMED", NotConfigured })
+                Need(DecideFallbackRoute(true, true, false, true, code, false, true, false) == "SCOPE", "LLM enabled but failed, blind_copy off: " + code);
+            // LLM off, before any activation: the opt-in, auto copy, an input-permitting read and an aim at the current size.
+            Need(DecideBlindFallback(false, true, true, true, true, false) && DecideBlindFallback(false, true, true, true, false, true) &&
+                DecideBlindFallback(false, true, true, true, true, true) && !DecideBlindFallback(false, true, true, true, false, false) &&
+                !DecideBlindFallback(false, true, false, true, true, true) && !DecideBlindFallback(false, false, true, true, true, true) &&
+                !DecideBlindFallback(false, true, true, false, true, true) && !DecideBlindFallback(true, true, true, true, true, true),
+                "LLM off: activation only with the opt-in and an aim at this size");
+            var sized = new OutputAnchorStore(null);
+            OutputAnchorEntry atSize;
+            Need(sized.Store(OutputAnchorEntry.Create(Anchor(4321, 638000000000000000L, 2, size), "powersi", Text, learned)) &&
+                sized.TryGetProcessAnchor(4321, 638000000000000000L, 2, size, out atSize) &&
+                DecideBlindFallback(false, true, true, true, true, false) &&
+                !sized.TryGetProcessAnchor(4321, 638000000000000000L, 2, new Size(1280, 1009), out atSize) &&
+                !DecideBlindFallback(false, true, true, true, false, false), "an entry stored at another client size alone never activates");
+            // A windowless "Output" dock (BUFFER_OUTPUT_NO_HWND) aims SCOPE exactly like BUFFER_STANDARD_TEXT_NOT_FOUND, after a
+            // model failure and (with the opt-in) with the LLM off; BUFFER_OUTPUT_NOT_IDENTIFIED has no rectangle and no SCOPE.
+            OutputBufferResult Read(string readCode, string readDetail, string text = null)
+            { return new OutputBufferResult { Code = readCode, Method = "NATIVE_WM_GETTEXT", Detail = readDetail, Text = text }; }
+            var noHwnd = Read("BUFFER_OUTPUT_NO_HWND", "B1|37|0|0|143|R|315|735|300|265");
+            var customText = Read("BUFFER_STANDARD_TEXT_NOT_FOUND", "B1|37|1|0|0|R|315|735|300|265");
+            var notIdentified = Read("BUFFER_OUTPUT_NOT_IDENTIFIED", "B1|37|0|0|143");
+            foreach (var aimed in new[] { noHwnd, customText })
+            {
+                Rectangle fitted;
+                bool scope = PowerSiOutputBuffer.TryScopeRect(aimed.Detail, size, out fitted), permits = ReadPermitsInput(aimed);
+                bool smaller = PowerSiOutputBuffer.TryScopeRect(aimed.Detail, new Size(600, 400), out fitted);
+                Need(scope && !smaller && permits && DecideFallbackRoute(true, true, false, permits, "OUTPUT_REGION_UNCONFIRMED", false, scope, false) == "SCOPE" &&
+                    DecideFallbackRoute(true, true, false, permits, "VISION_TIMEOUT", false, scope, true) == "SCOPE" &&
+                    DecideFallbackRoute(false, true, true, permits, NotConfigured, false, scope, false) == "SCOPE" &&
+                    DecideFallbackRoute(false, true, false, permits, NotConfigured, false, scope, false) == null &&
+                    DecideBlindFallback(false, true, true, permits, false, scope) && !DecideBlindFallback(false, true, false, permits, false, scope) &&
+                    !DecideBlindFallback(false, true, true, permits, false, smaller) &&
+                    DecideFallbackRoute(true, false, true, permits, "VISION_TIMEOUT", false, scope, false) == null, "SCOPE route for " + aimed.Code);
+            }
+            Need(ReadPermitsInput(notIdentified) && !PowerSiOutputBuffer.HasScopeRect(notIdentified.Detail) &&
+                !DecideBlindFallback(false, true, true, true, false, false) &&
+                DecideFallbackRoute(true, true, true, true, "VISION_TIMEOUT", false, false, false) == null, "no rectangle, no SCOPE");
+            foreach (var refused in new[] { Read("BUFFER_TIMEOUT", "NONE"), Read("BUFFER_WORKER_FAILED", "NONE"), Read("BUFFER_SIZE", "NONE"),
+                Read("BUFFER_TOO_LARGE", "NONE"), Read("BUFFER_READ", "B1|2|1|1|0", "text"), Read("SC_PENDING", "NONE"), Read(null, "NONE"), null })
+                Need(!ReadPermitsInput(refused), "read refuses input: " + (refused?.Code ?? "null"));
             var success = PowerSiObservation.VisionLogExcerpt(null, learned);
             var empty = PowerSiObservation.VisionLogExcerpt(null, learned); empty.LocalVisibleEmpty = true;
             var unreadable = PowerSiObservation.VisionUnavailable("OUTPUT_UNAVAILABLE"); unreadable.LocalFailure = "LOCATE_OUTPUT_OUTPUT_UNREADABLE";
             var busy = PowerSiObservation.VisionUnavailable("VISION_BUSY");
             Need(LocateFailureCode(success) == null && LocateFailureCode(empty) == null && LocateFailureCode(null) == null &&
                 LocateFailureCode(unreadable) == "OUTPUT_UNAVAILABLE" && LocateFailureCode(busy) == "VISION_BUSY", "locate failure code");
+            // A model region refused by the crop boundary check, or a success-shaped locate refused by AnchorFromVision, is
+            // one model failure for the routes: OUTPUT_REGION_UNCONFIRMED (never AUTO_COPY_REGION_UNCONFIRMED as VisionCode).
+            var cropRefused = PowerSiObservation.VisionUnavailable("OUTPUT_REGION_UNCONFIRMED");
+            cropRefused.LocalFailure = "CROP_OUTPUT_REGION_BOUNDARY_UNCONFIRMED";
+            Need(RejectedLocateCode(cropRefused) == "OUTPUT_REGION_UNCONFIRMED" && RejectedLocateCode(success) == "OUTPUT_REGION_UNCONFIRMED" &&
+                RejectedLocateCode(busy) == "VISION_BUSY" && RejectedLocateCode(unreadable) == "OUTPUT_UNAVAILABLE" &&
+                RejectedLocateCode(empty) == null && RejectedLocateCode(null) == null && IsVisionFailure("OUTPUT_REGION_UNCONFIRMED") &&
+                !IsVisionFailure("AUTO_COPY_REGION_UNCONFIRMED"), "rejected locate code");
+            Need(DecideFallbackRoute(true, true, false, true, RejectedLocateCode(cropRefused), false, true, true) == "SCOPE" &&
+                DecideFallbackRoute(true, true, false, true, RejectedLocateCode(success), true, true, true) == "ANCHOR" &&
+                DecideFallbackRoute(true, true, false, true, RejectedLocateCode(cropRefused), false, false, false) == null &&
+                DecideFallbackRoute(true, true, false, true, RejectedLocateCode(empty), true, true, true) == null, "rejected region runs the routes");
 
             // LAYOUT re-keying and the scope guard.
             var target = new ProcessInventory { SessionId = 3, Items = new[] { new ProcessState { Pid = 8888, Name = "powersi",
@@ -508,6 +620,10 @@ namespace RemoteMonitorSlave
                     FullName = "PowerSI" } } }, size) == null, "re-key needs an exact size and a full identity");
             Need(InsideScope(rekeyed, Rectangle.Empty) && InsideScope(rekeyed, new Rectangle(300, 380, 700, 600)) &&
                 !InsideScope(rekeyed, new Rectangle(0, 0, 300, 300)) && !InsideScope(null, Rectangle.Empty), "scope guard");
+            // LAYOUT is offered only beside this window's own known scope (cross-product contamination guard); then the
+            // borrowed point must also fall inside that scope.
+            Need(!OffersLayout(Rectangle.Empty) && OffersLayout(new Rectangle(300, 380, 700, 600)) &&
+                OffersLayout(new Rectangle(0, 0, 300, 300)) && !InsideScope(rekeyed, new Rectangle(0, 0, 300, 300)), "layout scope guard");
             var detail = FallbackDetail("VISION_TIMEOUT", "AUTO_COPY_BODY_MOVED", null, "AUTO_COPY_READ");
             Need(detail == "FB|VISION=VISION_TIMEOUT|ANCHOR=AUTO_COPY_BODY_MOVED|SCOPE=NONE|LAYOUT=AUTO_COPY_READ" &&
                 Regex.IsMatch(detail, @"\A[A-Z0-9_:=,| -]{1,512}\z") &&
@@ -538,7 +654,7 @@ namespace RemoteMonitorSlave
                 Need(invalidUtf8.Store(first) && invalidUtf8.LastFileError == null && new OutputAnchorStore(file).Count == 1, "rewrite recovers the file");
             }
             finally { try { if (Directory.Exists(directory)) Directory.Delete(directory, true); } catch { } }
-            Console.WriteLine("PASS: output anchor store (format, continuity, keys, layout, prune, drop table, route table, file)");
+            Console.WriteLine("PASS: output anchor store (format, continuity, keys, layout, prune, drop table, route table incl. LLM off x blind_copy, layout scope guard, file)");
 
             // Report projection of each route and of an all-failed chain (SlaveForm owns the projection).
             SlaveForm.FallbackProjectionSelfTest();

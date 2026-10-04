@@ -44,6 +44,7 @@ namespace RemoteMonitorMaster
         private bool started, busy, closing, auditFailed;
         private int generation;
         private int activeRound;
+        private string resumedReason; // 직전 REQUEST_RESUMED의 사유 코드(UI 스레드 전용). NOTICE_ABORT 설명에만 씁니다.
         private int environmentRevision, approvedEnvironmentRevision, disposed;
         private bool environmentReady;
         private string environmentReason;
@@ -418,7 +419,10 @@ namespace RemoteMonitorMaster
                     "PREPARING BASELINE - do not send from the phone yet", false);
                 var result = await Task.Run(() =>
                 {
-                    // 답장 준비는 이 작업자 스레드에서 동기로 실행되므로 WATCHDOG_COMMAND 기록을 이 로그에 남깁니다.
+                    // 답장 준비는 이 작업자 스레드에서 동기로 실행되므로 WATCHDOG_COMMAND·PWRSI_TARGET 기록을 이 로그에 남깁니다.
+                    // 같은 로그에 수신 쪽 RECEIVE_HISTORY_SHIFTED(메신저가 위쪽 행을 정리해 기준 행을 다시 맞춤)·
+                    // RECEIVE_READY_SHIFTED(Ready 기준 행 재정렬)·RECEIVE_ACCEPTED_CANDIDATE_LOST(접수한 명령 행 소실)와
+                    // 세션 쪽 STATUS_ABORT_NOTICE_RESULT(중단 안내 전송 결과)가 남습니다. 모두 내용 없는 코드·개수·위치 값만 기록합니다.
                     if (operating)
                     {
                         using (ReadOnlyCommands.UseCommandLog(log))
@@ -638,6 +642,19 @@ namespace RemoteMonitorMaster
                 SetStatus("watchdog 알림을 보내는 중", false);
                 SetInteractionNotice("메신저 안내 전송 중 — 마우스·키보드를 건드리지 마세요.");
             }
+            else if (phase == "NOTICE_ABORT" || phase.StartsWith("NOTICE_ABORT:", StringComparison.Ordinal))
+            {
+                // 앞 부분이 정상 전송된 보고(CLEAN_PREFIX)가 중단된 뒤, 새 Ready 전에 중단 안내 한 건을 보내는 단계입니다.
+                // StatusSession은 "NOTICE_ABORT:<확인>/<준비>"(예: NOTICE_ABORT:12/40)를 넘깁니다. 접미사가 없거나 PartCounts 형식(숫자/숫자, 7자 이하)이 아니면 c/p 없이 표시합니다.
+                code.Text = "WAIT";
+                var counts = PartCounts(phase.Length > "NOTICE_ABORT:".Length ? phase.Substring("NOTICE_ABORT:".Length) : null);
+                SetStatus("중단 안내 전송 중" + (counts == null ? "" : " (확인된 부분 " + counts + ")"), false);
+                SetInteractionNotice("메신저 안내 전송 중 — 마우스·키보드를 건드리지 마세요.");
+                var why = ReasonLine(resumedReason);
+                details.Text = "이전 보고 전송이 중단되어" + (counts == null ? "" : " (" + counts + ")") +
+                    " 남은 부분을 보내지 않고 새 Ready를 보냅니다." + (why == null ? "" : " " + why) +
+                    "\r\n" + Explain("STATUS_REQUEST_ABORTED_CLEAN_PREFIX");
+            }
             else if (phase == "NOTICE_READY" || phase == "NOTICE_BUSY")
             {
                 code.Text = "WAIT";
@@ -652,12 +669,18 @@ namespace RemoteMonitorMaster
             }
             else if (phase == "REQUEST_RESUMED" || phase.StartsWith("REQUEST_RESUMED:", StringComparison.Ordinal))
             {
-                // 입력 전에 중단된 요청만 여기로 옵니다. 중단된 답장은 다시 보내지 않고 새 Ready만 보냅니다.
+                // 입력 전에 중단된 요청(UNTOUCHED_ROUND)과 앞 부분만 전송된 보고(CLEAN_PREFIX)가 여기로 옵니다. 중단된 답장은 다시 보내지 않고 새 Ready만 보냅니다.
+                // StatusSession은 실제 중단 사유 코드만 넘겨 두 경우를 여기서 구분할 수 없습니다. 앞 부분이 전송된 경우에는
+                // 곧바로 NOTICE_ABORT가 이어지며 그 분기가 상태 줄과 설명(c/p·남은 부분 미전송)을 바꿉니다.
                 code.Text = "WAIT";
                 var reason = phase.Length > "REQUEST_RESUMED:".Length ? phase.Substring("REQUEST_RESUMED:".Length) : null;
+                resumedReason = reason;
                 SetStatus("이전 요청이 입력 전에 중단되어 새 Ready로 다시 대기합니다" +
                     (reason == null ? "" : " (사유: " + reason + ")") + " — 중단된 요청은 다시 보내지 않습니다.", false);
                 SetInteractionNotice("새 Master Ready가 온 뒤에 명령을 다시 보내세요. 자동 재시도는 하지 않습니다.");
+                // 상태 줄은 두 줄까지만 보이므로 사유 설명은 설명 칸에 둡니다.
+                var resumedReasonLine = ReasonLine(reason);
+                if (resumedReasonLine != null) details.Text = "중단된 요청은 다시 보내지 않고 새 Ready 뒤의 새 명령만 처리합니다.\r\n" + resumedReasonLine;
             }
             else if (phase == "BASELINE")
             {
@@ -886,6 +909,25 @@ namespace RemoteMonitorMaster
             return end > prefix.Length && end - prefix.Length <= 64 ? result.Substring(prefix.Length, end - prefix.Length) : null;
         }
 
+        // 한 줄 사유 표시: "사유: 코드 — 설명". 설명이 없는 코드는 코드만, 코드가 없으면 null입니다(메시지 본문·창 제목은 쓰지 않습니다).
+        private static string ReasonLine(string reason)
+        {
+            if (string.IsNullOrEmpty(reason)) return null;
+            var explanation = Explain(reason);
+            return "사유: " + reason + (string.IsNullOrEmpty(explanation) ? "" : " — " + explanation);
+        }
+
+        // "확인/준비" 개수 접미사(예: 2/3)만 받습니다. 그 밖의 문자열은 무시해 상태 줄에 임의 텍스트가 나오지 않게 합니다.
+        private static string PartCounts(string text)
+        {
+            if (string.IsNullOrEmpty(text) || text.Length > 7) return null;
+            var slash = text.IndexOf('/');
+            if (slash < 1 || slash == text.Length - 1) return null;
+            for (var i = 0; i < text.Length; i++)
+                if (i != slash && (text[i] < '0' || text[i] > '9')) return null;
+            return text;
+        }
+
         // 사유 코드는 그대로 두고 다음 행동만 덧붙입니다. 모르는 코드는 null이며 코드만 표시합니다.
         private static string Explain(string reason)
         {
@@ -925,6 +967,18 @@ namespace RemoteMonitorMaster
                     return "요청이 연속 " + StatusSession.AbortResumeLimit + "회 중단되어 세션을 끝냈습니다. 새 세션을 시작하세요.";
                 case "STATUS_WATCHDOG_NOTICE_UNCERTAIN":
                     return "watchdog 알림 전송이 불확실하게 끝나 세션을 중단했습니다. 대화창에서 알림이 보였는지 확인한 뒤 새 세션을 시작하세요.";
+                case "STATUS_REQUEST_ABORTED_CLEAN_PREFIX": // STATUS_REQUEST_ABORTED resume_rule=CLEAN_PREFIX
+                    return "앞 부분은 정상 전송됐고 다음 부분은 입력 전에 중단되어, 남은 부분은 보내지 않고 중단 안내 뒤 새 Ready로 다시 대기합니다. 보내지 못한 Output은 다음 pwrsi에 포함됩니다.";
+                case "STATUS_ABORT_NOTICE_UNCERTAIN":
+                    return "보고 중단 안내 전송이 불확실하게 끝나 세션을 중단했습니다. 대화창에서 안내가 보였는지 확인한 뒤 새 세션을 시작하세요.";
+                case "RECEIVE_HISTORY_SHIFTED":
+                    return "메신저 목록이 위쪽 행을 정리해 기준 행 위치를 다시 맞췄습니다.";
+                case "RECEIVE_READY_SHIFTED":
+                    return "메신저 목록이 위쪽 행을 정리해 Ready 기준 행 위치를 다시 맞췄습니다 (정상 진행).";
+                case "RECEIVE_ACCEPTED_CANDIDATE_CHANGED":
+                    return "접수한 명령 행을 대화 기록에서 다시 확인하지 못해 남은 부분을 보내지 않았습니다.";
+                case "RECEIVE_ACCEPTED_CANDIDATE_LOST":
+                    return "수락한 명령 행을 다시 찾지 못해 전송을 중단했습니다.";
                 case "WATCHDOG_STATE_UNAVAILABLE":
                     return "내부 오류: 운용 세션의 watchdog 상태가 연결되지 않아 watchdog 명령을 처리하지 않았습니다. 로그 폴더의 최신 로그를 첨부해 문의하세요.";
                 case "ROUNDTRIP_PROOF_EXPIRED_OR_WINDOW_CHANGED":
@@ -941,8 +995,12 @@ namespace RemoteMonitorMaster
                 case "RECEIVE_BEGIN_FAILED":
                     return "예상하지 못한 오류로 중단했습니다. 로그 폴더의 최신 로그를 첨부해 문의하세요.";
             }
+            // 회신 직전 재관찰 실패는 감싼 수신 사유 코드의 설명을 씁니다(예: ..._RECEIVE_ACCEPTED_CANDIDATE_LOST).
+            if (reason.StartsWith("ROUNDTRIP_REOBSERVATION_FAILED_", StringComparison.Ordinal))
+                return Explain(reason.Substring("ROUNDTRIP_REOBSERVATION_FAILED_".Length));
             if (reason.StartsWith("TARGET_ROOT_", StringComparison.Ordinal))
                 return "선택한 대화창이 닫히거나 이동·변경되었습니다. 창을 움직이지 말고 새 세션을 시작하세요.";
+            // RECEIVE_HISTORY_SHIFTED와 RECEIVE_READY_SHIFTED는 위 switch에서 먼저 처리되므로 이 일반 중단 문구는 받지 않습니다.
             if (reason.StartsWith("RECEIVE_HISTORY_", StringComparison.Ordinal))
                 return "대화 기록의 구조가 바뀌어 안전을 위해 중단했습니다. 메시지 삭제·재정렬이 없었는지 확인하고 새 세션을 시작하세요.";
             if (reason.StartsWith("ENVIRONMENT_CHANGED", StringComparison.Ordinal))

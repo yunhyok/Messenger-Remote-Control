@@ -25,6 +25,9 @@ namespace RemoteMonitorLink
         // Slave-only: allow one click + Ctrl+A/Ctrl+C at a learned, re-verified Output position. Never used by the
         // vision client itself; the Slave reads it before starting its auto-copy worker.
         internal bool AutoCopyEnabled = true;
+        // Slave-only, explicit opt-in: with the LLM switched off, still let the LLM-free fallback (stored position, Output
+        // window structure) activate PowerSI and send Ctrl+A/C. Never true by default, by a reset or by a missing key.
+        internal bool BlindCopyEnabled = false;
 
         internal void Validate()
         {
@@ -38,7 +41,7 @@ namespace RemoteMonitorLink
         internal LocalVisionSettings Clone()
         {
             return new LocalVisionSettings { Enabled = Enabled, Port = Port, ModelId = ModelId,
-                ApiToken = ApiToken, TimeoutSeconds = TimeoutSeconds, AutoCopyEnabled = AutoCopyEnabled };
+                ApiToken = ApiToken, TimeoutSeconds = TimeoutSeconds, AutoCopyEnabled = AutoCopyEnabled, BlindCopyEnabled = BlindCopyEnabled };
         }
     }
 

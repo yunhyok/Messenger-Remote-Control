@@ -56,11 +56,17 @@ namespace RemoteMonitorMaster
     // Simple per-target DTO built by the caller from a Slave PowerSiReport.
     internal sealed class WatchdogReport
     {
+        // A Sigrity window in PowerDC mode (Slave: UNAVAILABLE / NONE / this code, nothing read or input). It is excluded by
+        // design, like a non-PowerSI process: never judged, never counted as unjudged, dropped from the watch list. Because
+        // the phone user armed that PID, the notice built from the same check says so (WatchdogText.CompletionNotice).
+        internal const string PowerDcModeCode = "TARGET_MODE_POWERDC";
+
         internal int Pid;
         internal long StartUtcTicks; // 0 when the Slave could not read the start time.
         internal string ProcessName;
         internal string State;
         internal string Source;
+        internal string Code;
         internal string OutputText;
 
         internal static WatchdogReport[] FromPowerSiReport(PowerSiReport report)
@@ -69,7 +75,7 @@ namespace RemoteMonitorMaster
             return report.Targets.Where(target => target != null).Select(target => new WatchdogReport
             {
                 Pid = target.Pid, StartUtcTicks = target.StartUtcTicks ?? 0, ProcessName = target.ProcessName,
-                State = target.State, Source = target.Source, OutputText = target.OutputText
+                State = target.State, Source = target.Source, Code = target.Code, OutputText = target.OutputText
             }).ToArray();
         }
 
@@ -116,6 +122,7 @@ namespace RemoteMonitorMaster
         internal const string OutcomeNoMarkers = "NO_MARKERS";
         internal const string OutcomeUnjudgeable = "UNJUDGEABLE";
         internal const string OutcomeMissing = "MISSING";
+        internal const string OutcomePowerDcExcluded = "POWERDC_EXCLUDED"; // Removed with a notice line; never unjudged.
         internal const string ReportStateAbsent = "ABSENT"; // Master-local label: no record for this PID.
 
         internal WatchdogTarget Target; // Copy after this check.
@@ -133,6 +140,7 @@ namespace RemoteMonitorMaster
         internal WatchdogTargetOutcome[] Outcomes = new WatchdogTargetOutcome[0];
         internal WatchdogTargetOutcome[] Finished = new WatchdogTargetOutcome[0];
         internal WatchdogTargetOutcome[] Missing = new WatchdogTargetOutcome[0];
+        internal WatchdogTargetOutcome[] PowerDcExcluded = new WatchdogTargetOutcome[0];
         internal int Remaining;
         internal bool AllCleared;
         internal WatchdogTargetOutcome[] UnjudgedStreakReached = new WatchdogTargetOutcome[0];
@@ -151,6 +159,7 @@ namespace RemoteMonitorMaster
         private TimeSpan interval;
         private int failureStreak;
         private int unjudgedWarningsSent;
+        private int powerDcExcluded; // PowerDC-mode windows dropped since the watch list was last empty.
         private string lastFailureReason;
         private string lastClearReason;
 
@@ -338,6 +347,7 @@ namespace RemoteMonitorMaster
             var outcomes = new List<WatchdogTargetOutcome>();
             var finished = new List<WatchdogTargetOutcome>();
             var missing = new List<WatchdogTargetOutcome>();
+            var excluded = new List<WatchdogTargetOutcome>();
             var reached = new List<WatchdogTargetOutcome>();
             lock (sync)
             {
@@ -354,6 +364,8 @@ namespace RemoteMonitorMaster
                     bool unjudged = false;
                     if (report == null ? absentMeansMissing : report.StartUtcTicks > 0 && report.StartUtcTicks != entry.StartUtcTicks)
                         outcome.Outcome = WatchdogTargetOutcome.OutcomeMissing;
+                    else if (report != null && report.Code == WatchdogReport.PowerDcModeCode)
+                        outcome.Outcome = WatchdogTargetOutcome.OutcomePowerDcExcluded; // Excluded by design, not uncertain.
                     else if (report == null || report.StartUtcTicks <= 0 || report.State != "READ" ||
                         !PowerSiCompletion.IsJudgeableSource(report.Source))
                     {
@@ -399,19 +411,23 @@ namespace RemoteMonitorMaster
 
                     if (outcome.Outcome == WatchdogTargetOutcome.OutcomeFinished) finished.Add(outcome);
                     else if (outcome.Outcome == WatchdogTargetOutcome.OutcomeMissing) missing.Add(outcome);
+                    else if (outcome.Outcome == WatchdogTargetOutcome.OutcomePowerDcExcluded) excluded.Add(outcome);
                     else if (unjudged && entry.ConsecutiveUnjudged == UnjudgedWarningThreshold) reached.Add(outcome);
                     if (outcome.Outcome == WatchdogTargetOutcome.OutcomeFinished ||
-                        outcome.Outcome == WatchdogTargetOutcome.OutcomeMissing) entries.Remove(entry.Pid);
+                        outcome.Outcome == WatchdogTargetOutcome.OutcomeMissing ||
+                        outcome.Outcome == WatchdogTargetOutcome.OutcomePowerDcExcluded) entries.Remove(entry.Pid);
                 }
 
                 failureStreak = 0;
                 lastFailureReason = null;
                 bool allCleared = outcomes.Count > 0 && entries.Count == 0;
-                if (allCleared) ResetLocked("ALL_CLEARED");
+                if (allCleared) ResetLocked(finished.Count + missing.Count == 0 ? "POWERDC_EXCLUDED" : "ALL_CLEARED");
+                else if (powerDcExcluded <= int.MaxValue - excluded.Count) powerDcExcluded += excluded.Count;
                 return new WatchdogCheckResult
                 {
                     Outcomes = outcomes.ToArray(), Finished = finished.ToArray(), Missing = missing.ToArray(),
-                    Remaining = entries.Count, AllCleared = allCleared, UnjudgedStreakReached = reached.ToArray()
+                    PowerDcExcluded = excluded.ToArray(), Remaining = entries.Count, AllCleared = allCleared,
+                    UnjudgedStreakReached = reached.ToArray()
                 };
             }
         }
@@ -434,8 +450,11 @@ namespace RemoteMonitorMaster
             int count, intervalMinutes, streak;
             DateTime? next;
             ReadSchedule(out count, out next, out intervalMinutes, out streak);
-            if (count == 0 || !next.HasValue) return "감시 없음";
+            if (count == 0 || !next.HasValue) return LastClearReason == "POWERDC_EXCLUDED" ? "감시 없음 (PowerDC 창 제외)" : "감시 없음";
             string text = "감시 " + Number(count) + "개 · 다음 확인 " + WatchdogText.NextCheckClock(next.Value, nowLocal);
+            int excludedCount;
+            lock (sync) excludedCount = powerDcExcluded;
+            if (excludedCount > 0) text += " · PowerDC 창 제외 " + Number(excludedCount) + "개";
             return streak > 0 ? text + " · 조회 실패 " + Number(streak) + "회 연속" : text;
         }
 
@@ -449,6 +468,7 @@ namespace RemoteMonitorMaster
             entries.Clear();
             failureStreak = 0;
             unjudgedWarningsSent = 0;
+            powerDcExcluded = 0;
             lastFailureReason = null;
             lastClearReason = reason;
         }
@@ -727,6 +747,7 @@ namespace RemoteMonitorMaster
         internal const string KindUnjudgeable = "UNJUDGEABLE";
         private const string Prefix = "WATCHDOG ";
         private const string CompletionTitle = "완료 알림";
+        private const string ExclusionTitle = "감시 제외"; // A check that only excluded PowerDC-mode windows.
         private const string WarningTitle = "경고";
         private const int ListBudget = 480;
         private const int MaxReasonText = 200;
@@ -811,7 +832,8 @@ namespace RemoteMonitorMaster
                 "watchdog off는 모든 감시를, watchdog off <PID>는 해당 감시를 해제합니다. " +
                 "Master 설정 간격(30분 또는 60분)마다 PowerSI Output을 수집해 버퍼·자동 복사 Output 끝에 AFS Finished와 " +
                 "Total Sampling Points가 보이면 알리고 그 대상을 해제하며, 모두 끝나면 watchdog이 꺼집니다. " +
-                "Pending·수집 실패·OCR은 완료로 판정하지 않으며 Master Stop 시 감시가 끝납니다.";
+                "Pending·수집 실패·OCR은 완료로 판정하지 않으며 Master Stop 시 감시가 끝납니다. " +
+                "PowerDC 모드 창은 Output 수집 대상이 아니어서 감시에서 제외하고 그 PID를 알립니다.";
         }
 
         internal static string HelpUsage()
@@ -825,7 +847,8 @@ namespace RemoteMonitorMaster
             if (result == null || state == null) throw new ArgumentNullException(result == null ? "result" : "state");
             WatchdogTargetOutcome[] finished = result.Finished ?? new WatchdogTargetOutcome[0];
             WatchdogTargetOutcome[] missing = result.Missing ?? new WatchdogTargetOutcome[0];
-            if (finished.Length == 0 && missing.Length == 0) return new string[0];
+            WatchdogTargetOutcome[] excluded = result.PowerDcExcluded ?? new WatchdogTargetOutcome[0];
+            if (finished.Length == 0 && missing.Length == 0 && excluded.Length == 0) return new string[0];
 
             var lines = new List<string>();
             foreach (WatchdogTargetOutcome outcome in finished)
@@ -833,10 +856,21 @@ namespace RemoteMonitorMaster
                     outcome.SamplingPoints.ToString(CultureInfo.InvariantCulture) + " (출처: " + SourceName(outcome.Source) + ")");
             foreach (WatchdogTargetOutcome outcome in missing)
                 lines.Add(TargetLabel(outcome.Target) + ": 종료되었거나 다시 시작되어 감시를 해제했습니다");
+            // An armed PID never disappears silently: one line per PowerDC-mode window excluded by this check.
+            foreach (WatchdogTargetOutcome outcome in excluded)
+                lines.Add(PowerDcExclusionLine(outcome.Target == null ? 0 : outcome.Target.Pid));
+            bool onlyExcluded = finished.Length == 0 && missing.Length == 0;
             if (state.Count == 0)
-                lines.Add(result.AllCleared && missing.Length == 0 ? "모든 대상 완료 — watchdog 꺼짐" : "남은 감시 없음 — watchdog 꺼짐");
+                lines.Add(onlyExcluded ? "남은 감시 대상이 모두 PowerDC 창이어서 제외했습니다 — watchdog 꺼짐" :
+                    result.AllCleared && missing.Length == 0 && excluded.Length == 0 ? "모든 대상 완료 — watchdog 꺼짐" :
+                    "남은 감시 없음 — watchdog 꺼짐");
             else lines.Add(TailLine(state, nowLocal));
-            return Pack(marker, CompletionTitle, lines);
+            return Pack(marker, onlyExcluded ? ExclusionTitle : CompletionTitle, lines);
+        }
+
+        internal static string PowerDcExclusionLine(int pid)
+        {
+            return "PID " + Number(pid) + ": PowerDC 창으로 확인되어 감시에서 제외";
         }
 
         internal static string[] WarningNotice(string marker, string kind, string detail, WatchdogState state, DateTime nowLocal)
@@ -1496,6 +1530,101 @@ namespace RemoteMonitorMaster
             WatchdogSettings.RunSelfTest();
             WatchdogState.RunSelfTest();
             WatchdogText.RunSelfTest();
+            RunPowerDcExclusionSelfTest();
+        }
+
+        // A PowerDC-mode window is excluded by design: one notice line per excluded PID, never unjudged, never a warning.
+        private static void RunPowerDcExclusionSelfTest()
+        {
+            const string marker = "M345678";
+            const string finished = "AFS Current Frequency ( GHz ) = 1\nAFS Finished\nTotal Sampling Points = 118\n";
+            const string running = "AFS Current Frequency ( GHz ) = 1\n";
+            DateTime t0 = new DateTime(2026, 9, 23, 12, 0, 0, DateTimeKind.Utc);
+            DateTime nowLocal = t0.ToLocalTime();
+            long start = t0.AddHours(-1).Ticks;
+            WatchdogTarget Watched(int pid) { return new WatchdogTarget(pid, start + pid, "PowerSI"); }
+            WatchdogReport Read(int pid, string output)
+            {
+                return new WatchdogReport { Pid = pid, StartUtcTicks = start + pid, ProcessName = "PowerSI", State = "READ",
+                    Source = "BUFFER", Code = "BUFFER_READ", OutputText = output };
+            }
+            WatchdogReport PowerDc(int pid)
+            {
+                return new WatchdogReport { Pid = pid, StartUtcTicks = start + pid, ProcessName = "PowerSI", State = "UNAVAILABLE",
+                    Source = "NONE", Code = WatchdogReport.PowerDcModeCode, OutputText = string.Empty };
+            }
+
+            // Completed + PowerDC: one completion notice with the completion line and the exclusion line.
+            var mixed = new WatchdogState(TimeSpan.FromMinutes(30));
+            mixed.Arm(new[] { Watched(101), Watched(202) }, null, t0);
+            WatchdogCheckResult check = mixed.ApplyCheck(new[] { Read(101, finished), PowerDc(202) }, t0.AddMinutes(30));
+            string[] notice = WatchdogText.CompletionNotice(marker, check, mixed, nowLocal);
+            Need(check.Finished.Length == 1 && check.Missing.Length == 0 && check.UnjudgedStreakReached.Length == 0 &&
+                check.PowerDcExcluded.Length == 1 && check.PowerDcExcluded[0].Target.Pid == 202 &&
+                check.PowerDcExcluded[0].ConsecutiveUnjudged == 0 && check.AllCleared && !mixed.IsArmed &&
+                mixed.LastClearReason == "ALL_CLEARED" && notice.Length == 1 && notice[0] == "WATCHDOG M345678 | 완료 알림\r\n" +
+                    "PowerSI (PID 101): AFS Finished, Total Sampling Points = 118 (출처: 버퍼)\r\n" +
+                    "PID 202: PowerDC 창으로 확인되어 감시에서 제외\r\n남은 감시 없음 — watchdog 꺼짐" &&
+                WatchdogText.IsNotice(notice[0]), "POWERDC_WITH_COMPLETED");
+
+            // Only PowerDC: one notice that names the PID and says the watchdog turned off; no unjudged warning.
+            var only = new WatchdogState(TimeSpan.FromMinutes(30));
+            only.Arm(new[] { Watched(303) }, null, t0);
+            check = only.ApplyCheck(new[] { PowerDc(303) }, t0.AddMinutes(30));
+            notice = WatchdogText.CompletionNotice(marker, check, only, nowLocal);
+            Need(check.Outcomes.Length == 1 && check.Outcomes[0].Outcome == WatchdogTargetOutcome.OutcomePowerDcExcluded &&
+                check.Finished.Length == 0 && check.Missing.Length == 0 && check.UnjudgedStreakReached.Length == 0 &&
+                check.PowerDcExcluded.Length == 1 && notice.Length == 1 && notice[0] == "WATCHDOG M345678 | 감시 제외\r\n" +
+                    "PID 303: PowerDC 창으로 확인되어 감시에서 제외\r\n남은 감시 대상이 모두 PowerDC 창이어서 제외했습니다 — watchdog 꺼짐" &&
+                WatchdogText.IsNotice(notice[0]) &&
+                WatchdogText.WarningNotice(marker, WatchdogText.KindUnjudgeable,
+                    WatchdogText.UnjudgedDetail(check.UnjudgedStreakReached), only, nowLocal).Length == 0 &&
+                !only.IsArmed && only.NextCheckUtc == null && only.FailureStreak == 0 && only.LastClearReason == "POWERDC_EXCLUDED" &&
+                only.Summary(nowLocal) == "감시 없음 (PowerDC 창 제외)", "POWERDC_ONLY_ONE_NOTICE");
+            // The exclusion-only notice goes through the same one-use watchdog notice consent as completion/warning notices.
+            string[] consentText = WatchdogText.CompletionNotice("D345678", check, only, nowLocal);
+            var consent = SupervisedSendTest.Consent.ForWatchdogNotice("D345678", consentText[0]);
+            Need(consent.IsAuthorizedReply(consentText[0]) && consent.TryConsume(consentText[0]) && !consent.TryConsume(consentText[0]),
+                "POWERDC_NOTICE_CONSENT");
+
+            // A remaining target keeps its own judgement; the PowerDC window never builds an unjudged streak, and its
+            // exclusion is announced once, by the check that excluded it.
+            var kept = new WatchdogState(TimeSpan.FromMinutes(30));
+            kept.Arm(new[] { Watched(404), Watched(505) }, null, t0);
+            for (int round = 1; round <= WatchdogState.UnjudgedWarningThreshold + 1; round++)
+            {
+                check = kept.ApplyCheck(new[] { Read(404, running), PowerDc(505) }, t0.AddMinutes(30 * round));
+                notice = WatchdogText.CompletionNotice(marker, check, kept, nowLocal);
+                Need(check.UnjudgedStreakReached.Length == 0 && check.Finished.Length == 0 && check.Missing.Length == 0 &&
+                    check.Remaining == 1 && check.Outcomes[0].Outcome == WatchdogTargetOutcome.OutcomeRunning &&
+                    check.Outcomes[0].ConsecutiveUnjudged == 0 && (round == 1 ? notice.Length == 1 &&
+                        notice[0].StartsWith("WATCHDOG M345678 | 감시 제외\r\nPID 505: PowerDC 창으로 확인되어 감시에서 제외\r\n남은 감시 1개 | 다음 확인 ",
+                            StringComparison.Ordinal) : notice.Length == 0), "POWERDC_NEVER_UNJUDGED");
+            }
+            Need(kept.Count == 1 && kept.Summary(nowLocal).Contains(" · PowerDC 창 제외 1개"), "POWERDC_SUMMARY");
+            kept.ClearAll("SESSION_END");
+            Need(kept.Summary(nowLocal) == "감시 없음", "POWERDC_SUMMARY_CLEARED");
+
+            // A different start time is a restarted process first (MISSING), whatever its mode now.
+            var restarted = new WatchdogState(TimeSpan.FromMinutes(30));
+            restarted.Arm(new[] { Watched(606) }, null, t0);
+            WatchdogReport moved = PowerDc(606);
+            moved.StartUtcTicks++;
+            check = restarted.ApplyCheck(new[] { moved }, t0.AddMinutes(30));
+            Need(check.Missing.Length == 1 && check.PowerDcExcluded.Length == 0, "RESTARTED_IS_MISSING_FIRST");
+
+            WatchdogReport[] converted = WatchdogReport.FromPowerSiReport(new PowerSiReport
+            {
+                CapturedUtc = t0, Targets = new[] { new PowerSiTargetReport { Pid = 7, StartUtcTicks = start, ProcessName = "PowerSI",
+                    State = "UNAVAILABLE", Source = "NONE", Code = WatchdogReport.PowerDcModeCode,
+                    BufferCode = WatchdogReport.PowerDcModeCode, OutputText = string.Empty } }
+            });
+            Need(converted.Length == 1 && converted[0].Code == WatchdogReport.PowerDcModeCode, "FROM_REPORT_CODE");
+        }
+
+        private static void Need(bool condition, string reason)
+        {
+            if (!condition) throw new InvalidOperationException("Watchdog PowerDC self-test failed: " + reason + ".");
         }
     }
 }
