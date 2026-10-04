@@ -24,12 +24,15 @@ namespace RemoteMonitorSlave
 
         internal static bool TryRunWorker(string[] args)
         {
-            if (args.Length == 0 || (args[0] != Argument && args[0] != CopyArgument && args[0] != OutputAutoCopy.WorkerArgument)) return false;
+            if (args.Length == 0 || (args[0] != Argument && args[0] != CopyArgument && args[0] != OutputAutoCopy.WorkerArgument &&
+                args[0] != PowerSiTargetMode.WorkerArgument)) return false;
             OutputBufferResult result;
             try
             {
                 // The auto-copy verb owns its own window resolution, live re-checks and failure codes.
                 if (args[0] == OutputAutoCopy.WorkerArgument) result = OutputAutoCopy.RunWorker(args);
+                // Read-only PowerSI/PowerDC window-mode scan (UIA Names compared in this worker only).
+                else if (args[0] == PowerSiTargetMode.WorkerArgument) result = PowerSiTargetMode.RunWorker(args);
                 else
                 {
                     var targetArgs = args[0] == CopyArgument ? args.Take(3).ToArray() : args;

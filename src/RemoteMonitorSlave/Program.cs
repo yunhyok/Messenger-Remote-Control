@@ -23,6 +23,7 @@ namespace RemoteMonitorSlave
                 {
                     LinkSelfTest.Run(); PowerSiOutputBuffer.SelfTest(); OutputBufferCapture.SelfTest();
                     OutputAnchorStore.SelfTest(); // Vision-failure fallback: store, route table and report projection.
+                    PowerSiTargetMode.SelfTest(); // PowerDC window exclusion: classifier, worker result and report projection.
                     Console.WriteLine(DiagnosticBundle.SelfTest());
                     SlaveForm.SelfTest();
                     Console.WriteLine("PASS: Slave status link and UI checks");
@@ -142,6 +143,17 @@ namespace RemoteMonitorSlave
             lock (gate)
                 File.AppendAllText(Path, DateTime.UtcNow.ToString("O") + " version=" + LinkVersion.AppValue +
                     " code=OUTPUT_BUFFER" + metadata + Environment.NewLine, new UTF8Encoding(false));
+        }
+
+        // The direct WM_GETTEXT result as read, before a copy, a fallback or a deadline replaces the target's code.
+        // Same validated metadata as OUTPUT_BUFFER (code, method, counts, B1 detail); the text itself is never written.
+        internal void WriteOutputBufferRead(int pid, OutputBufferResult result)
+        {
+            var metadata = OutputBufferCapture.LogMetadata(result);
+            lock (gate)
+                File.AppendAllText(Path, DateTime.UtcNow.ToString("O") + " version=" + LinkVersion.AppValue +
+                    " code=OUTPUT_BUFFER_READ pid=" + pid.ToString(System.Globalization.CultureInfo.InvariantCulture) + metadata +
+                    Environment.NewLine, new UTF8Encoding(false));
         }
     }
 }

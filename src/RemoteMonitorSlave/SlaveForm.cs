@@ -45,7 +45,10 @@ namespace RemoteMonitorSlave
             internal string FallbackVision;
             internal string Fallback;
             internal string Route;
+            // The direct WM_GETTEXT read's own code, kept when a copy, a fallback or a deadline later replaces Buffer.
+            internal string DirectCode;
             public override string ToString() { return "PID " + Process.Pid + " / " + (Buffer?.Code ?? "대기") +
+                (Buffer?.Code == PowerSiTargetMode.PowerDcCode ? " · PowerDC 창 제외" : "") +
                 (Route != null ? " · 대체 복사 " + Route : Fallback != null ? " · 대체 복사 실패" : "") + " / OCR " +
                 (Vision?.LocalVisibleEmpty == true ? "보이는 내용 없음" : Vision?.LocalFailure != null ? "실패 (상세 확인)" : Vision?.Code ?? "없음"); }
         }
@@ -99,7 +102,7 @@ namespace RemoteMonitorSlave
         private readonly bool visionSettingsReset;
         // What the last answered Master request served, for the completion line only (no protocol change).
         private string lastServedKind;
-        private int lastServedTargets = -1, lastServedPending = -1;
+        private int lastServedTargets = -1, lastServedPending = -1, lastServedPowerDc = -1;
         // Reason of the request that just failed inside the Slave, kept for the CLIENT_REJECTED that follows it.
         private string lastRequestFailure;
         private string pairingText;
@@ -371,7 +374,8 @@ namespace RemoteMonitorSlave
                     remoteProgress.Stop(); remoteClock = null;
                     ShowActivity("Master 요청 처리 완료 — " + (lastServedKind ?? "요청") + " / " + (++statusReplies) + "회째 / " +
                         DateTime.Now.ToString("HH:mm:ss") +
-                        (lastServedTargets < 0 ? "" : " / 대상 " + lastServedTargets + "개 · Pending " + lastServedPending + "개"));
+                        (lastServedTargets < 0 ? "" : " / 대상 " + lastServedTargets + "개 · Pending " + lastServedPending + "개") +
+                        (lastServedPowerDc > 0 ? " · PowerDC 창 " + lastServedPowerDc + "개 제외" : ""));
                     break;
                 case "COLLECT_FAILED":
                     remoteProgress.Stop(); remoteClock = null;
@@ -549,6 +553,7 @@ namespace RemoteMonitorSlave
             lastServedKind = kind;
             lastServedTargets = report?.Targets == null ? -1 : report.Targets.Length;
             lastServedPending = report?.Targets == null ? -1 : report.Targets.Count(item => item.State == "PENDING");
+            lastServedPowerDc = report?.Targets == null ? -1 : report.Targets.Count(item => item.Code == PowerSiTargetMode.PowerDcCode);
         }
 
         private void RenderSnapshot(ProcessInventory inventory, DateTime sampledAt, string source)
@@ -716,7 +721,9 @@ namespace RemoteMonitorSlave
                 aims.Process = entry;
             Rectangle scope;
             if (PowerSiOutputBuffer.TryScopeRect(bufferRead?.Detail, size, out scope)) aims.Scope = scope;
-            if (anchorStore.TryGetLayoutAnchor(sample.Process.Name, size, sample.Process.Pid, out entry)) aims.Layout = entry;
+            // Another window's point only beside this window's own Output scope, which the point must then fall inside.
+            if (OutputAnchorStore.OffersLayout(aims.Scope) &&
+                anchorStore.TryGetLayoutAnchor(sample.Process.Name, size, sample.Process.Pid, out entry)) aims.Layout = entry;
             return aims;
         }
 
@@ -772,7 +779,7 @@ namespace RemoteMonitorSlave
                 // A further route only while this target can still afford one whole guarded copy.
                 if (codes.Count > 0 && remainingMilliseconds() < OutputAutoCopy.BudgetMilliseconds + 2000) break;
                 try { log.Write("OUTPUT_FALLBACK_BEGIN", "pid=" + pid + " route=" + route + " vision=" + LogValue(visionCode)); } catch { }
-                ShowActivity(prefix + " / 비전 실패(" + visionCode + ") → " + OutputAnchorStore.RouteCaption(route) + " 복사 시도");
+                ShowActivity(prefix + " / " + FallbackCause(visionCode) + " → " + OutputAnchorStore.RouteCaption(route) + " 복사 시도");
                 OutputAnchor anchor = route == "ANCHOR" ? aims.Process.Anchor
                     : route == "SCOPE" ? OutputAutoCopy.AnchorFromScope(frame, aims.Scope, target, deadline)
                     : OutputAnchorStore.Rekey(aims.Layout.Anchor, target, frame.PixelSize);
@@ -825,9 +832,34 @@ namespace RemoteMonitorSlave
         private static string FallbackSummary(OutputSample sample)
         {
             if (sample?.Fallback == null) return null;
-            return "비전 실패(" + (sample.FallbackVision ?? "?") + ") → " + (sample.Route != null
+            return FallbackCause(sample.FallbackVision) + " → " + (sample.Route != null
                 ? OutputAnchorStore.RouteCaption(sample.Route) + " 복사 성공"
                 : "대체 복사 실패(" + (sample.Buffer?.Code ?? "?") + ")");
+        }
+
+        // Vision off or unconfigured made no model call at all; every other cause is a model failure.
+        private static string FallbackCause(string visionCode)
+        {
+            return (visionCode == "VISION_NOT_CONFIGURED" ? "LLM 미설정(" : "비전 실패(") + (visionCode ?? "?") + ")";
+        }
+
+        // A positively identified PowerDC window: nothing was read, captured or typed, and it never lends or keeps a stored
+        // Output position (a LAYOUT candidate of the same size would otherwise aim a PowerSI copy at PowerDC geometry).
+        private void ExcludePowerDc(OutputSample sample)
+        {
+            sample.Buffer = new OutputBufferResult { Code = PowerSiTargetMode.PowerDcCode, Method = "NONE", Detail = "NONE" };
+            sample.ReceivedUtc = DateTime.UtcNow;
+            try
+            {
+                if (sample.Process.StartUtcTicks.HasValue &&
+                    anchorStore.Drop(sample.Process.Pid, sample.Process.StartUtcTicks.Value, PowerSiTargetMode.PowerDcCode) > 0)
+                {
+                    log.Write("OUTPUT_ANCHOR_DROPPED", "pid=" + sample.Process.Pid.ToString(CultureInfo.InvariantCulture) +
+                        " reason=" + PowerSiTargetMode.PowerDcCode);
+                    UpdateAnchorState();
+                }
+            }
+            catch { } // Position bookkeeping never changes the exclusion itself.
         }
 
         // Only a vision-confirmed clean copy teaches a position; it is also the LAYOUT candidate for other PIDs of this size.
@@ -906,41 +938,75 @@ namespace RemoteMonitorSlave
                         {
                             sample.Vision = null;
                             log.Write("OUTPUT_TARGET_BEGIN", "pid=" + sample.Process.Pid + " start=" + (sample.Process.StartUtcTicks ?? 0));
-                            ShowActivity(prefix + " / 창 확인 → Output 위치 찾기 → 자동 복사 → OCR");
+                            ShowActivity(prefix + " / 창 종류 확인 → 창 확인 → Output 위치 찾기 → 자동 복사 → OCR");
                             PowerSiFrame frame = null;
                             PowerSiObservation located = null;
                             bool autoCopy = visionSettings.Enabled && visionSettings.AutoCopyEnabled;
-                            bool fallbackAttempted = false;
+                            bool fallbackAttempted = false, blindFallback = false;
                             List<KeyValuePair<Form, FormWindowState>> hidden = null;
                             try
                             {
+                                // PowerSI and PowerDC share one executable. Before any read, capture or input, a window that
+                                // positively shows PowerDC is excluded; any doubt or failure (UNKNOWN) collects as before.
+                                var modeClock = Stopwatch.StartNew();
+                                var mode = await PowerSiTargetMode.DetectAsync(target, deadline.Token);
+                                try { log.Write("OUTPUT_TARGET_MODE", PowerSiTargetMode.LogDetail(sample.Process.Pid, mode, modeClock.ElapsedMilliseconds)); } catch { }
+                                if (mode.Pending) throw new InvalidDataException("SC_PENDING");
+                                if (mode.IsPowerDc)
+                                {
+                                    ExcludePowerDc(sample);
+                                    continue;
+                                }
                                 // The response probe is independent of image inference and always precedes collection.
                                 sample.Buffer = await ResponsiveStep(target, deadline.Token,
                                     () => OutputBufferCapture.ReadAsync(target, deadline.Token));
+                                sample.DirectCode = sample.Buffer.Code;
                                 sample.ReceivedUtc = DateTime.UtcNow;
+                                // The original direct-read code (and its B1 detail) stays in the log whatever replaces it later.
+                                try { log.WriteOutputBufferRead(sample.Process.Pid, sample.Buffer); } catch { }
                                 if (IsPending(sample.Buffer.Code)) throw new InvalidDataException("SC_PENDING");
-                                if (!visionSettings.Enabled || (remote && sample.Buffer.Text != null))
+                                // A timed-out text provider is not permission to try input against the same application.
+                                bool copyAllowed = sample.Buffer.Text == null &&
+                                    sample.Buffer.Code.StartsWith("BUFFER_", StringComparison.Ordinal) &&
+                                    sample.Buffer.Code != "BUFFER_TIMEOUT" && sample.Buffer.Code != "BUFFER_WORKER_FAILED" &&
+                                    sample.Buffer.Code != "BUFFER_SIZE" && sample.Buffer.Code != "BUFFER_TOO_LARGE";
+                                // LLM off or not configured: the LLM-free routes still run when auto copy is on, the read failure
+                                // permits input and an aim may exist (own stored position or Output scope rectangle). Otherwise
+                                // exactly as before: no capture, no input.
+                                blindFallback = OutputAnchorStore.DecideBlindFallback(visionSettings.Enabled, visionSettings.AutoCopyEnabled,
+                                    copyAllowed, sample.Process.StartUtcTicks.HasValue && anchorStore.HasProcessEntry(sample.Process.Pid,
+                                        sample.Process.StartUtcTicks.Value, sample.SessionId), PowerSiOutputBuffer.HasScopeRect(sample.Buffer.Detail));
+                                if ((!visionSettings.Enabled && !blindFallback) || (remote && sample.Buffer.Text != null))
                                 {
                                     sample.Vision = PowerSiObservation.VisionUnavailable(visionSettings.Enabled ? "OUTPUT_UNAVAILABLE" : "VISION_NOT_CONFIGURED");
                                     continue;
                                 }
                                 if (new[] { "BUFFER_TIMEOUT", "BUFFER_WORKER_FAILED", "BUFFER_SIZE", "BUFFER_TOO_LARGE" }.Contains(sample.Buffer.Code))
                                     continue;
-                                frame = autoCopy
+                                frame = autoCopy || blindFallback
                                     ? await ResponsiveStep(target, deadline.Token, () => PowerSiScreenCapture.PrepareAsync(target, deadline.Token,
                                         detail => log.Write("OUTPUT_PREPARE", "pid=" + sample.Process.Pid + " " + detail)))
                                     : await ResponsiveStep(target, deadline.Token, () => PowerSiScreenCapture.CaptureAsync(target, deadline.Token));
-                                if (autoCopy)
+                                if (autoCopy || blindFallback)
                                 {
                                     hidden = MinimizeForAutoCopy();
                                     await Task.Delay(300, deadline.Token);
                                 }
-                                // A timed-out text provider is not permission to try input against the same application.
-                                bool copyAllowed = sample.Buffer.Text == null &&
-                                    sample.Buffer.Code.StartsWith("BUFFER_", StringComparison.Ordinal) &&
-                                    sample.Buffer.Code != "BUFFER_TIMEOUT" && sample.Buffer.Code != "BUFFER_WORKER_FAILED" &&
-                                    sample.Buffer.Code != "BUFFER_SIZE" && sample.Buffer.Code != "BUFFER_TOO_LARGE";
-                                if (copyAllowed && autoCopy)
+                                if (blindFallback)
+                                {
+                                    // No model call: the routes and guards of a model failure, with VISION_NOT_CONFIGURED as
+                                    // their cause. The prepared frame keys every aim (client size) and is SCOPE's body search.
+                                    sample.Vision = PowerSiObservation.VisionUnavailable("VISION_NOT_CONFIGURED");
+                                    var aims = FindFallbackAims(sample, frame, sample.Buffer);
+                                    if (OutputAnchorStore.DecideFallbackRoute(false, visionSettings.AutoCopyEnabled, copyAllowed,
+                                        "VISION_NOT_CONFIGURED", aims.Process != null, !aims.Scope.IsEmpty, aims.Layout != null) != null)
+                                    {
+                                        fallbackAttempted = true;
+                                        await CopyWithoutVision(sample, target, frame, "VISION_NOT_CONFIGURED", aims, deadline.Token,
+                                            () => allowance - targetClock.ElapsedMilliseconds, prefix);
+                                    }
+                                }
+                                else if (copyAllowed && autoCopy)
                                 {
                                     // The buffer read result is kept as read: its scope rectangle is one LLM-free aim. All aims
                                     // are known before the model runs; with one available the model gets a child limit, so a
@@ -980,7 +1046,21 @@ namespace RemoteMonitorSlave
                                     }
                                     else
                                     {
-                                        var visionCode = OutputAnchorStore.LocateFailureCode(located);
+                                        // No usable position from the model, including a region it proposed that the boundary check
+                                        // (OUTPUT_REGION_UNCONFIRMED) or AnchorFromVision refused: the LLM-free routes may still aim.
+                                        var visionCode = OutputAnchorStore.RejectedLocateCode(located);
+                                        if (visionCode != null && visionCode != located.Code)
+                                        {
+                                            // A success-shaped locate refused here reads as the unconfirmed region it is: one VisionCode.
+                                            var refused = PowerSiObservation.VisionUnavailable(visionCode);
+                                            refused.LocalFailure = "LOCATE_ANCHOR_REJECTED";
+                                            refused.LocalFrame = located.LocalFrame;
+                                            refused.LocalFullImage = located.LocalFullImage;
+                                            refused.LocalFrameSize = located.LocalFrameSize;
+                                            refused.LocalVisionMode = "LOCATE_ONLY";
+                                            refused.LocalRequestTimeoutSeconds = located.LocalRequestTimeoutSeconds;
+                                            sample.Vision = refused;
+                                        }
                                         if (OutputAnchorStore.DecideFallbackRoute(visionSettings.Enabled, visionSettings.AutoCopyEnabled,
                                             copyAllowed, visionCode, aims.Process != null, !aims.Scope.IsEmpty, aims.Layout != null) != null)
                                         {
@@ -989,7 +1069,7 @@ namespace RemoteMonitorSlave
                                                 () => allowance - targetClock.ElapsedMilliseconds, prefix);
                                         }
                                         else sample.Buffer = new OutputBufferResult { Code = "AUTO_COPY_REGION_UNCONFIRMED",
-                                            Method = "NONE", Detail = LogValue(located?.LocalFailure) };
+                                            Method = "NONE", Detail = LogValue(sample.Vision?.LocalFailure) };
                                     }
                                 }
                             }
@@ -997,8 +1077,9 @@ namespace RemoteMonitorSlave
                             deadline.Token.ThrowIfCancellationRequested();
                             if (remote && sample.Buffer.Text != null) continue; // A fresh exact copy needs no extra OCR request.
                             // The model just failed: a fallback never spends the rest of the budget on a second model call (OCR)
-                            // and never reframes, because its copy has no located observation behind it.
-                            if (fallbackAttempted) continue;
+                            // and never reframes, because its copy has no located observation behind it. With the LLM off
+                            // there is no OCR either, whether or not a route was found after the capture.
+                            if (fallbackAttempted || blindFallback) continue;
                             // Nonresponsive or failed input targets receive no more operations. Their captured diagnostics remain.
                             if (sample.Buffer.Code == "AUTO_COPY_READ")
                                 sample.Vision = await ResponsiveStep(target, deadline.Token,
@@ -1040,11 +1121,14 @@ namespace RemoteMonitorSlave
                 }
                 int copied = outputSamples.Count(item => item.Buffer.Text != null);
                 int visibleEmpty = outputSamples.Count(item => item.Vision?.LocalVisibleEmpty == true);
+                int powerDc = outputSamples.Count(item => item.Buffer?.Code == PowerSiTargetMode.PowerDcCode);
                 ShowActivity("전체 완료 — " + outputSamples.Count + "개 중 원문 " + copied + "개 / 보이는 내용 없음 " + visibleEmpty + "개 / " +
+                    (powerDc > 0 ? "PowerDC 창 " + powerDc + "개 제외 / " : "") +
                     clock.Elapsed.TotalSeconds.ToString("0.0", CultureInfo.InvariantCulture) +
                     "초. PID별 결과 확인 후 진단 ZIP 한 번 저장하세요." +
                     (inventory.Omitted > 0 ? " 목록 한도 밖 " + inventory.Omitted + "개는 미수집입니다." : ""));
-                log.Write("OUTPUT_BATCH_COMPLETE", "targets=" + outputSamples.Count + " text=" + copied + " visible_empty=" + visibleEmpty + " omitted=" + inventory.Omitted);
+                log.Write("OUTPUT_BATCH_COMPLETE", "targets=" + outputSamples.Count + " text=" + copied + " visible_empty=" + visibleEmpty +
+                    " powerdc=" + powerDc + " omitted=" + inventory.Omitted);
                 return BuildReport(inventory);
             }
             catch (OperationCanceledException)
@@ -1160,8 +1244,14 @@ namespace RemoteMonitorSlave
             var targets = outputSamples.Select(ProjectReportTarget).ToArray();
             return new PowerSiReport { CapturedUtc = DateTime.UtcNow, SessionId = inventory.SessionId,
                 Omitted = inventory.Omitted, Unreadable = inventory.Unreadable, Code = code, Targets = targets,
-                Partial = code != "OK" || inventory.Omitted != 0 || inventory.Unreadable != 0 ||
-                    targets.Any(target => target.State == "UNAVAILABLE" || target.State == "TIMEOUT" || target.State == "NOT_ATTEMPTED") };
+                Partial = ReportPartial(code, inventory.Omitted, inventory.Unreadable, targets) };
+        }
+
+        // A deliberately excluded PowerDC window is a complete answer for that PID, not a missing PowerSI result.
+        private static bool ReportPartial(string code, int omitted, int unreadable, PowerSiTargetReport[] targets)
+        {
+            return code != "OK" || omitted != 0 || unreadable != 0 || targets.Any(target => target.Code != PowerSiTargetMode.PowerDcCode &&
+                (target.State == "UNAVAILABLE" || target.State == "TIMEOUT" || target.State == "NOT_ATTEMPTED"));
         }
 
         private static PowerSiTargetReport ProjectReportTarget(OutputSample sample)
@@ -1173,6 +1263,12 @@ namespace RemoteMonitorSlave
             if (IsPending(target.Code) || IsPending(sample.Vision?.LocalFailure))
             {
                 target.State = "PENDING"; target.Code = "SC_PENDING";
+                return target;
+            }
+            // PowerDC window: UNAVAILABLE / NONE / TARGET_MODE_POWERDC, no text and no LLM code (nothing was attempted).
+            if (target.Code == PowerSiTargetMode.PowerDcCode)
+            {
+                target.VisionCode = null;
                 return target;
             }
             var text = sample.Buffer?.Text;
@@ -1221,6 +1317,9 @@ namespace RemoteMonitorSlave
                 target.CapturedUtc = sample.Vision.CapturedUtc;
                 return target;
             }
+            // Nothing reported: BufferCode keeps the direct WM_GETTEXT read's own code, which a later copy, fallback,
+            // deadline or LLM code may have replaced in Code. A reported text keeps the code of the read that produced it.
+            if (sample.DirectCode != null && PowerSiReport.ValidCode(sample.DirectCode)) target.BufferCode = sample.DirectCode;
             if (target.Code == "NOT_ATTEMPTED") target.State = "NOT_ATTEMPTED";
             // After a fallback attempt a VISION_TIMEOUT is the model's, not the target's: the copy chain still finished.
             else if (sample.Vision?.LocalFailure == "TARGET_TIMEOUT" || (sample.Fallback == null && sample.Vision?.Code == "VISION_TIMEOUT"))
@@ -1266,7 +1365,8 @@ namespace RemoteMonitorSlave
                 "자 / " + result.LineCount.ToString(CultureInfo.InvariantCulture) + "줄 / LLM " + (vision?.Code ?? "대기 중") + "\r\n" +
                 (fallback == null ? "" : fallback + (routed.Route != null ? " — LLM 없이 위치를 정해 Ctrl+A/C로 복사, OCR 생략." :
                     " — " + routed.Fallback) + "\r\n") +
-                (result.Code == "OUTPUT_VISIBLE_EMPTY" ? "보이는 Output 내용 없음 — 전체 버퍼 미확인, 클릭·복사·OCR 생략.\r\n" :
+                (result.Code == PowerSiTargetMode.PowerDcCode ? "PowerDC 창으로 확인되어 PowerSI 수집에서 제외했습니다 — 읽기·캡처·LLM·입력·클립보드 사용 없음.\r\n" :
+                    result.Code == "OUTPUT_VISIBLE_EMPTY" ? "보이는 Output 내용 없음 — 전체 버퍼 미확인, 클릭·복사·OCR 생략.\r\n" :
                     result.Code == "SC_MINIMIZED" ? "선택된 PowerSI 창을 Windows가 최소화 상태로 보고하여 활성화·입력을 생략했습니다. 창이 열려 있었다면 진단 ZIP으로 식별값을 확인합니다.\r\n" :
                     result.Method == "USER_CLIPBOARD" ? "수동 복사본 — Output에서 Ctrl+A로 선택했는지 확인하세요.\r\n" :
                     result.Method == "AUTO_CLIPBOARD" ? "자동 복사본 — 선택 해제 → 판독용 캡처 → Ctrl+A/C → 선택 해제. 클립보드가 바뀌었습니다.\r\n" :
@@ -1888,21 +1988,44 @@ namespace RemoteMonitorSlave
                 { "ANCHOR", OutputAnchorStore.FallbackDetail("X", "AUTO_COPY_READ", null, null) },
                 { "SCOPE", OutputAnchorStore.FallbackDetail("X", "AUTO_COPY_BODY_MOVED", "AUTO_COPY_READ", null) },
                 { "LAYOUT", OutputAnchorStore.FallbackDetail("X", null, "AUTO_COPY_SCOPE_UNCONFIRMED", "AUTO_COPY_READ") } };
+            // VISION_NOT_CONFIGURED: the LLM was off or unconfigured and the same routes ran without any model call.
+            // OUTPUT_REGION_UNCONFIRMED: the model proposed a region that the boundary check or AnchorFromVision refused.
             foreach (var route in new[] { "ANCHOR", "SCOPE", "LAYOUT" })
-                foreach (var visionCode in new[] { "VISION_SERVER_UNAVAILABLE", "VISION_TIMEOUT", "OUTPUT_UNAVAILABLE", "VISION_BUSY" })
+                foreach (var visionCode in new[] { "VISION_SERVER_UNAVAILABLE", "VISION_TIMEOUT", "OUTPUT_UNAVAILABLE", "VISION_BUSY",
+                    "VISION_NOT_CONFIGURED", "OUTPUT_REGION_UNCONFIRMED" })
                 {
                     var routed = Sample(visionCode);
                     routed.Buffer = Copy(); routed.Route = route; routed.Fallback = chains[route];
+                    routed.DirectCode = "BUFFER_RICHEDIT_LARGE_UNSUPPORTED";
                     var read = ProjectReportTarget(routed);
                     read.Validate();
                     Need(read.State == "READ" && read.Source == "AUTO_COPY" && read.Code == "AUTO_COPY_" + route + "_READ" &&
                         read.BufferCode == "AUTO_COPY_READ" && read.VisionCode == visionCode && read.OutputText == Copied &&
                         read.OcrText == "" && read.OcrCapturedUtc == null && read.CapturedUtc == now, "fallback read " + route + " " + visionCode);
                     Need(routed.ToString().Contains("대체 복사 " + route) &&
-                        FallbackSummary(routed) == "비전 실패(" + visionCode + ") → " + OutputAnchorStore.RouteCaption(route) + " 복사 성공",
+                        FallbackSummary(routed) == FallbackCause(visionCode) + " → " + OutputAnchorStore.RouteCaption(route) + " 복사 성공",
                         "route shown in the PID list and status line");
                     targets.Add(read);
                 }
+            Need(FallbackCause("VISION_NOT_CONFIGURED") == "LLM 미설정(VISION_NOT_CONFIGURED)" &&
+                FallbackCause("VISION_TIMEOUT") == "비전 실패(VISION_TIMEOUT)" && FallbackCause(null) == "비전 실패(?)", "fallback cause caption");
+            var llmOff = Sample("VISION_NOT_CONFIGURED");
+            llmOff.Buffer = Copy(); llmOff.Route = "SCOPE"; llmOff.Fallback = OutputAnchorStore.FallbackDetail("VISION_NOT_CONFIGURED", null, "AUTO_COPY_READ", null);
+            var llmOffRead = ProjectReportTarget(llmOff);
+            llmOffRead.Validate();
+            Need(llmOffRead.Code == "AUTO_COPY_SCOPE_READ" && llmOffRead.VisionCode == "VISION_NOT_CONFIGURED" && llmOffRead.State == "READ" &&
+                llmOffRead.Source == "AUTO_COPY" && FallbackSummary(llmOff) == "LLM 미설정(VISION_NOT_CONFIGURED) → Output 창 영역 복사 성공",
+                "LLM off: SCOPE copy is AUTO_COPY_SCOPE_READ with VisionCode VISION_NOT_CONFIGURED");
+            var refusedRegion = Sample("OUTPUT_REGION_UNCONFIRMED");
+            refusedRegion.Vision.LocalFailure = "CROP_OUTPUT_REGION_BOUNDARY_UNCONFIRMED";
+            refusedRegion.Buffer = Copy(); refusedRegion.Route = "SCOPE";
+            refusedRegion.Fallback = OutputAnchorStore.FallbackDetail("OUTPUT_REGION_UNCONFIRMED", null, "AUTO_COPY_READ", null);
+            var refusedRead = ProjectReportTarget(refusedRegion);
+            refusedRead.Validate();
+            Need(refusedRead.State == "READ" && refusedRead.Code == "AUTO_COPY_SCOPE_READ" && refusedRead.VisionCode == "OUTPUT_REGION_UNCONFIRMED" &&
+                refusedRead.BufferCode == "AUTO_COPY_READ" && refusedRead.OcrText == "",
+                "refused model region: SCOPE copy is AUTO_COPY_SCOPE_READ with VisionCode OUTPUT_REGION_UNCONFIRMED");
+            targets.Add(refusedRead);
             // Even a valid OCR transcript never rides along with a fallback copy, and a vision copy stays AUTO_COPY_READ.
             var withOcr = Sample("VISION_TIMEOUT");
             withOcr.Buffer = Copy(); withOcr.Route = "SCOPE"; withOcr.Fallback = chains["SCOPE"];
@@ -1919,7 +2042,8 @@ namespace RemoteMonitorSlave
 
             // Every route failed: the last route's code, the model code beside it, and no TIMEOUT for the model's own timeout.
             foreach (var failure in new[] { new[] { "VISION_TIMEOUT", "AUTO_COPY_OCCLUDED" }, new[] { "VISION_SERVER_UNAVAILABLE", "AUTO_COPY_BODY_MOVED" },
-                new[] { "OUTPUT_REGION_UNCONFIRMED", "AUTO_COPY_ANCHOR_CONTINUITY" }, new[] { "VISION_MODEL_UNAVAILABLE", "SC_WINDOW_UNAVAILABLE" } })
+                new[] { "OUTPUT_REGION_UNCONFIRMED", "AUTO_COPY_ANCHOR_CONTINUITY" }, new[] { "VISION_MODEL_UNAVAILABLE", "SC_WINDOW_UNAVAILABLE" },
+                new[] { "VISION_NOT_CONFIGURED", "AUTO_COPY_BODY_UNCONFIRMED" } })
             {
                 var failed = Sample(failure[0]);
                 failed.Fallback = OutputAnchorStore.FallbackDetail(failure[0], "AUTO_COPY_BODY_MOVED", "AUTO_COPY_SCOPE_UNCONFIRMED", failure[1]);
@@ -1947,6 +2071,52 @@ namespace RemoteMonitorSlave
             var plain = ProjectReportTarget(unconfirmed);
             Need(plain.State == "UNAVAILABLE" && plain.Code == "AUTO_COPY_REGION_UNCONFIRMED" && plain.VisionCode == "VISION_SERVER_UNAVAILABLE",
                 "no fallback: region unconfirmed unchanged");
+
+            // Nothing reported: BufferCode keeps the direct read's own code whatever later replaced Code.
+            const string Direct = "BUFFER_RICHEDIT_LARGE_UNSUPPORTED";
+            var direct = Sample("VISION_NOT_CONFIGURED");
+            direct.DirectCode = Direct;
+            direct.Buffer = new OutputBufferResult { Code = Direct, Method = "NATIVE_WM_GETTEXT", Detail = "B1|9|1|1|0|R|12|8|300|200" };
+            var visionOff = ProjectReportTarget(direct);
+            visionOff.Validate();
+            Need(visionOff.State == "UNAVAILABLE" && visionOff.Code == "VISION_NOT_CONFIGURED" && visionOff.BufferCode == Direct &&
+                visionOff.VisionCode == "VISION_NOT_CONFIGURED", "LLM code in Code, the direct read in BufferCode");
+            targets.Add(visionOff);
+            direct.Fallback = OutputAnchorStore.FallbackDetail("VISION_NOT_CONFIGURED", null, "AUTO_COPY_BODY_UNCONFIRMED", null);
+            direct.Buffer = new OutputBufferResult { Code = "AUTO_COPY_BODY_UNCONFIRMED", Method = "NONE", Detail = direct.Fallback };
+            var chainFailed = ProjectReportTarget(direct);
+            chainFailed.Validate();
+            Need(chainFailed.Code == "AUTO_COPY_BODY_UNCONFIRMED" && chainFailed.BufferCode == Direct &&
+                chainFailed.VisionCode == "VISION_NOT_CONFIGURED", "failed chain keeps the direct read in BufferCode");
+            var visionCopyFailed = Sample("OUTPUT_UNAVAILABLE");
+            visionCopyFailed.DirectCode = "BUFFER_STANDARD_TEXT_NOT_FOUND";
+            visionCopyFailed.Buffer = new OutputBufferResult { Code = "AUTO_COPY_OCCLUDED", Method = "NONE", Detail = "NONE" };
+            Need(ProjectReportTarget(visionCopyFailed).Code == "AUTO_COPY_OCCLUDED" &&
+                ProjectReportTarget(visionCopyFailed).BufferCode == "BUFFER_STANDARD_TEXT_NOT_FOUND", "failed vision copy keeps the direct read");
+            RecordTargetFailure(direct, "TARGET_TIMEOUT");
+            var late = ProjectReportTarget(direct);
+            late.Validate();
+            Need(late.State == "TIMEOUT" && late.Code == "TARGET_TIMEOUT" && late.BufferCode == Direct, "deadline keeps the direct read in BufferCode");
+            visionCopyFailed.DirectCode = new string('A', 49); // Not a PS4 code: never sent.
+            Need(ProjectReportTarget(visionCopyFailed).BufferCode == "AUTO_COPY_OCCLUDED", "an invalid direct code is not projected");
+
+            // OUTPUT_BUFFER_READ: the direct read's code and B1 detail reach the log; its text never does.
+            var logDirectory = Path.Combine(Path.GetTempPath(), "RemoteMonitorSlave-log-" + Guid.NewGuid().ToString("N"));
+            try
+            {
+                var directLog = new SlaveLog(logDirectory);
+                directLog.WriteOutputBufferRead(27000, new OutputBufferResult { Code = Direct, Method = "NATIVE_WM_GETTEXT",
+                    Detail = "B1|9|1|0|0|R|12|8|300|200", Text = "private-direct-read-sentinel" });
+                directLog.WriteOutputBufferRead(27000, new OutputBufferResult { Code = "BUFFER_RICHEDIT_UNSTABLE", Method = "NATIVE_WM_GETTEXT",
+                    Detail = "B1|9|1|1|0|E|W50|70000|69990|0|R|12|8|300|200" });
+                var written = File.ReadAllText(directLog.Path);
+                Need(written.Contains(" code=OUTPUT_BUFFER_READ pid=27000 result=" + Direct +
+                    " method=NATIVE_WM_GETTEXT chars=28 lines=1 detail=B1|9|1|0|0|R|12|8|300|200") &&
+                    written.Contains(" code=OUTPUT_BUFFER_READ pid=27000 result=BUFFER_RICHEDIT_UNSTABLE method=NATIVE_WM_GETTEXT chars=0 lines=0 " +
+                    "detail=B1|9|1|1|0|E|W50|70000|69990|0|R|12|8|300|200") &&
+                    !written.Contains("private-direct-read-sentinel") && !written.Contains("detail=INVALID"), "direct read log record");
+            }
+            finally { try { if (Directory.Exists(logDirectory)) Directory.Delete(logDirectory, true); } catch { } }
             // The target deadline during a fallback is still a target timeout; Pending still suppresses an accepted copy.
             var interrupted = Sample("VISION_TIMEOUT");
             interrupted.Fallback = OutputAnchorStore.FallbackDetail("VISION_TIMEOUT", "AUTO_COPY_BODY_MOVED", null, null);
@@ -1979,7 +2149,69 @@ namespace RemoteMonitorSlave
                 left.Pid == right.Pid && left.State == right.State && left.Source == right.Source && left.Code == right.Code &&
                 left.BufferCode == right.BufferCode && left.VisionCode == right.VisionCode && left.OutputText == right.OutputText &&
                 left.OcrText == right.OcrText && left.CapturedUtc == right.CapturedUtc).All(same => same), "PS4 framed round trip");
-            Console.WriteLine("PASS: vision-failure fallback projection (ANCHOR/SCOPE/LAYOUT reads, all-failed chain, PS4 round trip)");
+            Console.WriteLine("PASS: vision-failure fallback projection (ANCHOR/SCOPE/LAYOUT reads incl. LLM off, all-failed chain, direct-read BufferCode and log, PS4 round trip)");
+        }
+
+        // Report projection of a positively identified PowerDC window. Pure; PowerSiTargetMode.SelfTest calls it.
+        internal static void TargetModeProjectionSelfTest()
+        {
+            void Need(bool value, string name) { if (!value) throw new InvalidOperationException("PowerDC projection self-test: " + name); }
+            var now = new DateTime(2026, 10, 4, 1, 2, 3, DateTimeKind.Utc);
+            OutputSample Sample(int pid, OutputBufferResult buffer, PowerSiObservation vision)
+            {
+                return new OutputSample { Process = new ProcessState { Pid = pid, Name = "powersi", FullName = "PowerSI",
+                    StartUtcTicks = now.AddHours(-1).Ticks }, SessionId = 1, ReceivedUtc = now, Buffer = buffer, Vision = vision };
+            }
+            OutputBufferResult Excluded(string text = null)
+            { return new OutputBufferResult { Code = PowerSiTargetMode.PowerDcCode, Method = "NONE", Detail = "NONE", Text = text }; }
+            // What the collection leaves for an excluded window: its own code and the finally's OUTPUT_UNAVAILABLE run.
+            var powerDc = Sample(54108, Excluded(), PowerSiObservation.VisionUnavailable("OUTPUT_UNAVAILABLE"));
+            var excluded = ProjectReportTarget(powerDc);
+            excluded.Validate();
+            Need(excluded.State == "UNAVAILABLE" && excluded.Source == "NONE" && excluded.Code == "TARGET_MODE_POWERDC" &&
+                excluded.BufferCode == "TARGET_MODE_POWERDC" && excluded.VisionCode == null && excluded.OutputText == "" &&
+                excluded.OcrText == "" && excluded.CapturedUtc == null && excluded.OcrCapturedUtc == null, "UNAVAILABLE / NONE / TARGET_MODE_POWERDC");
+            Need(powerDc.ToString().Contains("PowerDC 창 제외") && powerDc.ToString().Contains("TARGET_MODE_POWERDC"), "PID list caption");
+            // Neither a text nor an OCR transcript can ride along with an excluded window, nor a direct-read code.
+            var ocr = PowerSiObservation.VisionLogExcerpt("private-powerdc-ocr", now);
+            ocr.LocalEvidence = "private-powerdc-ocr";
+            var leaked = Sample(54109, Excluded("Sink Voltage private-powerdc-sentinel"), ocr);
+            leaked.DirectCode = "BUFFER_READ";
+            var none = ProjectReportTarget(leaked);
+            none.Validate();
+            Need(none.State == "UNAVAILABLE" && none.Source == "NONE" && none.OutputText == "" && none.OcrText == "" &&
+                none.Code == "TARGET_MODE_POWERDC" && none.BufferCode == "TARGET_MODE_POWERDC" && none.VisionCode == null, "no text for PowerDC");
+            // Pending still outranks everything.
+            var pendingVision = PowerSiObservation.VisionUnavailable("VISION_CAPTURE_FAILED");
+            pendingVision.LocalFailure = "SC_PENDING";
+            var pending = ProjectReportTarget(Sample(54110, Excluded(), pendingVision));
+            pending.Validate();
+            Need(pending.State == "PENDING" && pending.Code == "SC_PENDING" && pending.OutputText == "", "Pending wins");
+            // An excluded window does not make the report partial; any other unavailable target still does.
+            var read = ProjectReportTarget(Sample(27000, new OutputBufferResult { Code = "BUFFER_READ", Method = "NATIVE_WM_GETTEXT",
+                Detail = "B1|9|1|1|0", Text = "AFS Finished\r\nTotal Sampling Points = 93" }, PowerSiObservation.VisionUnavailable("VISION_NOT_CONFIGURED")));
+            var failed = ProjectReportTarget(Sample(27001, new OutputBufferResult { Code = "BUFFER_OUTPUT_NOT_IDENTIFIED", Method = "NATIVE_WM_GETTEXT",
+                Detail = "B1|9|0|0|12" }, PowerSiObservation.VisionUnavailable("VISION_NOT_CONFIGURED")));
+            read.Validate(); failed.Validate();
+            Need(read.State == "READ" && read.Source == "BUFFER" && failed.State == "UNAVAILABLE" &&
+                !ReportPartial("OK", 0, 0, new[] { read, excluded }) && ReportPartial("OK", 0, 0, new[] { read, excluded, failed }) &&
+                ReportPartial("CANCELLED", 0, 0, new[] { excluded }) && ReportPartial("OK", 1, 0, new[] { excluded }) &&
+                ReportPartial("OK", 0, 0, new[] { pending, failed }), "partial ignores only the PowerDC exclusion");
+            // Protocol 0.3.0: a new Code only, no new state, source or field.
+            var report = new PowerSiReport { CapturedUtc = now, SessionId = 1, Partial = false, Code = "OK", Targets = new[] { read, excluded } };
+            report.Validate();
+            PowerSiReport received;
+            using (var stream = new MemoryStream())
+            {
+                report.WriteFramedAsync(stream, CancellationToken.None).GetAwaiter().GetResult();
+                stream.Position = 0;
+                received = PowerSiReport.ReadFramedAsync(new LinkProtocol.LineReader(stream), CancellationToken.None).GetAwaiter().GetResult();
+            }
+            var back = received.Targets.Single(item => item.Pid == 54108);
+            Need(!received.Partial && back.State == "UNAVAILABLE" && back.Source == "NONE" && back.Code == "TARGET_MODE_POWERDC" &&
+                back.BufferCode == "TARGET_MODE_POWERDC" && string.IsNullOrEmpty(back.VisionCode) && back.OutputText == "" &&
+                received.Targets.Single(item => item.Pid == 27000).OutputText == read.OutputText, "PS4 framed round trip");
+            Console.WriteLine("PASS: PowerDC window projection (UNAVAILABLE/NONE/TARGET_MODE_POWERDC, no text, not partial, PS4 round trip)");
         }
 
         internal static void SelfTest()
