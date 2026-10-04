@@ -344,7 +344,9 @@ namespace RemoteMonitorMaster
                 void SendAbortNotice(string requestMarker, int confirmed, int prepared)
                 {
                     Alive();
-                    var notice = SupervisedSendTest.Consent.ForAbortNotice("D" + requestMarker.Substring(1), confirmed, prepared);
+                    // Its own code, allocated like QueueNotice: never the aborted round's D code, never the next Ready's.
+                    var noticeMarker = Allocate(store, allocated, "M" + Protocol.CreateDiagnosticDigits());
+                    var notice = SupervisedSendTest.Consent.ForAbortNotice("D" + noticeMarker.Substring(1), confirmed, prepared);
                     Volatile.Write(ref activeNotice, notice);
                     Alive();
                     progress(CompletedRounds, "NOTICE_ABORT:" + confirmed.ToString(System.Globalization.CultureInfo.InvariantCulture) + "/" + prepared.ToString(System.Globalization.CultureInfo.InvariantCulture), requestMarker);
@@ -444,9 +446,15 @@ namespace RemoteMonitorMaster
                         AuditLog.Field("missing", result.Missing.Length), AuditLog.Field("remaining", result.Remaining),
                         AuditLog.Field("all_cleared", result.AllCleared),
                         AuditLog.Field("unjudged_streak", result.UnjudgedStreakReached.Length),
+                        AuditLog.Field("powerdc_excluded", result.PowerDcExcluded.Length),
                         AuditLog.Field("absent_means_missing", WatchdogReport.AbsentMeansMissing(report)));
+                    // One notice per check: completion/missing lines plus one line per PowerDC exclusion, through the same
+                    // queue and consent path; a check that only excluded PowerDC windows still sends that notice.
                     if (result.Finished.Length + result.Missing.Length > 0)
                         QueueNotice("COMPLETION", noticeMarker =>
+                            WatchdogText.CompletionNotice(noticeMarker, result, Watchdog, DateTime.Now));
+                    else if (result.PowerDcExcluded.Length > 0)
+                        QueueNotice("POWERDC_EXCLUDED", noticeMarker =>
                             WatchdogText.CompletionNotice(noticeMarker, result, Watchdog, DateTime.Now));
                     if (result.UnjudgedStreakReached.Length > 0)
                         QueueNotice("WARNING", noticeMarker => WatchdogText.WarningNotice(noticeMarker, WatchdogText.KindUnjudgeable,
@@ -628,8 +636,8 @@ namespace RemoteMonitorMaster
                         Alive();
                         progress(round, "REQUEST_RESUMED:" + abortReason, marker);
                         Alive();
-                        // The phone already holds parts 1..c: say the report stopped, before the new Ready. Its consent is
-                        // bound to the aborted request's code; the new Ready below gets a fresh one.
+                        // The phone already holds parts 1..c: say the report stopped, before the new Ready. The notice's
+                        // consent gets its own fresh code, and the new Ready below another one.
                         if (cleanPrefix) SendAbortNotice(marker, confirmedParts, preparedParts);
                         // A fresh code, and a baseline rebuilt by the new Ready; the aborted proof/marker is never reused.
                         marker = Allocate(store, allocated, "M" + Protocol.CreateDiagnosticDigits());
@@ -986,8 +994,11 @@ namespace RemoteMonitorMaster
                     "STATUS_SELFTEST_CLEAN_PREFIX_ABANDONED");
                 try { request.CommitPreparedOutput(); throw new InvalidOperationException("A clean prefix committed Output history."); }
                 catch (MonitorException) { }
-                var notice = SupervisedSendTest.Consent.ForAbortNotice(request.Marker, outcome.Confirmed, outcome.Prepared);
-                Need(notice.NoticeText == SupervisedSendTest.ReportAbortNotice(1, 3) &&
+                // The abort notice has its own code (Run allocates it like QueueNotice), never the aborted request's code.
+                const string abortNoticeMarker = "D678923";
+                var notice = SupervisedSendTest.Consent.ForAbortNotice(abortNoticeMarker, outcome.Confirmed, outcome.Prepared);
+                Need(abortNoticeMarker != request.Marker && notice.NoticeText == SupervisedSendTest.ReportAbortNotice(1, 3) &&
+                    notice.NoticeText == "보고 전송을 중단했습니다 (1/3 전송됨). 남은 부분은 보내지 않으며 새 Ready 이후의 명령만 처리합니다." &&
                     notice.TryConsume(SupervisedSendTest.ReportAbortNotice(1, 3)) && !notice.TryConsume(notice.NoticeText),
                     "STATUS_SELFTEST_CLEAN_PREFIX_NOTICE");
                 var next = resumable.StartRequest("M456789", "M567892"); // The session keeps listening with a new code.

@@ -26,12 +26,14 @@ namespace RemoteMonitorMaster
 
         // Sent once after a clean-prefix abort (StatusSession): parts 1..confirmed of prepared were sent cleanly and the
         // rest are abandoned, never resent. No code and no "Master Ready" token, so it is neither a command nor a Ready.
+        // Neutral wording: the abort reason is not always a receive failure (idle gate, guard or proof checks also stop it).
         internal static string ReportAbortNotice(int confirmed, int prepared)
         {
             Need(IsAbortNoticeCount(confirmed, prepared), "SEND_NOTICE_INVALID");
-            return "전송 중 수신 확인에 실패해 보고를 중단했습니다 (" +
+            return "보고 전송을 중단했습니다 (" +
                 confirmed.ToString(System.Globalization.CultureInfo.InvariantCulture) + "/" +
-                prepared.ToString(System.Globalization.CultureInfo.InvariantCulture) + "). 새 Ready 이후의 명령만 처리합니다.";
+                prepared.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                " 전송됨). 남은 부분은 보내지 않으며 새 Ready 이후의 명령만 처리합니다.";
         }
 
         // A clean prefix needs at least one confirmed part and at least one abandoned part.
@@ -1058,7 +1060,7 @@ namespace RemoteMonitorMaster
         {
             const string marker = "D234567";
             var text = ReportAbortNotice(12, 40);
-            Need(text == "전송 중 수신 확인에 실패해 보고를 중단했습니다 (12/40). 새 Ready 이후의 명령만 처리합니다." &&
+            Need(text == "보고 전송을 중단했습니다 (12/40 전송됨). 남은 부분은 보내지 않으며 새 Ready 이후의 명령만 처리합니다." &&
                 text.Length <= PcStatusReport.MaxPhoneLength && !ReadOnlyCommands.IsCommand(text) &&
                 !ReadOnlyCommands.IsCommand(text.Trim()) && text != ReadyText(marker) && text != ReadyNotice &&
                 !text.StartsWith("Master Ready", StringComparison.Ordinal) && !text.Contains(marker) && !WatchdogText.IsNotice(text) &&

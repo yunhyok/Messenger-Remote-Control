@@ -645,7 +645,7 @@ namespace RemoteMonitorMaster
             else if (phase == "NOTICE_ABORT" || phase.StartsWith("NOTICE_ABORT:", StringComparison.Ordinal))
             {
                 // 앞 부분이 정상 전송된 보고(CLEAN_PREFIX)가 중단된 뒤, 새 Ready 전에 중단 안내 한 건을 보내는 단계입니다.
-                // 현재 StatusSession은 개수 없이 "NOTICE_ABORT"만 넘기므로 "NOTICE_ABORT:<확인>/<준비>" 접미사가 있을 때만 c/p를 표시합니다.
+                // StatusSession은 "NOTICE_ABORT:<확인>/<준비>"(예: NOTICE_ABORT:12/40)를 넘깁니다. 접미사가 없거나 PartCounts 형식(숫자/숫자, 7자 이하)이 아니면 c/p 없이 표시합니다.
                 code.Text = "WAIT";
                 var counts = PartCounts(phase.Length > "NOTICE_ABORT:".Length ? phase.Substring("NOTICE_ABORT:".Length) : null);
                 SetStatus("중단 안내 전송 중" + (counts == null ? "" : " (확인된 부분 " + counts + ")"), false);

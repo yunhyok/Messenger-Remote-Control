@@ -447,9 +447,12 @@ namespace RemoteMonitorMaster
                 yield break;
             }
             var text = plan.Text;
-            yield return kind == PowerSiOutputDelta.Appended ? "이전 전송 이후 추가된 Output:" :
-                kind == PowerSiOutputDelta.Replaced ? "Output이 교체·초기화되었거나 기존 내용이 변경되어 현재 수집 내용 전체를 보냅니다:" :
-                "수집된 Output 전체:";
+            // A truncated text never says "전체": its header names the tail, and the omission line below gives exact counts.
+            var tail = string.Format(CultureInfo.InvariantCulture, "마지막 {0:N0}자", MaxRenderedOutputCharacters);
+            yield return kind == PowerSiOutputDelta.Appended ? (plan.Truncated ? "추가된 Output " + tail + ":" : "이전 전송 이후 추가된 Output:") :
+                kind == PowerSiOutputDelta.Replaced ? "Output이 교체·초기화되었거나 기존 내용이 변경되어 현재 수집 내용" +
+                    (plan.Truncated ? "의 " + tail + "를 보냅니다:" : " 전체를 보냅니다:") :
+                plan.Truncated ? "수집된 Output " + tail + ":" : "수집된 Output 전체:";
             if (text.Length == 0) { yield return "(Output 내용 없음)"; yield break; }
             if (plan.Truncated)
                 yield return string.Format(CultureInfo.InvariantCulture, "…(앞 {0}자 생략, 전체 {1}자)", plan.Start, text.Length);
@@ -1083,8 +1086,19 @@ namespace RemoteMonitorMaster
             }
             var over = "A" + new string('b', 2999) + "Z"; // 3,001
             var overLines = Lines(over);
-            Check(RenderedOutputStart(over) == 1 && overLines[1] == Omission(1, 3001) && Body(overLines) == over.Substring(1) &&
-                Occurrences(string.Join("\n", overLines), "…(") == 1, "TAIL_3001");
+            Check(RenderedOutputStart(over) == 1 && overLines[0] == "수집된 Output 마지막 3,000자:" && overLines[1] == Omission(1, 3001) &&
+                Body(overLines) == over.Substring(1) && Occurrences(string.Join("\n", overLines), "…(") == 1 &&
+                !overLines.Contains("수집된 Output 전체:"), "TAIL_3001");
+            // Truncated headers never say "전체"; untruncated APPENDED/REPLACED keep today's headers.
+            List<string> DeltaLines(string kind, string output) { return OutputLines(new PowerSiOutputDelta(kind, output), null, false).ToList(); }
+            Check(DeltaLines(PowerSiOutputDelta.Appended, over)[0] == "추가된 Output 마지막 3,000자:" &&
+                DeltaLines(PowerSiOutputDelta.Appended, "새 줄")[0] == "이전 전송 이후 추가된 Output:" &&
+                DeltaLines(PowerSiOutputDelta.Replaced, over)[0] ==
+                    "Output이 교체·초기화되었거나 기존 내용이 변경되어 현재 수집 내용의 마지막 3,000자를 보냅니다:" &&
+                DeltaLines(PowerSiOutputDelta.Replaced, "새 줄")[0] ==
+                    "Output이 교체·초기화되었거나 기존 내용이 변경되어 현재 수집 내용 전체를 보냅니다:" &&
+                DeltaLines(PowerSiOutputDelta.First, over)[1] == Omission(1, 3001) &&
+                DeltaLines(PowerSiOutputDelta.Appended, over)[1] == Omission(1, 3001), "TAIL_HEADERS");
             var numbered = new StringBuilder();
             for (var n = 0; numbered.Length < 10000; n++)
                 numbered.Append('L').Append(n.ToString("D4", CultureInfo.InvariantCulture)).Append(' ', 31).Append('\n'); // 37 per line
@@ -1130,7 +1144,8 @@ namespace RemoteMonitorMaster
                 var capFirst = capHistory.Prepare(pin, state.PowerSiReport);
                 var firstReply = string.Join("\n", FormatPowerSi(nonce, state, capFirst));
                 Check(capFirst.Primary[0].Kind == PowerSiOutputDelta.First && capFirst.Primary[0].Text == ten &&
-                    firstReply.Contains("수집된 Output 전체:") && firstReply.Contains(Omission(tenStart, 10000)) &&
+                    firstReply.Contains("수집된 Output 마지막 3,000자:") && !firstReply.Contains("수집된 Output 전체:") &&
+                    firstReply.Contains(Omission(tenStart, 10000)) &&
                     !firstReply.Contains("L0000") && firstReply.Contains("L0270") && capFirst.Commit(), "CAP_FIRST");
                 Check(File.ReadAllText(capHistoryPath).Contains("\t10000\t" + TokenStore.Hash(ten) + "\n"), "CAP_HISTORY_FULL_TEXT");
                 var capSame = capHistory.Prepare(pin, state.PowerSiReport);
@@ -1143,7 +1158,8 @@ namespace RemoteMonitorMaster
                 var capAppended = capHistory.Prepare(pin, state.PowerSiReport);
                 var appendedReply = string.Join("\n", FormatPowerSi(nonce, state, capAppended));
                 Check(capAppended.Primary[0].Kind == PowerSiOutputDelta.Appended && capAppended.Primary[0].Text == appendix &&
-                    RenderedOutputStart(appendix) == 2000 && appendedReply.Contains("이전 전송 이후 추가된 Output:") &&
+                    RenderedOutputStart(appendix) == 2000 && appendedReply.Contains("추가된 Output 마지막 3,000자:") &&
+                    !appendedReply.Contains("이전 전송 이후 추가된 Output:") &&
                     appendedReply.Contains(Omission(2000, 5000)) && !appendedReply.Contains("A049.") && appendedReply.Contains("A050.") &&
                     appendedReply.Contains("A124.") && !appendedReply.Contains("L0270"), "CAP_APPENDED");
                 Check(capAppended.Commit() && File.ReadAllText(capHistoryPath).Contains("\t15000\t" + TokenStore.Hash(ten + appendix) + "\n") &&
@@ -1223,7 +1239,7 @@ namespace RemoteMonitorMaster
                 !slaveShapes.Contains("LLM 위치 확인(VISION_NOT_CONFIGURED)") && !slaveShapes.Contains(UnknownAdvice), "SLAVE_CODE_SHAPES");
             Check(Help("help pwrsi", nonce).Contains("PowerDC 모드 창은 Output 수집 대상이 아니어서") &&
                 IsReply(Help("help pwrsi", nonce), "help pwrsi", nonce) &&
-                WatchdogText.HelpBody().Contains("PowerDC 모드 창은 Output 수집 대상이 아니어서 알림 없이 감시에서 제외합니다.") &&
+                WatchdogText.HelpBody().Contains("PowerDC 모드 창은 Output 수집 대상이 아니어서 감시에서 제외하고 그 PID를 알립니다.") &&
                 IsReply(Help(WatchdogText.HelpWatchdog, nonce), WatchdogText.HelpWatchdog, nonce), "HELP_POWERDC");
 
             // PWRSI_TARGET: one record per target inside the command-log scope only; codes, counts and kinds, no names or text.
