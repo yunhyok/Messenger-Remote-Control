@@ -925,6 +925,14 @@ namespace RemoteMonitorMaster
                     return "요청이 연속 " + StatusSession.AbortResumeLimit + "회 중단되어 세션을 끝냈습니다. 새 세션을 시작하세요.";
                 case "STATUS_WATCHDOG_NOTICE_UNCERTAIN":
                     return "watchdog 알림 전송이 불확실하게 끝나 세션을 중단했습니다. 대화창에서 알림이 보였는지 확인한 뒤 새 세션을 시작하세요.";
+                case "STATUS_REQUEST_ABORTED_CLEAN_PREFIX": // STATUS_REQUEST_ABORTED resume_rule=CLEAN_PREFIX
+                    return "앞 부분은 정상 전송됐고 다음 부분은 입력 전에 중단되어, 남은 부분은 보내지 않고 중단 안내 뒤 새 Ready로 다시 대기합니다. 보내지 못한 Output은 다음 pwrsi에 포함됩니다.";
+                case "STATUS_ABORT_NOTICE_UNCERTAIN":
+                    return "보고 중단 안내 전송이 불확실하게 끝나 세션을 중단했습니다. 대화창에서 안내가 보였는지 확인한 뒤 새 세션을 시작하세요.";
+                case "RECEIVE_HISTORY_SHIFTED":
+                    return "메신저 목록이 위쪽 행을 정리해 기준 행 위치를 다시 맞췄습니다.";
+                case "RECEIVE_ACCEPTED_CANDIDATE_LOST":
+                    return "수락한 명령 행을 다시 찾지 못해 전송을 중단했습니다.";
                 case "WATCHDOG_STATE_UNAVAILABLE":
                     return "내부 오류: 운용 세션의 watchdog 상태가 연결되지 않아 watchdog 명령을 처리하지 않았습니다. 로그 폴더의 최신 로그를 첨부해 문의하세요.";
                 case "ROUNDTRIP_PROOF_EXPIRED_OR_WINDOW_CHANGED":
@@ -941,6 +949,9 @@ namespace RemoteMonitorMaster
                 case "RECEIVE_BEGIN_FAILED":
                     return "예상하지 못한 오류로 중단했습니다. 로그 폴더의 최신 로그를 첨부해 문의하세요.";
             }
+            // 회신 직전 재관찰 실패는 감싼 수신 사유 코드의 설명을 씁니다(예: ..._RECEIVE_ACCEPTED_CANDIDATE_LOST).
+            if (reason.StartsWith("ROUNDTRIP_REOBSERVATION_FAILED_", StringComparison.Ordinal))
+                return Explain(reason.Substring("ROUNDTRIP_REOBSERVATION_FAILED_".Length));
             if (reason.StartsWith("TARGET_ROOT_", StringComparison.Ordinal))
                 return "선택한 대화창이 닫히거나 이동·변경되었습니다. 창을 움직이지 말고 새 세션을 시작하세요.";
             if (reason.StartsWith("RECEIVE_HISTORY_", StringComparison.Ordinal))

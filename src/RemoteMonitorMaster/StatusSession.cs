@@ -129,14 +129,67 @@ namespace RemoteMonitorMaster
             return Flags(consent) != 0 || outcome == null || (outcome.Send != null && outcome.Send.InputAttempted);
         }
 
+        // Clean-prefix abort (plain commands only): the BUSY notice and reply parts 1..c of this round were all sent
+        // cleanly and recorded, the failing part c+1 never moved, wrote or clicked, and no later part was touched.
+        // RoundTripTest's flag is cross-checked against the consent itself; anything unreadable counts as touched.
+        // The remaining parts stay abandoned (the round's consent is already cancelled) and are never resent.
+        internal static bool IsCleanPrefixAbort(bool plainCommands, SupervisedSendTest.Consent consent, RoundTripTest.Outcome outcome)
+        {
+            if (!plainCommands || consent == null || !consent.IsPlainCommands || outcome == null || outcome.CleanCompletion ||
+                outcome.Yielded || !outcome.CleanPrefixUntouchedPart || outcome.FailedPartInputAttempted || consent.PendingWrite)
+                return false;
+            try
+            {
+                var prepared = consent.PreparedReplyCount;
+                var failed = outcome.FailedPart - 1; // Zero-based index of the untouched failing part.
+                var notice = consent.ProgressNoticeInputState;
+                if (outcome.Prepared != prepared || outcome.Confirmed != failed || consent.ConfirmedPartCount != failed ||
+                    failed < 1 || failed >= prepared || (notice != -1 && notice != 4)) return false;
+                for (var index = 0; index < prepared; index++)
+                {
+                    var state = consent.PartInputState(index);
+                    if (index < failed ? state != 4 : index == failed ? state > 1 : state != 0) return false;
+                }
+                return true;
+            }
+            catch (MonitorException) { return false; }
+        }
+
+        // An abort is uncertain when any input of the round is attempted or unknown, unless it is a verified clean prefix.
+        internal static bool IsUncertainAbort(bool plainCommands, SupervisedSendTest.Consent consent, RoundTripTest.Outcome outcome)
+        {
+            return InputAttempted(consent, outcome) && !IsCleanPrefixAbort(plainCommands, consent, outcome);
+        }
+
+        // Which rule allows resuming this abort; logged as resume_rule. Whether it resumed also depends on DecideAfterAbort.
+        internal static string ResumeRule(bool inputAttempted, bool uncertain)
+        {
+            return uncertain ? "NONE" : inputAttempted ? "CLEAN_PREFIX" : "UNTOUCHED_ROUND";
+        }
+
+        // The real reason the round ended. Send may be an earlier clean part whose own reason is NONE.
+        internal static string AbortReason(RoundTripTest.Outcome outcome)
+        {
+            return outcome?.Reason ?? outcome?.Send?.Reason ?? "UNKNOWN";
+        }
+
         // Pure rule for a round that did not complete cleanly. Uncertain delivery always wins: an attempted send is
-        // never retried or resumed, only reported. Cancellation stops as well; only an untouched round may resume.
+        // never retried or resumed, only reported. Cancellation stops as well; only an untouched round or a verified
+        // clean prefix (IsUncertainAbort false) may resume.
         internal static string DecideAfterAbort(bool cancelled, bool inputAttempted, int consecutiveAborts, int limit)
         {
             if (inputAttempted) return "STATUS_REQUEST_STOPPED";
             if (cancelled) return "STATUS_SESSION_CANCELLED";
             if (consecutiveAborts >= limit) return "STATUS_REQUEST_ABORT_LIMIT";
             return "RESUME";
+        }
+
+        // The abort notice follows the notice rule, but there is no later yield to defer it to: rejected before any
+        // input ends the session as STATUS_REQUEST_STOPPED; attempted or contradictory ends it as uncertain. No retry.
+        internal static string DecideAfterAbortNotice(bool clean, bool inputAttempted)
+        {
+            var decision = DecideAfterNotice(clean, inputAttempted);
+            return decision == "SENT" ? decision : decision == "DEFERRED" ? "STATUS_REQUEST_STOPPED" : "STATUS_ABORT_NOTICE_UNCERTAIN";
         }
 
         // Retires an aborted round without completing it: no completed round, no cancellation, no consent reuse.
@@ -146,7 +199,7 @@ namespace RemoteMonitorMaster
             lock (sync)
             {
                 if (Cancelled || !ReferenceEquals(active, consent) || outcome == null || outcome.CleanCompletion ||
-                    InputAttempted(consent, outcome)) return false;
+                    IsUncertainAbort(plainCommands, consent, outcome)) return false;
                 attempts |= Flags(consent);
                 Volatile.Write(ref active, null);
                 return true;
@@ -282,6 +335,47 @@ namespace RemoteMonitorMaster
                     notice.Cancel();
                     log.Write("INFO", "MASTER_NOTICE_SENT", AuditLog.Field("stage", "READY"), AuditLog.Field("delivery_verified", false));
                     progress(CompletedRounds, "WATCHDOG:" + Watchdog.Summary(DateTime.Now), requestMarker);
+                }
+                // After a clean-prefix abort, one guarded notice before the new Ready says the report stopped at c/p.
+                // Same notice path and pre-input checks as Ready; it is never retried and never resends a report part.
+                void SendAbortNotice(string requestMarker, int confirmed, int prepared)
+                {
+                    Alive();
+                    var notice = SupervisedSendTest.Consent.ForAbortNotice("D" + requestMarker.Substring(1), confirmed, prepared);
+                    Volatile.Write(ref activeNotice, notice);
+                    Alive();
+                    progress(CompletedRounds, "NOTICE_ABORT", requestMarker);
+                    SupervisedSendTest.Outcome result = null;
+                    string reason;
+                    try
+                    {
+                        target?.PrepareSend(); // Idle gate and on-demand activation; a failure here is before any input.
+                        result = SupervisedSendTest.RunBoundObserved(window, log, notice.NoticeText, new System.Windows.Point(), notice,
+                            Stopped, snapshot =>
+                            {
+                                Alive();
+                                Need(process.Equals(snapshot.Process), "STATUS_PROCESS_CHANGED");
+                                ReceiveProbe.ValidateContinuity(original, snapshot);
+                            });
+                        last = result.Message;
+                        reason = result.Reason;
+                    }
+                    catch (MonitorException ex) when (result == null) { reason = ex.ReasonCode; }
+                    var inputAttempted = Flags(notice) != 0 || (result != null && result.InputAttempted);
+                    var decision = DecideAfterAbortNotice(result != null && result.CleanCompletion, inputAttempted);
+                    log.Write("INFO", "STATUS_ABORT_NOTICE_RESULT", AuditLog.Field("decision", decision),
+                        AuditLog.Field("reason", reason ?? "UNKNOWN"), AuditLog.Field("input_attempted", inputAttempted),
+                        AuditLog.Field("confirmed_parts", confirmed), AuditLog.Field("prepared_parts", prepared),
+                        AuditLog.Field("delivery_verified", false));
+                    // Uncertain delivery keeps the notice consent visible for the final summary, like an unclean Ready.
+                    if (decision == "STATUS_ABORT_NOTICE_UNCERTAIN")
+                        throw new MonitorException(decision, "The abort notice was not confirmed. It is never retried.");
+                    lock (sync) { attempts |= Flags(notice); Volatile.Write(ref activeNotice, null); }
+                    notice.Cancel();
+                    Alive(); // A stop during the attempt ends the session as cancelled.
+                    if (decision != "SENT")
+                        throw new MonitorException(decision, "The abort notice was rejected before input. No next request will run.");
+                    log.Write("INFO", "MASTER_NOTICE_SENT", AuditLog.Field("stage", "ABORT"), AuditLog.Field("delivery_verified", false));
                 }
                 // A later notice attempt waits at least WatchdogNoticeRetryDelay after a deferral; a due check yields at once.
                 var noticeRetryUtc = DateTime.MinValue;
@@ -497,14 +591,29 @@ namespace RemoteMonitorMaster
                     }
                     if (outcome == null || !outcome.CleanCompletion)
                     {
-                        // Nothing typed or clicked: re-arm receiving with a new code and a new Ready. Never a resend.
+                        // Nothing typed or clicked (UNTOUCHED_ROUND), or only clean parts before an untouched failing part
+                        // (CLEAN_PREFIX): re-arm receiving with a new code and a new Ready. Never a resend; the remaining
+                        // parts are abandoned and Output history is not advanced, so the next pwrsi repeats them.
                         var inputAttempted = InputAttempted(consent, outcome);
-                        var abortReason = outcome?.Send?.Reason ?? "UNKNOWN";
+                        var cleanPrefix = IsCleanPrefixAbort(plainCommands, consent, outcome);
+                        var uncertain = inputAttempted && !cleanPrefix;
+                        var abortReason = AbortReason(outcome);
+                        var confirmedParts = outcome?.Confirmed ?? 0;
+                        var preparedParts = outcome?.Prepared ?? 0;
+                        var failedPart = outcome?.FailedPart ?? 0;
                         consecutiveAborts++;
-                        var decision = DecideAfterAbort(Cancelled || stop(), inputAttempted, consecutiveAborts, AbortResumeLimit);
+                        var decision = DecideAfterAbort(Cancelled || stop(), uncertain, consecutiveAborts, AbortResumeLimit);
                         var resumed = decision == "RESUME" && TryReleaseAbortedRequest(consent, outcome);
+                        // reason is kept for existing log readers and now carries the real abort reason (= abort_reason).
                         log.Write("INFO", "STATUS_REQUEST_ABORTED", AuditLog.Field("reason", abortReason),
-                            AuditLog.Field("input_attempted", inputAttempted), AuditLog.Field("consecutive", consecutiveAborts),
+                            AuditLog.Field("abort_reason", abortReason),
+                            AuditLog.Field("resume_rule", ResumeRule(inputAttempted, uncertain)), AuditLog.Field("uncertain", uncertain),
+                            AuditLog.Field("input_attempted", inputAttempted),
+                            AuditLog.Field("confirmed_parts", confirmedParts), AuditLog.Field("prepared_parts", preparedParts),
+                            AuditLog.Field("failed_part", failedPart == 0 ? (object)"NONE" : failedPart),
+                            AuditLog.Field("abandoned_parts", Math.Max(0, preparedParts - confirmedParts)),
+                            AuditLog.Field("failed_part_input_attempted", failedPart == 0 ? (object)"NONE" : outcome.FailedPartInputAttempted),
+                            AuditLog.Field("consecutive", consecutiveAborts),
                             AuditLog.Field("resumed", resumed), AuditLog.Field("round_index", round),
                             AuditLog.Field("delivery_verified", false));
                         if (!resumed)
@@ -516,6 +625,9 @@ namespace RemoteMonitorMaster
                         Alive();
                         progress(round, "REQUEST_RESUMED:" + abortReason, marker);
                         Alive();
+                        // The phone already holds parts 1..c: say the report stopped, before the new Ready. Its consent is
+                        // bound to the aborted request's code; the new Ready below gets a fresh one.
+                        if (cleanPrefix) SendAbortNotice(marker, confirmedParts, preparedParts);
                         // A fresh code, and a baseline rebuilt by the new Ready; the aborted proof/marker is never reused.
                         marker = Allocate(store, allocated, "M" + Protocol.CreateDiagnosticDigits());
                         reported = marker;
@@ -602,6 +714,7 @@ namespace RemoteMonitorMaster
                 DecideAfterAbort(true, false, AbortResumeLimit, AbortResumeLimit) == "STATUS_SESSION_CANCELLED",
                 "STATUS_SELFTEST_ABORT_DECISION");
             RunWatchdogSelfTest(); // Pure; runs before the PC-status capture below.
+            RunCleanPrefixSelfTest(); // Pure as well.
             var path = Path.Combine(directory, "status-session-tokens.txt");
             void Reject(Action action)
             {
@@ -800,6 +913,134 @@ namespace RemoteMonitorMaster
                 }), "STATUS_SELFTEST_WATCHDOG_NOTICE_CONSENT");
             Reject(() => SupervisedSendTest.Consent.ForWatchdogNotice("D567892", parts[0]), "SEND_NOTICE_INVALID");
             Reject(() => SupervisedSendTest.Consent.ForWatchdogNotice("D456789", readyText), "SEND_NOTICE_INVALID");
+        }
+
+        // Clean-prefix resume without Win32: a three-part pwrsi whose BUSY notice and part 1 were sent cleanly and whose
+        // part 2 was never touched resumes (reason carried, attempts kept); touched, attempted, cancelled, unrecorded or
+        // over-limit variants do not.
+        private static void RunCleanPrefixSelfTest()
+        {
+            const string reason = "ROUNDTRIP_REOBSERVATION_FAILED_RECEIVE_ACCEPTED_CANDIDATE_CHANGED";
+            var endpoint = new SlaveEndpoint(System.Net.IPAddress.Loopback, 1, new string('0', 64),
+                Convert.ToBase64String(new byte[32]));
+            var clean = new SupervisedSendTest.Outcome("ACTION_RETURNED", "NONE", "test", true);
+            var preInput = new SupervisedSendTest.Outcome("REJECTED", "ROUNDTRIP_HANDOFF_CANDIDATE_CHANGED", "test", false, false);
+            var attempted = new SupervisedSendTest.Outcome("REJECTED", "SEND_FOREGROUND_CHANGED", "test", false, true);
+            Need(DecideAfterAbortNotice(true, true) == "SENT" && DecideAfterAbortNotice(false, false) == "STATUS_REQUEST_STOPPED" &&
+                DecideAfterAbortNotice(false, true) == "STATUS_ABORT_NOTICE_UNCERTAIN" &&
+                DecideAfterAbortNotice(true, false) == "STATUS_ABORT_NOTICE_UNCERTAIN", "STATUS_SELFTEST_ABORT_NOTICE_DECISION");
+            Need(ResumeRule(false, false) == "UNTOUCHED_ROUND" && ResumeRule(true, false) == "CLEAN_PREFIX" &&
+                ResumeRule(true, true) == "NONE" && AbortReason(null) == "UNKNOWN", "STATUS_SELFTEST_RESUME_RULE");
+            // One aborted round on a fresh session: BUSY notice (clicked unless busyState says otherwise) and part 1 sent and
+            // recorded clean (unless recordFirst is false), then part 2 driven by touch. The consent is retired as
+            // RoundTripTest retires it on return.
+            StatusSession Round(Func<SupervisedSendTest.Consent, string, bool> touch, out SupervisedSendTest.Consent consent,
+                out string[] parts, bool busyClicked = true, bool recordFirst = true)
+            {
+                var session = new StatusSession("M234567", true, endpoint, true);
+                Need(session.TryClaim(), "STATUS_SELFTEST_CLEAN_PREFIX_CLAIM");
+                consent = session.StartRequest("M234567", "M345678");
+                Need(consent.TryClaimRoundTrip(), "STATUS_SELFTEST_CLEAN_PREFIX_APPROVAL");
+                consent.BindCommand("pwrsi");
+                var busy = consent.CreateProgressNotice(SupervisedSendTest.PowerSiBusyNotice);
+                Need(busy.TryConsume(SupervisedSendTest.PowerSiBusyNotice) && busy.TryCommitMove() && busy.TryCommitWrite() &&
+                    (!busyClicked || busy.TryCommit()), "STATUS_SELFTEST_CLEAN_PREFIX_BUSY");
+                var marker = consent.Marker;
+                parts = Enumerable.Range(1, 3).Select(index => "PWRSI REPORT " + marker + " | PART 00" + index + "/003\r\nbody " + index)
+                    .ToArray();
+                consent.BindPreparedReplies(parts);
+                var first = consent.GetPreparedPart(0);
+                Need(first.TryConsume(parts[0]) && first.TryCommitMove() && first.TryCommitWrite() && first.TryCommit(),
+                    "STATUS_SELFTEST_CLEAN_PREFIX_PART1");
+                if (recordFirst) consent.RecordPreparedPartOutcome(0, clean);
+                Need(touch == null || touch(consent.GetPreparedPart(1), parts[1]), "STATUS_SELFTEST_CLEAN_PREFIX_TOUCH");
+                consent.Cancel();
+                return session;
+            }
+            RoundTripTest.Outcome Caught(SupervisedSendTest.Consent consent, int claimedState = -2)
+            {
+                // The catch shape of the field log: Send is part 1's clean outcome; the failing part 2 never reached the sender.
+                return RoundTripTest.Outcome.Ended("UNKNOWN - " + reason, clean, false, reason, 1, 3, 2,
+                    claimedState == -2 ? consent.PartInputState(1) : claimedState, null);
+            }
+            SupervisedSendTest.Consent request;
+            string[] payloads;
+            var resumable = Round(null, out request, out payloads);
+            try
+            {
+                var outcome = Caught(request);
+                Need(outcome.CleanPrefixUntouchedPart && InputAttempted(request, outcome) && IsCleanPrefixAbort(true, request, outcome) &&
+                    !IsUncertainAbort(true, request, outcome) && !IsCleanPrefixAbort(false, request, outcome) &&
+                    ResumeRule(InputAttempted(request, outcome), IsUncertainAbort(true, request, outcome)) == "CLEAN_PREFIX" &&
+                    DecideAfterAbort(false, IsUncertainAbort(true, request, outcome), 1, AbortResumeLimit) == "RESUME" &&
+                    AbortReason(outcome) == reason && outcome.Send.Reason == "NONE", "STATUS_SELFTEST_CLEAN_PREFIX_RULE");
+                Need(resumable.TryReleaseAbortedRequest(request, outcome) && !resumable.Cancelled && resumable.CompletedRounds == 0 &&
+                    resumable.SendAttempted && resumable.WriteAttempted && resumable.CursorMoveAttempted && !resumable.PendingWrite,
+                    "STATUS_SELFTEST_CLEAN_PREFIX_RELEASED");
+                Need(!resumable.TryReleaseAbortedRequest(request, outcome), "STATUS_SELFTEST_CLEAN_PREFIX_ONCE");
+                // Abandoned parts are never sent and Output history is not committed; the next pwrsi repeats them.
+                Need(!request.GetPreparedPart(1).TryConsume(payloads[1]) && !request.GetPreparedPart(2).TryConsume(payloads[2]),
+                    "STATUS_SELFTEST_CLEAN_PREFIX_ABANDONED");
+                try { request.CommitPreparedOutput(); throw new InvalidOperationException("A clean prefix committed Output history."); }
+                catch (MonitorException) { }
+                var notice = SupervisedSendTest.Consent.ForAbortNotice(request.Marker, outcome.Confirmed, outcome.Prepared);
+                Need(notice.NoticeText == SupervisedSendTest.ReportAbortNotice(1, 3) &&
+                    notice.TryConsume(SupervisedSendTest.ReportAbortNotice(1, 3)) && !notice.TryConsume(notice.NoticeText),
+                    "STATUS_SELFTEST_CLEAN_PREFIX_NOTICE");
+                var next = resumable.StartRequest("M456789", "M567892"); // The session keeps listening with a new code.
+                Need(next != null && !ReferenceEquals(next, request), "STATUS_SELFTEST_CLEAN_PREFIX_NEXT_REQUEST");
+                // The limit still bounds repeated clean-prefix aborts.
+                Need(DecideAfterAbort(false, false, AbortResumeLimit, AbortResumeLimit) == "STATUS_REQUEST_ABORT_LIMIT",
+                    "STATUS_SELFTEST_CLEAN_PREFIX_LIMIT");
+            }
+            finally { resumable.Cancel(); }
+
+            void Refuse(StatusSession session, SupervisedSendTest.Consent consent, RoundTripTest.Outcome outcome, string name)
+            {
+                try
+                {
+                    Need(!IsCleanPrefixAbort(true, consent, outcome) && IsUncertainAbort(true, consent, outcome) &&
+                        DecideAfterAbort(false, IsUncertainAbort(true, consent, outcome), 1, AbortResumeLimit) == "STATUS_REQUEST_STOPPED" &&
+                        !session.TryReleaseAbortedRequest(consent, outcome) && !session.Cancelled, name);
+                }
+                finally { session.Cancel(); }
+            }
+            // Part 2 written but not clicked: the honest flag is false, and a forged flag is caught by the consent check.
+            var written = Round((part, text) => part.TryConsume(text) && part.TryCommitMove() && part.TryCommitWrite(),
+                out request, out payloads);
+            Need(!Caught(request).CleanPrefixUntouchedPart && Caught(request, 0).CleanPrefixUntouchedPart,
+                "STATUS_SELFTEST_CLEAN_PREFIX_WRITTEN_FLAG");
+            Refuse(written, request, Caught(request, 0), "STATUS_SELFTEST_CLEAN_PREFIX_WRITTEN");
+            // Part 2 handed to the sender, which reports an input attempt (or moved the cursor).
+            var touched = Round((part, text) => part.TryConsume(text), out request, out payloads);
+            var reported = RoundTripTest.Outcome.Ended("STOPPED", attempted, false, attempted.Reason, 1, 3, 2, request.PartInputState(1), attempted);
+            Need(!reported.CleanPrefixUntouchedPart && reported.FailedPartInputAttempted, "STATUS_SELFTEST_CLEAN_PREFIX_ATTEMPT_FLAG");
+            Refuse(touched, request, reported, "STATUS_SELFTEST_CLEAN_PREFIX_ATTEMPTED");
+            var moved = Round((part, text) => part.TryConsume(text) && part.TryCommitMove(), out request, out payloads);
+            Refuse(moved, request, RoundTripTest.Outcome.Ended("STOPPED", preInput, false, preInput.Reason, 1, 3, 2, 1, preInput),
+                "STATUS_SELFTEST_CLEAN_PREFIX_MOVED");
+            // A part consumed but rejected before input still qualifies (the pre-input rejection branch).
+            var rejected = Round((part, text) => part.TryConsume(text), out request, out payloads);
+            try
+            {
+                var outcome = RoundTripTest.Outcome.Ended("STOPPED", preInput, false, preInput.Reason, 1, 3, 2,
+                    request.PartInputState(1), preInput);
+                Need(outcome.CleanPrefixUntouchedPart && IsCleanPrefixAbort(true, request, outcome) && AbortReason(outcome) == preInput.Reason &&
+                    rejected.TryReleaseAbortedRequest(request, outcome), "STATUS_SELFTEST_CLEAN_PREFIX_PRE_INPUT_REJECTION");
+            }
+            finally { rejected.Cancel(); }
+            // BUSY notice written but not clicked, or part 1 sent but not recorded clean: not a clean prefix.
+            var busyPending = Round(null, out request, out payloads, busyClicked: false);
+            Refuse(busyPending, request, Caught(request), "STATUS_SELFTEST_CLEAN_PREFIX_BUSY_PENDING");
+            var unrecorded = Round(null, out request, out payloads, recordFirst: false);
+            Refuse(unrecorded, request, Caught(request), "STATUS_SELFTEST_CLEAN_PREFIX_UNRECORDED");
+            // Cancelled session: never resumed, and the decision is a cancellation, not a resume.
+            var cancelled = Round(null, out request, out payloads);
+            var cancelledOutcome = Caught(request);
+            cancelled.Cancel();
+            Need(IsCleanPrefixAbort(true, request, cancelledOutcome) && !cancelled.TryReleaseAbortedRequest(request, cancelledOutcome) &&
+                DecideAfterAbort(true, IsUncertainAbort(true, request, cancelledOutcome), 1, AbortResumeLimit) == "STATUS_SESSION_CANCELLED",
+                "STATUS_SELFTEST_CLEAN_PREFIX_CANCELLED");
         }
 
         private static void RunPlainCommandSelfTest(string directory)
