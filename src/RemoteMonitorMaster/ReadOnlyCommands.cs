@@ -253,7 +253,7 @@ namespace RemoteMonitorMaster
                 case "help help": body = "help는 허용 명령을 표시합니다. help 다음에 명령을 쓰면 해당 설명을 표시합니다."; break;
                 case "help total status": body = "total status는 Slave 시각, 가동 시간, RAM, 버전과 최대 8개 프로세스의 이름·PID·CPU·RAM·경과 시간을 표시합니다. CPU는 시뮬레이션 진행률이 아닙니다."; break;
                 case "help watchdog": return "HELP " + nonce + "\r\n" + WatchdogText.HelpBody() + "\r\n" + WatchdogText.HelpUsage();
-                case "help pwrsi": body = "pwrsi는 모든 PowerSI를 한 번 수집합니다. 처음에는 수집된 Output 전체, 이후에는 마지막 전송 이후 추가분을 보내며, 어느 쪽이든 3,000자를 넘으면 끝 3,000자만 표시하고 생략한 글자 수를 알립니다. 변동이 없으면 알립니다. 버퍼·자동 복사로 읽은 Output은 AFS Finished와 Total Sampling Points 줄로 완료 여부를 표시합니다. 조회·답장 준비는 최대 120초이며, 긴 답장은 여러 메시지로 나뉩니다. 다음 Master Ready까지 기다리세요. 답장 머리글의 PWRSI REPORT 번호는 Master Ready의 대괄호 번호와 같은 숫자이며, 같은 보고서의 PART는 001/003처럼 이어집니다."; break;
+                case "help pwrsi": body = "pwrsi는 모든 PowerSI를 한 번 수집합니다. 처음에는 수집된 Output 전체, 이후에는 마지막 전송 이후 추가분을 보내며, 어느 쪽이든 3,000자를 넘으면 끝 3,000자만 표시하고 생략한 글자 수를 알립니다. 변동이 없으면 알립니다. 버퍼·자동 복사로 읽은 Output은 AFS Finished와 Total Sampling Points 줄로 완료 여부를 표시합니다. PowerDC 모드 창은 Output 수집 대상이 아니어서 읽기·입력·복사 없이 제외 사실만 표시합니다. 조회·답장 준비는 최대 120초이며, 긴 답장은 여러 메시지로 나뉩니다. 다음 Master Ready까지 기다리세요. 답장 머리글의 PWRSI REPORT 번호는 Master Ready의 대괄호 번호와 같은 숫자이며, 같은 보고서의 PART는 001/003처럼 이어집니다."; break;
                 default: throw new MonitorException("COMMAND_INVALID", "Unknown read-only command.");
             }
             return "HELP " + nonce + "\r\n" + body + "\r\n명령은 표시된 소문자로 입력하세요. pwrsi에는 공백이 없고 total status와 watchdog on/off <PID>의 단어 사이는 한 칸입니다. 바깥 공백은 허용하며 답장을 확인한 뒤 다음 명령을 보내세요.";
@@ -652,20 +652,28 @@ namespace RemoteMonitorMaster
                 case "AUTO_COPY_OCCLUDED": return "다른 창이 Output을 가리고 있어 자동 입력을 생략했습니다";
                 case "AUTO_COPY_ANCHOR_CONTINUITY": return "저장 위치의 텍스트가 이전과 이어지지 않아 복사 결과를 버렸습니다";
                 case "BUFFER_RICHEDIT_UNSTABLE": return "Output 창 텍스트가 읽는 동안 바뀌어 직접 읽기를 보류했습니다. 잠시 후 다시 시도하세요.";
+                case "BUFFER_OUTPUT_NO_HWND": return "Output 창은 찾았지만 표준 텍스트 컨트롤이 없어 직접 읽지 못했습니다. 창 구조(SCOPE)로 대체 복사를 시도합니다.";
                 case PowerDcModeCode: return "PowerDC 모드 창: Output 수집 대상이 아닙니다 (읽기·입력·복사 없음)";
                 default: return UnknownAdvice;
             }
         }
 
-        // The LLM side of a fallback route: a missing setting, server or model is named; other locate failures stay generic.
+        // The LLM side of a fallback route: a missing setting, server or model and a refused region are named; other locate
+        // failures stay generic. OUTPUT_REGION_UNCONFIRMED is the Slave's one code for a located region the check refused.
         private static string LocateFailureName(string visionCode)
+        {
+            return NamedLocateFailure(visionCode) ?? "LLM 위치 확인 실패";
+        }
+
+        private static string NamedLocateFailure(string visionCode)
         {
             switch (visionCode)
             {
                 case "VISION_NOT_CONFIGURED": return "LLM 미설정";
                 case "VISION_SERVER_UNAVAILABLE": return "LLM 서버 없음";
                 case "VISION_MODEL_UNAVAILABLE": return "LLM 모델 미적재";
-                default: return "LLM 위치 확인 실패";
+                case "OUTPUT_REGION_UNCONFIRMED": return "LLM이 지목한 위치가 검증에서 거부됨";
+                default: return null;
             }
         }
 
@@ -702,9 +710,11 @@ namespace RemoteMonitorMaster
             var vision = target.VisionCode ?? string.Empty;
             if (target.State != "UNAVAILABLE" || target.Code == null || !target.Code.StartsWith("AUTO_COPY_", StringComparison.Ordinal) ||
                 !(vision.StartsWith("VISION_", StringComparison.Ordinal) || vision == "OUTPUT_REGION_UNCONFIRMED")) return null;
-            return "LLM 위치 확인(" + vision + ")과 대체 복사(" +
-                (target.Code == "AUTO_COPY_REGION_UNCONFIRMED" ? "사용할 위치 없음" : "마지막 결과: " + target.Code) +
-                ")가 모두 실패했습니다. LM Studio와 모델 상태를 확인하거나 Slave에서 PowerSI 전체 수집을 한 번 실행해 위치를 다시 저장하세요.";
+            var copy = "대체 복사(" + (target.Code == "AUTO_COPY_REGION_UNCONFIRMED" ? "사용할 위치 없음" : "마지막 결과: " + target.Code) + ")";
+            var named = NamedLocateFailure(vision);
+            return (named == null ? "LLM 위치 확인(" + vision + ")과 " + copy + "가 모두 실패했습니다. " :
+                named + "(" + vision + "), " + copy + "도 실패했습니다. ") +
+                "LM Studio와 모델 상태를 확인하거나 Slave에서 PowerSI 전체 수집을 한 번 실행해 위치를 다시 저장하세요.";
         }
 
         private static string BatchExplanation(string code, int targets)
@@ -1020,7 +1030,7 @@ namespace RemoteMonitorMaster
                 routes.Contains("로컬 LLM: Slave의 LM Studio 로컬 서버 실행과 포트를 확인하세요 [code VISION_SERVER_UNAVAILABLE]") &&
                 routes.Contains("상태: 읽음 | 출처: 자동 복사(LLM 위치 확인 실패 → Output 창 구조로 복사)") &&
                 routes.Contains("로컬 LLM: Output 창 위치를 찾지 못했습니다 [code OUTPUT_UNAVAILABLE]") &&
-                routes.Contains("상태: 읽음 | 출처: 자동 복사(LLM 위치 확인 실패 → 같은 창 크기의 저장 레이아웃으로 복사)") &&
+                routes.Contains("상태: 읽음 | 출처: 자동 복사(LLM이 지목한 위치가 검증에서 거부됨 → 같은 창 크기의 저장 레이아웃으로 복사)") &&
                 routes.Contains("로컬 LLM: 찾은 Output 위치를 확인하지 못했습니다 [code OUTPUT_REGION_UNCONFIRMED]") &&
                 routes.Contains("[code AUTO_COPY_SCOPE_READ]") && routes.Contains("대체 본문 41") && routes.Contains("대체 본문 43") &&
                 Occurrences(routes, "출처: 자동 복사(") == 3 && Occurrences(routes, "로컬 LLM: ") == 3 &&
@@ -1033,9 +1043,9 @@ namespace RemoteMonitorMaster
                 Fallback(56, "UNAVAILABLE", "VISION_SERVER_UNAVAILABLE", "VISION_SERVER_UNAVAILABLE"));
             var fallbackCodes = new[] { "AUTO_COPY_ANCHOR_CONTINUITY", "AUTO_COPY_BODY_MOVED", "AUTO_COPY_BODY_UNCONFIRMED", "AUTO_COPY_OCCLUDED" };
             Need(chains.Contains("LLM 위치 확인(VISION_TIMEOUT)과 대체 복사(마지막 결과: AUTO_COPY_BODY_MOVED)가 모두 실패했습니다. " + relearn) &&
-                chains.Contains("LLM 위치 확인(OUTPUT_REGION_UNCONFIRMED)과 대체 복사(사용할 위치 없음)가 모두 실패했습니다. " + relearn) &&
-                chains.Contains("LLM 위치 확인(VISION_MODEL_UNAVAILABLE)과 대체 복사(마지막 결과: AUTO_COPY_ANCHOR_CONTINUITY)가 모두 실패했습니다. ") &&
-                Occurrences(chains, "LLM 위치 확인(") == 3 && Occurrences(chains, relearn) == 3 &&
+                chains.Contains("LLM이 지목한 위치가 검증에서 거부됨(OUTPUT_REGION_UNCONFIRMED), 대체 복사(사용할 위치 없음)도 실패했습니다. " + relearn) &&
+                chains.Contains("LLM 모델 미적재(VISION_MODEL_UNAVAILABLE), 대체 복사(마지막 결과: AUTO_COPY_ANCHOR_CONTINUITY)도 실패했습니다. ") &&
+                Occurrences(chains, "LLM 위치 확인(") == 1 && Occurrences(chains, relearn) == 3 &&
                 chains.Contains("로컬 LLM: 제한 시간 내 수집하지 못했습니다 [code VISION_TIMEOUT]") && !chains.Contains("출처: 자동 복사") &&
                 chains.Contains("저장 위치의 텍스트가 이전과 이어지지 않아 복사 결과를 버렸습니다") &&
                 fallbackCodes.Select(RecoveryAdvice).Distinct().Count() == 4 &&
@@ -1199,6 +1209,22 @@ namespace RemoteMonitorMaster
                 modes.Contains("로컬 LLM: LM Studio 설정을 켜고 로드된 이미지 모델을 선택하세요 [code VISION_NOT_CONFIGURED]") &&
                 modes.Contains("로컬 LLM: Slave의 LM Studio에서 이미지 모델을 로드하세요 [code VISION_MODEL_UNAVAILABLE]") &&
                 Occurrences(modes, "로컬 LLM: ") == 3, "POWERDC_AND_ROUTE_NAMES");
+            // The Slave's actual PowerDC shape (BufferCode = Code, no LLM code), an Output dock without a native handle, and
+            // an all-failed chain without LLM setup.
+            const string noHwnd = "Output 창은 찾았지만 표준 텍스트 컨트롤이 없어 직접 읽지 못했습니다. 창 구조(SCOPE)로 대체 복사를 시도합니다.";
+            var dock = Fallback(87, "UNAVAILABLE", "AUTO_COPY_BODY_UNCONFIRMED", "VISION_NOT_CONFIGURED");
+            dock.BufferCode = "BUFFER_OUTPUT_NO_HWND";
+            var slaveShapes = Rendered(Fallback(89, "UNAVAILABLE", PowerDcModeCode, null), dock,
+                Fallback(88, "UNAVAILABLE", "BUFFER_OUTPUT_NO_HWND", null));
+            Check(RecoveryAdvice("BUFFER_OUTPUT_NO_HWND") == noHwnd && Occurrences(slaveShapes, powerDcLine) == 1 &&
+                Occurrences(slaveShapes, "직접 읽기: ") == 1 && slaveShapes.Contains("직접 읽기: " + noHwnd + " [code BUFFER_OUTPUT_NO_HWND]") &&
+                Occurrences(slaveShapes, noHwnd) == 2 &&
+                slaveShapes.Contains("LLM 미설정(VISION_NOT_CONFIGURED), 대체 복사(마지막 결과: AUTO_COPY_BODY_UNCONFIRMED)도 실패했습니다. " + relearn) &&
+                !slaveShapes.Contains("LLM 위치 확인(VISION_NOT_CONFIGURED)") && !slaveShapes.Contains(UnknownAdvice), "SLAVE_CODE_SHAPES");
+            Check(Help("help pwrsi", nonce).Contains("PowerDC 모드 창은 Output 수집 대상이 아니어서") &&
+                IsReply(Help("help pwrsi", nonce), "help pwrsi", nonce) &&
+                WatchdogText.HelpBody().Contains("PowerDC 모드 창은 Output 수집 대상이 아니어서 알림 없이 감시에서 제외합니다.") &&
+                IsReply(Help(WatchdogText.HelpWatchdog, nonce), WatchdogText.HelpWatchdog, nonce), "HELP_POWERDC");
 
             // PWRSI_TARGET: one record per target inside the command-log scope only; codes, counts and kinds, no names or text.
             var targetLogDirectory = Path.Combine(directory, "pwrsi-target-log");
