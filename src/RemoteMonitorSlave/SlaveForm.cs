@@ -575,7 +575,8 @@ namespace RemoteMonitorSlave
         {
             anchorState.Text = "자동 복사: 매번 Output 영역 확인 / 저장 위치 " + anchorStore.Count.ToString(CultureInfo.InvariantCulture) +
                 "개 / 최근 결과: " + (lastAutoCopyCode ?? "없음") +
-                " / 자동 복사 설정: " + (visionSettings.AutoCopyEnabled ? "사용" : "꺼짐") + Environment.NewLine +
+                " / 자동 복사 설정: " + (visionSettings.AutoCopyEnabled ? "사용" : "꺼짐") +
+                " / LLM 없이 대체 복사: " + (visionSettings.BlindCopyEnabled ? "허용" : "꺼짐") + Environment.NewLine +
                 (lastFallbackResult == null ? "" : "최근 대체 복사: " + lastFallbackResult + Environment.NewLine) +
                 "PowerSI 크기 변경 없음. 응답 없음(PENDING)은 입력 없이 건너뜁니다. 내부 시뮬레이션 pending 판별은 미구현입니다.";
         }
@@ -772,13 +773,15 @@ namespace RemoteMonitorSlave
             // Kept current after every route, so a target deadline or Pending in the middle still leaves the chain so far.
             sample.FallbackVision = visionCode;
             sample.Fallback = OutputAnchorStore.FallbackDetail(visionCode, null, null, null);
-            while ((route = OutputAnchorStore.DecideFallbackRoute(visionSettings.Enabled, visionSettings.AutoCopyEnabled, true, visionCode,
+            while ((route = OutputAnchorStore.DecideFallbackRoute(visionSettings.Enabled, visionSettings.AutoCopyEnabled,
+                visionSettings.BlindCopyEnabled, true, visionCode,
                 aims.Process != null && !codes.ContainsKey("ANCHOR"), !aims.Scope.IsEmpty && !codes.ContainsKey("SCOPE"),
                 aims.Layout != null && !codes.ContainsKey("LAYOUT"))) != null)
             {
                 // A further route only while this target can still afford one whole guarded copy.
                 if (codes.Count > 0 && remainingMilliseconds() < OutputAutoCopy.BudgetMilliseconds + 2000) break;
-                try { log.Write("OUTPUT_FALLBACK_BEGIN", "pid=" + pid + " route=" + route + " vision=" + LogValue(visionCode)); } catch { }
+                try { log.Write("OUTPUT_FALLBACK_BEGIN", "pid=" + pid + " route=" + route + " vision=" + LogValue(visionCode) +
+                    " llm=" + (visionSettings.Enabled ? "1" : "0") + " blind_copy=" + (visionSettings.BlindCopyEnabled ? "1" : "0")); } catch { }
                 ShowActivity(prefix + " / " + FallbackCause(visionCode) + " → " + OutputAnchorStore.RouteCaption(route) + " 복사 시도");
                 OutputAnchor anchor = route == "ANCHOR" ? aims.Process.Anchor
                     : route == "SCOPE" ? OutputAutoCopy.AnchorFromScope(frame, aims.Scope, target, deadline)
@@ -967,12 +970,30 @@ namespace RemoteMonitorSlave
                                 if (IsPending(sample.Buffer.Code)) throw new InvalidDataException("SC_PENDING");
                                 // A timed-out text provider is not permission to try input against the same application.
                                 bool copyAllowed = OutputAnchorStore.ReadPermitsInput(sample.Buffer);
-                                // LLM off or not configured: the LLM-free routes still run when auto copy is on, the read failure
-                                // permits input and an aim may exist (own stored position or Output scope rectangle). Otherwise
-                                // exactly as before: no capture, no input.
-                                blindFallback = OutputAnchorStore.DecideBlindFallback(visionSettings.Enabled, visionSettings.AutoCopyEnabled,
-                                    copyAllowed, sample.Process.StartUtcTicks.HasValue && anchorStore.HasProcessEntry(sample.Process.Pid,
-                                        sample.Process.StartUtcTicks.Value, sample.SessionId), PowerSiOutputBuffer.HasScopeRect(sample.Buffer.Detail));
+                                // LLM switched off: the LLM-free routes run only with auto copy AND the explicit blind_copy
+                                // opt-in, a read failure that permits input and an aim at the window's current client size (own
+                                // stored position for that size, or an Output scope rectangle that fits it). Otherwise exactly
+                                // as before: no activation, capture or input.
+                                if (!visionSettings.Enabled)
+                                {
+                                    OutputAnchorEntry sized;
+                                    Rectangle fits;
+                                    bool anchorAtSize = !mode.ClientSize.IsEmpty && sample.Process.StartUtcTicks.HasValue &&
+                                        anchorStore.TryGetProcessAnchor(sample.Process.Pid, sample.Process.StartUtcTicks.Value, sample.SessionId,
+                                            mode.ClientSize, out sized);
+                                    bool scopeAtSize = !mode.ClientSize.IsEmpty && PowerSiOutputBuffer.TryScopeRect(sample.Buffer.Detail, mode.ClientSize, out fits);
+                                    blindFallback = OutputAnchorStore.DecideBlindFallback(false, visionSettings.AutoCopyEnabled,
+                                        visionSettings.BlindCopyEnabled, copyAllowed, anchorAtSize, scopeAtSize);
+                                    try
+                                    {
+                                        log.Write("OUTPUT_FALLBACK_GATE", "pid=" + sample.Process.Pid.ToString(CultureInfo.InvariantCulture) +
+                                            " llm=0 auto_copy=" + (visionSettings.AutoCopyEnabled ? "1" : "0") +
+                                            " blind_copy=" + (visionSettings.BlindCopyEnabled ? "1" : "0") + " copy_allowed=" + (copyAllowed ? "1" : "0") +
+                                            " anchor=" + (anchorAtSize ? "1" : "0") + " scope=" + (scopeAtSize ? "1" : "0") +
+                                            " capture=" + (blindFallback ? "1" : "0"));
+                                    }
+                                    catch { }
+                                }
                                 if ((!visionSettings.Enabled && !blindFallback) || (remote && sample.Buffer.Text != null))
                                 {
                                     sample.Vision = PowerSiObservation.VisionUnavailable(visionSettings.Enabled ? "OUTPUT_UNAVAILABLE" : "VISION_NOT_CONFIGURED");
@@ -995,8 +1016,8 @@ namespace RemoteMonitorSlave
                                     // their cause. The prepared frame keys every aim (client size) and is SCOPE's body search.
                                     sample.Vision = PowerSiObservation.VisionUnavailable("VISION_NOT_CONFIGURED");
                                     var aims = FindFallbackAims(sample, frame, sample.Buffer);
-                                    if (OutputAnchorStore.DecideFallbackRoute(false, visionSettings.AutoCopyEnabled, copyAllowed,
-                                        "VISION_NOT_CONFIGURED", aims.Process != null, !aims.Scope.IsEmpty, aims.Layout != null) != null)
+                                    if (OutputAnchorStore.DecideFallbackRoute(false, visionSettings.AutoCopyEnabled, visionSettings.BlindCopyEnabled,
+                                        copyAllowed, "VISION_NOT_CONFIGURED", aims.Process != null, !aims.Scope.IsEmpty, aims.Layout != null) != null)
                                     {
                                         fallbackAttempted = true;
                                         await CopyWithoutVision(sample, target, frame, "VISION_NOT_CONFIGURED", aims, deadline.Token,
@@ -1010,7 +1031,7 @@ namespace RemoteMonitorSlave
                                     // slow or hung server still leaves this target time for one guarded fallback copy.
                                     var bufferRead = sample.Buffer;
                                     var aims = FindFallbackAims(sample, frame, bufferRead);
-                                    int locateLimit = OutputAnchorStore.DecideFallbackRoute(true, true, true, "VISION_TIMEOUT",
+                                    int locateLimit = OutputAnchorStore.DecideFallbackRoute(true, true, false, true, "VISION_TIMEOUT",
                                         aims.Process != null, !aims.Scope.IsEmpty, aims.Layout != null) == null ? 0 :
                                         (int)Math.Max(5000, allowance - targetClock.ElapsedMilliseconds - 12000);
                                     located = await LocateOutput(target, deadline.Token, progress, frame, locateLimit);
@@ -1059,7 +1080,8 @@ namespace RemoteMonitorSlave
                                             sample.Vision = refused;
                                         }
                                         if (OutputAnchorStore.DecideFallbackRoute(visionSettings.Enabled, visionSettings.AutoCopyEnabled,
-                                            copyAllowed, visionCode, aims.Process != null, !aims.Scope.IsEmpty, aims.Layout != null) != null)
+                                            visionSettings.BlindCopyEnabled, copyAllowed, visionCode, aims.Process != null, !aims.Scope.IsEmpty,
+                                            aims.Layout != null) != null)
                                         {
                                             fallbackAttempted = true;
                                             await CopyWithoutVision(sample, target, frame, visionCode, aims, deadline.Token,
@@ -1577,7 +1599,8 @@ namespace RemoteMonitorSlave
                     (sample?.Fallback == null ? "" : " / 비전 실패 대체 복사: " + sample.Fallback +
                         (sample.Route == null ? " 실패" : " 성공 " + sample.Route)) +
                     " / 자동 복사 설정: " +
-                    (visionSettings.AutoCopyEnabled ? "사용" : "꺼짐") + " / 전체 텍스트: " +
+                    (visionSettings.AutoCopyEnabled ? "사용" : "꺼짐") + " / LLM 없이 대체 복사: " +
+                    (visionSettings.BlindCopyEnabled ? "허용" : "꺼짐") + " / 전체 텍스트: " +
                     (buffer == null ? "없음" : buffer.Code + " " + buffer.Method + " " + buffer.Detail) +
                     " / 입력 이미지와 마지막 줄을 직접 대조하세요. 한 번의 성공이 연속 무인 운용이나 전체 전사 정확도를 보증하지 않습니다."
             };
@@ -2231,7 +2254,16 @@ namespace RemoteMonitorSlave
                         !thinkingNote.Text.Contains("LM Studio에서도 thinking을 끄고") ||
                         settingsForm.Controls.Cast<Control>().Any(control => control.Bottom > settingsForm.ClientSize.Height))
                         throw new InvalidOperationException("Vision settings hide the thinking distinction or clip controls.");
+                    var blindBox = settingsForm.Controls.OfType<CheckBox>().Single(box => box.Text.StartsWith("LLM을 쓰지 않을 때도 대체 복사 허용", StringComparison.Ordinal));
+                    if (settingsForm.Current().BlindCopyEnabled || blindBox.Checked ||
+                        !settingsForm.Controls.OfType<Label>().Any(label => label.AccessibleName == "LLM 없이 대체 복사 입력 안내"))
+                        throw new InvalidOperationException("The LLM-free copy was ticked by default or lost its input note.");
+                    blindBox.Checked = true;
+                    if (!settingsForm.Current().BlindCopyEnabled) throw new InvalidOperationException("Ticking the LLM-free copy was not read back.");
                 }
+                using (var optedIn = new LocalVisionSettingsForm(new LocalVisionSettings { BlindCopyEnabled = true }))
+                    if (!optedIn.Current().BlindCopyEnabled || !optedIn.Current().AutoCopyEnabled)
+                        throw new InvalidOperationException("A saved LLM-free copy opt-in did not round-trip through the dialog.");
                 using (var form = new SlaveForm(directory))
                 {
                     if (!form.Text.Contains(LinkVersion.AppValue) || form.server != null || form.identity != null ||

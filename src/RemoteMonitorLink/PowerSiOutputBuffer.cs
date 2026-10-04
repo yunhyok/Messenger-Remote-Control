@@ -135,7 +135,8 @@ namespace RemoteMonitorLink
                 Require(length == after, "BUFFER_CHANGED_DURING_READ");
                 if (large)
                 {
-                    var verdict = LargeRichEditVerdict(length, text.Length, capacity, LineBreaks(text), stable);
+                    var verdict = LargeRichEditVerdict(length, text.Length, capacity, LineBreaks(text),
+                        text.IndexOf("\r\n", StringComparison.Ordinal) >= 0, stable);
                     Require(verdict == null, verdict);
                 }
                 else
@@ -176,11 +177,12 @@ namespace RemoteMonitorLink
         }
 
         // UIA geometry of the one windowless "Output" element, in root client pixels. chain[0] is that element's
-        // BoundingRectangle, chain[1..4] its ancestors (the caller stops early at the root window, another process or a tab
-        // that is not selected). The first element of at least 240x120 decides: a caption bar or tab label is smaller, so
-        // its dock or tab pane is chosen; one larger than 90% of the client in either dimension is the main area or the
-        // whole window, and one not fully inside the client is not this window's pane. Either refuses (Empty), as do zero or
-        // several "Output" elements, no such element within 4 ancestors, or an empty client. Never clipped or guessed.
+        // BoundingRectangle, chain[1..2] its parent and grandparent (the caller stops early at the root window, another
+        // process or a tab that is not selected): enough for caption -> dock pane and tab item -> tab strip -> tab control
+        // pane. The first element of at least 240x120 decides: a caption bar or tab label is smaller, so its dock or tab
+        // pane is chosen; one larger than 90% of the client in either dimension is the main area or the whole window, and
+        // one not fully inside the client is not this window's pane. Either refuses (Empty), as do zero or several "Output"
+        // elements, nothing large enough within those 3 elements, or an empty client. Never clipped or guessed.
         internal static Rectangle SelectOutputGeometry(int outputElements, IList<Rectangle> chain, Size client)
         {
             if (outputElements != 1 || chain == null || client.Width < 1 || client.Height < 1) return Rectangle.Empty;
@@ -195,7 +197,34 @@ namespace RemoteMonitorLink
             }
             return Rectangle.Empty;
         }
-        private const int GeometryMinWidth = 240, GeometryMinHeight = 120, GeometryAncestors = 4;
+        private const int GeometryMinWidth = 240, GeometryMinHeight = 120, GeometryAncestors = 2;
+
+        // True only for a window shown at 96 DPI without scaling, the one case where UIA's BoundingRectangle (may be physical
+        // pixels) and this DPI-unaware process's ScreenToClient (logical) agree. dpi: GetDpiForWindow where available (it
+        // reports 96 for a DPI-unaware target at any scale), otherwise the system DPI; 0 when unknown. Because of that the
+        // DWM frame bounds (always physical) must also match the logical window rectangle within its invisible borders.
+        internal static bool UnscaledWindow(IntPtr root, out int dpi)
+        {
+            dpi = 0;
+            try
+            {
+                try { dpi = (int)GetDpiForWindow(root); }
+                catch (EntryPointNotFoundException)
+                {
+                    var screen = GetDC(IntPtr.Zero);
+                    if (screen == IntPtr.Zero) return false;
+                    try { dpi = GetDeviceCaps(screen, 88); } // LOGPIXELSX
+                    finally { ReleaseDC(IntPtr.Zero, screen); }
+                }
+                NativeRect logical, physical;
+                if (dpi != 96 || !GetWindowRect(root, out logical) ||
+                    DwmGetWindowAttribute(root, 9, out physical, Marshal.SizeOf(typeof(NativeRect))) != 0) return false; // DWMWA_EXTENDED_FRAME_BOUNDS
+                long lw = (long)logical.Right - logical.Left, lh = (long)logical.Bottom - logical.Top;
+                long pw = (long)physical.Right - physical.Left, ph = (long)physical.Bottom - physical.Top;
+                return lw > 0 && lh > 0 && pw > 0 && ph > 0 && Math.Abs(lw - pw) <= 32 && Math.Abs(lh - ph) <= 32;
+            }
+            catch { return false; }
+        }
         // WM_GETTEXT into declared + 2 characters (declared + 1 text characters and the terminator): a copy that fills
         // the buffer (capacity - 1 characters) may have been cut. The marshaler returns the text up to the first NUL.
         private static string ReadText(IntPtr window, int declared, out UIntPtr copied, out int capacity)
@@ -216,16 +245,18 @@ namespace RemoteMonitorLink
         private static int LineBreaks(string text) { return string.IsNullOrEmpty(text) ? 0 : CountLines(text) - 1; }
 
         // Acceptance of one Unicode RichEdit 2.0+ read above 64K: null accepts, anything else is the failure code. Fail
-        // closed: WM_GETTEXTLENGTH may count each paragraph end as CR+LF while WM_GETTEXT returns CR, so the copy may fall
-        // short of the declared length by at most its own line breaks and by nothing else; a copy that filled its buffer
-        // or came back no longer than 64K may be cut; the second read of the same attempt must be identical.
-        internal static string LargeRichEditVerdict(int declared, int copied, int capacity, int lineBreaks, bool stable)
+        // closed: the copy must equal the declared length exactly, or fall short by exactly its own line terminators when
+        // it holds no CR+LF pair at all (the documented over-count of CR-only RichEdit text, each paragraph end counted as
+        // CR+LF). Any other shortfall, a copy that filled its buffer or one no longer than 64K may be a cut tail; the
+        // second read of the same attempt must be identical.
+        internal static string LargeRichEditVerdict(int declared, int copied, int capacity, int lineTerminators, bool hasCrLf, bool stable)
         {
             if (declared > MaxCharacters || copied > MaxCharacters) return "BUFFER_TOO_LARGE";
             if (declared <= RichEditClassicLimit || capacity < declared + 2) return "BUFFER_RICHEDIT_LARGE_UNSUPPORTED";
             if (copied < 0 || copied >= capacity - 1 || copied > declared) return "BUFFER_INCOMPLETE";
             if (copied <= RichEditClassicLimit) return "BUFFER_INCOMPLETE";
-            if (lineBreaks < 0 || declared - copied > lineBreaks) return "BUFFER_INCOMPLETE";
+            int shortfall = declared - copied;
+            if (shortfall != 0 && (hasCrLf || lineTerminators < 1 || shortfall != lineTerminators)) return "BUFFER_INCOMPLETE";
             return stable ? null : "BUFFER_RICHEDIT_UNSTABLE";
         }
         // "|R|x|y|w|h" in the root's CLIENT pixels, in this DPI-unaware process's virtualized space like the Slave's other
@@ -358,14 +389,15 @@ namespace RemoteMonitorLink
                 ? OutputGeometry(root, pid, found.WithoutHandle) : Rectangle.Empty;
         }
 
-        // Fail closed: any UIA failure, another process, the root window itself or a tab that is not the selected one ends
-        // the ancestor chain, and only SelectOutputGeometry decides. Geometry only: no Name or text is read here.
+        // Fail closed: a scaled or unknown DPI, any UIA failure, another process, the root window itself or a tab that is not
+        // the selected one ends the chain, and only SelectOutputGeometry decides. Geometry only: no Name or text is read here.
         private static Rectangle OutputGeometry(IntPtr root, uint pid, AutomationElement marker)
         {
             try
             {
                 NativeRect client;
-                if (!GetClientRect(root, out client)) return Rectangle.Empty;
+                int dpi;
+                if (!UnscaledWindow(root, out dpi) || !GetClientRect(root, out client)) return Rectangle.Empty;
                 var request = new CacheRequest { TreeScope = TreeScope.Element, TreeFilter = Automation.RawViewCondition,
                     AutomationElementMode = AutomationElementMode.Full };
                 request.Add(AutomationElement.BoundingRectangleProperty); request.Add(AutomationElement.ControlTypeProperty);
@@ -410,9 +442,10 @@ namespace RemoteMonitorLink
             string name = element.GetCachedPropertyValue(AutomationElement.NameProperty) as string ?? "";
             var type = (ControlType)element.GetCachedPropertyValue(AutomationElement.ControlTypeProperty);
             bool offscreen = (bool)element.GetCachedPropertyValue(AutomationElement.IsOffscreenProperty);
+            // A TabItem never has an HWND of its own: it only ever leads to the geometry of its (selected) tab pane.
             bool marker = !offscreen && string.Equals(name.Trim(), "Output", StringComparison.OrdinalIgnoreCase) &&
                 (type == ControlType.Pane || type == ControlType.Group || type == ControlType.Custom ||
-                 type == ControlType.Text || type == ControlType.TitleBar || type == ControlType.Window);
+                 type == ControlType.Text || type == ControlType.TitleBar || type == ControlType.Window || type == ControlType.TabItem);
             if (marker)
             {
                 found.Count++;
@@ -559,9 +592,10 @@ namespace RemoteMonitorLink
             Rectangle Pick(int names, params Rectangle[] chain) { return SelectOutputGeometry(names, chain, client); }
             Require(Pick(1, caption, dock) == dock && Pick(1, caption, dock, new Rectangle(0, 0, 1920, 1009)) == dock,
                 "TEST_GEOMETRY_CAPTION_TO_PANE");
-            // Tab label -> tab item -> tab strip (wide but 26 px high) -> the tab control's pane.
+            // Tab item "Output" -> tab strip (wide but 26 px high) -> the tab control's pane; one level more is too far.
             var tabPane = new Rectangle(315, 736, 600, 264);
-            Require(Pick(1, new Rectangle(320, 740, 60, 20), new Rectangle(318, 738, 64, 24), new Rectangle(315, 736, 600, 26), tabPane) == tabPane,
+            Require(Pick(1, new Rectangle(318, 738, 64, 24), new Rectangle(315, 736, 600, 26), tabPane) == tabPane &&
+                Pick(1, new Rectangle(320, 740, 60, 20), new Rectangle(318, 738, 64, 24), new Rectangle(315, 736, 600, 26), tabPane).IsEmpty,
                 "TEST_GEOMETRY_TAB_LABEL");
             Require(Pick(1, dock, new Rectangle(300, 700, 700, 300)) == dock && Pick(1, new Rectangle(0, 0, 240, 120)) == new Rectangle(0, 0, 240, 120),
                 "TEST_GEOMETRY_ALREADY_LARGE");
@@ -576,10 +610,10 @@ namespace RemoteMonitorLink
             Require(Pick(1, new Rectangle(0, 0, 239, 400), new Rectangle(0, 0, 400, 119)).IsEmpty && Pick(1, caption).IsEmpty &&
                 Pick(1).IsEmpty && SelectOutputGeometry(1, null, client).IsEmpty && SelectOutputGeometry(1, new[] { dock }, Size.Empty).IsEmpty,
                 "TEST_GEOMETRY_NONE");
-            // At most 4 ancestors above the element itself.
+            // At most 3 elements: the "Output" element, its parent and its grandparent.
             var small = Rectangle.Empty;
-            Require(Pick(1, caption, small, small, small, dock) == dock && Pick(1, caption, small, small, small, small, dock).IsEmpty,
-                "TEST_GEOMETRY_FOUR_ANCESTORS");
+            Require(Pick(1, caption, small, dock) == dock && Pick(1, caption, small, small, dock).IsEmpty &&
+                Pick(1, caption, small, small, small, dock).IsEmpty, "TEST_GEOMETRY_THREE_ELEMENTS");
             // BUFFER_OUTPUT_NO_HWND carries the same "|R|x|y|w|h" root-client shape as the HWND scope codes.
             var detail = Detail(37, 0, 0, 143) + RectSuffix(dock);
             Rectangle parsed;
@@ -590,29 +624,36 @@ namespace RemoteMonitorLink
         private static void LargeReadSelfTest()
         {
             const int Declared = 70000, Capacity = Declared + 2;
-            // declared, copied, capacity, line breaks in the copy, second read identical -> null (accept) or failure code.
+            const bool CrLf = true, CrOnly = false, Same = true, Differs = false;
+            // declared, copied, capacity, line terminators in the copy, copy holds a CR+LF pair, second read identical
+            // -> null (accept) or the failure code.
             var table = new[]
             {
-                Tuple.Create(Declared, Declared, Capacity, 0, true, (string)null),                    // exact whole read
-                Tuple.Create(Declared, Declared - 1400, Capacity, 1400, true, (string)null),          // CR+LF counted, CR returned
-                Tuple.Create(Declared, Declared - 1401, Capacity, 1400, true, "BUFFER_INCOMPLETE"),   // more missing than line breaks
-                Tuple.Create(Declared, Declared + 1, Capacity, 0, true, "BUFFER_INCOMPLETE"),         // filled the buffer: maybe cut
-                Tuple.Create(Declared, Declared + 1, Capacity + 1, 0, true, "BUFFER_INCOMPLETE"),     // more than declared
-                Tuple.Create(Declared, 65535, Capacity, 4465, true, "BUFFER_INCOMPLETE"),             // classic 64K cut
-                Tuple.Create(Declared, 65536, Capacity, 4464, true, (string)null),                    // just past 64K, explained
-                Tuple.Create(Declared, 0, Capacity, 0, true, "BUFFER_INCOMPLETE"),
-                Tuple.Create(Declared, -1, Capacity, 0, true, "BUFFER_INCOMPLETE"),
-                Tuple.Create(Declared, 69000, Capacity, -1, true, "BUFFER_INCOMPLETE"),
-                Tuple.Create(Declared, Declared, Capacity, 0, false, "BUFFER_RICHEDIT_UNSTABLE"),     // second read differed
-                Tuple.Create(Declared, Declared - 1400, Capacity, 1400, false, "BUFFER_RICHEDIT_UNSTABLE"),
-                Tuple.Create(Declared, Declared, Declared + 1, 0, true, "BUFFER_RICHEDIT_LARGE_UNSUPPORTED"), // buffer too small
-                Tuple.Create(65535, 65535, 65537, 0, true, "BUFFER_RICHEDIT_LARGE_UNSUPPORTED"),      // not a large read
-                Tuple.Create(MaxCharacters, MaxCharacters, MaxCharacters + 2, 0, true, (string)null), // the 8 Mi cap itself
-                Tuple.Create(MaxCharacters + 1, MaxCharacters, MaxCharacters + 3, 1, true, "BUFFER_TOO_LARGE"),
-                Tuple.Create(Declared, MaxCharacters + 1, MaxCharacters + 3, 0, true, "BUFFER_TOO_LARGE"),
+                Tuple.Create(Declared, Declared, Capacity, 0, CrOnly, Same, (string)null),                   // exact whole read
+                Tuple.Create(Declared, Declared, Capacity, 1400, CrLf, Same, (string)null),                  // exact, CR+LF text
+                Tuple.Create(Declared, Declared - 1400, Capacity, 1400, CrOnly, Same, (string)null),         // CR-only over-count
+                Tuple.Create(Declared, Declared - 1399, Capacity, 1400, CrOnly, Same, "BUFFER_INCOMPLETE"),  // line count - 1
+                Tuple.Create(Declared, Declared - 1401, Capacity, 1400, CrOnly, Same, "BUFFER_INCOMPLETE"),  // more than the lines
+                Tuple.Create(Declared, Declared - 1, Capacity, 1400, CrLf, Same, "BUFFER_INCOMPLETE"),       // CR+LF copy, short by 1
+                Tuple.Create(Declared, Declared - 1400, Capacity, 1400, CrLf, Same, "BUFFER_INCOMPLETE"),    // CR+LF copy, short by lines
+                Tuple.Create(Declared, Declared - 5, Capacity, 0, CrOnly, Same, "BUFFER_INCOMPLETE"),        // no lines to explain it
+                Tuple.Create(Declared, Declared + 1, Capacity, 0, CrOnly, Same, "BUFFER_INCOMPLETE"),        // filled the buffer: maybe cut
+                Tuple.Create(Declared, Declared + 1, Capacity + 1, 0, CrOnly, Same, "BUFFER_INCOMPLETE"),    // more than declared
+                Tuple.Create(Declared, 65535, Capacity, 4465, CrOnly, Same, "BUFFER_INCOMPLETE"),            // classic 64K cut
+                Tuple.Create(Declared, 65536, Capacity, 4464, CrOnly, Same, (string)null),                   // just past 64K, explained
+                Tuple.Create(Declared, 0, Capacity, 0, CrOnly, Same, "BUFFER_INCOMPLETE"),
+                Tuple.Create(Declared, -1, Capacity, 0, CrOnly, Same, "BUFFER_INCOMPLETE"),
+                Tuple.Create(Declared, 69000, Capacity, -1, CrOnly, Same, "BUFFER_INCOMPLETE"),
+                Tuple.Create(Declared, Declared, Capacity, 0, CrOnly, Differs, "BUFFER_RICHEDIT_UNSTABLE"),   // second read differed
+                Tuple.Create(Declared, Declared - 1400, Capacity, 1400, CrOnly, Differs, "BUFFER_RICHEDIT_UNSTABLE"),
+                Tuple.Create(Declared, Declared, Declared + 1, 0, CrOnly, Same, "BUFFER_RICHEDIT_LARGE_UNSUPPORTED"), // buffer too small
+                Tuple.Create(65535, 65535, 65537, 0, CrOnly, Same, "BUFFER_RICHEDIT_LARGE_UNSUPPORTED"),     // not a large read
+                Tuple.Create(MaxCharacters, MaxCharacters, MaxCharacters + 2, 0, CrOnly, Same, (string)null), // the 8 Mi cap itself
+                Tuple.Create(MaxCharacters + 1, MaxCharacters, MaxCharacters + 3, 1, CrOnly, Same, "BUFFER_TOO_LARGE"),
+                Tuple.Create(Declared, MaxCharacters + 1, MaxCharacters + 3, 0, CrOnly, Same, "BUFFER_TOO_LARGE"),
             };
             foreach (var row in table)
-                Require(LargeRichEditVerdict(row.Item1, row.Item2, row.Item3, row.Item4, row.Item5) == row.Item6, "TEST_RICHEDIT_VERDICT");
+                Require(LargeRichEditVerdict(row.Item1, row.Item2, row.Item3, row.Item4, row.Item5, row.Item6) == row.Item7, "TEST_RICHEDIT_VERDICT");
             Require(LineBreaks("") == 0 && LineBreaks(null) == 0 && LineBreaks("a") == 0 && LineBreaks("a\r\nb\rc\nd\r") == 4,
                 "TEST_RICHEDIT_LINE_BREAKS");
             Require(LargeReadSuffix("RICHEDIT50W", 70000, 68600, true) == "|E|W50|70000|68600|1" &&
@@ -680,6 +721,11 @@ namespace RemoteMonitorLink
         [StructLayout(LayoutKind.Sequential)] private struct NativePoint { internal int X, Y; }
         [DllImport("user32.dll")] private static extern bool GetWindowRect(IntPtr window, out NativeRect rect);
         [DllImport("user32.dll")] private static extern bool GetClientRect(IntPtr window, out NativeRect rect);
+        [DllImport("user32.dll")] private static extern uint GetDpiForWindow(IntPtr window);
+        [DllImport("user32.dll")] private static extern IntPtr GetDC(IntPtr window);
+        [DllImport("user32.dll")] private static extern int ReleaseDC(IntPtr window, IntPtr dc);
+        [DllImport("gdi32.dll")] private static extern int GetDeviceCaps(IntPtr dc, int index);
+        [DllImport("dwmapi.dll")] private static extern int DwmGetWindowAttribute(IntPtr window, int attribute, out NativeRect value, int size);
         [DllImport("user32.dll")] private static extern bool ScreenToClient(IntPtr window, ref NativePoint point);
         [DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
         [DllImport("user32.dll")] private static extern uint GetClipboardSequenceNumber();
