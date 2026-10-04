@@ -231,12 +231,13 @@ namespace RemoteMonitorMaster
         }
 
         // A notice never goes out while a command is waiting after the current Ready: that command is handled first.
-        // waitBaseline is the pre-Ready baseline of the current wait; the Ready row is re-bound on this snapshot.
+        // waitBaseline is the pre-Ready baseline of the current wait; the Ready row is re-bound on this snapshot from the
+        // wait's last bound row (ReceiveProbe.RebindWait), so rows evicted from a full history list do not block it.
         internal static void RequireNoPendingCommand(ReceiveProbe.Baseline waitBaseline, ProbeSnapshot snapshot, AuditLog log = null)
         {
             Need(waitBaseline != null && waitBaseline.PlainCommands && waitBaseline.ReadyRow < 0 && snapshot != null,
                 "WATCHDOG_NOTICE_BASELINE_REQUIRED");
-            var bound = ReceiveProbe.BindReadyBoundary(waitBaseline, snapshot, log);
+            var bound = ReceiveProbe.RebindWait(waitBaseline, snapshot, log);
             Need(bound != null, "WATCHDOG_NOTICE_READY_NOT_BOUND");
             bool blocked;
             var candidate = ReceiveProbe.Evaluate(bound, snapshot, log, out blocked);
@@ -326,6 +327,8 @@ namespace RemoteMonitorMaster
                                 ReceiveProbe.ValidateContinuity(original, snapshot);
                             }
                             // The next receive binds to this exact Ready, without swallowing a fast following command.
+                            // This is the send's own capture just before input, never an earlier wait's snapshot; a top
+                            // eviction as Ready is appended is then tolerated by ReceiveProbe.BindReadyBoundary.
                             ReceiveProbe.RequireReadyAbsent(snapshot, requestMarker);
                             baseline = ReceiveProbe.CreateBaseline(snapshot, requestMarker, true);
                         });

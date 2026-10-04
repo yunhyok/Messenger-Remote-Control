@@ -863,7 +863,8 @@ namespace RemoteMonitorMaster
         // E2. Fresh admission only: when the bound Ready row moved up by a top eviction, the Ready-bound baseline re-bound
         // at its new index, checked against the bound snapshot and the previous poll; null when Ready did not move this
         // way, so today's checks (RECEIVE_READY_BOUNDARY_CHANGED etc.) decide unchanged.
-        internal static Baseline RebaseReady(Baseline bound, ProbeSnapshot previous, ProbeSnapshot current, AuditLog log = null)
+        internal static Baseline RebaseReady(Baseline bound, ProbeSnapshot previous, ProbeSnapshot current, AuditLog log = null,
+            string mode = "FRESH_ADMISSION")
         {
             if (bound == null || !bound.PlainCommands || bound.ReadyRow < 0 || current == null) return null;
             var after = ValidateContinuity(bound, current);
@@ -879,9 +880,54 @@ namespace RemoteMonitorMaster
             if (ready < 0 || ready != readyByNotice || !ShiftedReadyRows(bound.Selection, bound.ReadyRow, after, ready)) return null;
             if (previous != null && !ReferenceEquals(previous, bound.Snapshot) &&
                 !ShiftedReadyRows(SelectHistory(previous), bound.ReadyRow, after, ready)) return null;
-            log?.Write("INFO", "RECEIVE_READY_SHIFTED", ReadyShiftedFields("FRESH_ADMISSION", bound.ReadyRow - ready,
+            log?.Write("INFO", "RECEIVE_READY_SHIFTED", ReadyShiftedFields(mode, bound.ReadyRow - ready,
                 boundRows.Count, rows.Count, ready, bound.ReadyRow));
             return CreateBaseline(current, bound.Marker, true, ready);
+        }
+
+        // E4. The command wait's Ready binding, carried across a watchdog yield. Keyed by the wait's pre-Ready baseline,
+        // which StatusSession keeps for a re-entered wait; a new Ready (SendReady) starts a new key.
+        private static readonly ConditionalWeakTable<Baseline, Baseline> Waits = new ConditionalWeakTable<Baseline, Baseline>();
+
+        internal static void RememberWait(Baseline preReady, Baseline bound)
+        {
+            if (preReady == null || bound == null || preReady.ReadyRow >= 0 || bound.ReadyRow < 0) return;
+            lock (TrailGate)
+            {
+                Waits.Remove(preReady);
+                Waits.Add(preReady, bound);
+            }
+        }
+
+        // Binds the wait's Ready row. The first entry binds from the pre-Ready snapshot (BindReadyBoundary). A re-entry
+        // after a yield, or a watchdog notice's pending-command check, first continues from the wait's last bound Ready
+        // row: the same row with today's poll-to-poll rule, or RebaseReady's bounded rule when a top eviction moved it up
+        // (mode YIELD_REENTRY). Whenever that does not hold, today's re-binding from the pre-Ready snapshot decides.
+        internal static Baseline RebindWait(Baseline preReady, ProbeSnapshot current, AuditLog log = null)
+        {
+            Need(preReady != null && preReady.PlainCommands && preReady.ReadyRow < 0, "RECEIVE_READY_BASELINE_REQUIRED");
+            Baseline carried;
+            lock (TrailGate) Waits.TryGetValue(preReady, out carried);
+            var bound = (carried == null ? null : ContinueWait(preReady, carried, current, log)) ??
+                BindReadyBoundary(preReady, current, log);
+            RememberWait(preReady, bound);
+            return bound;
+        }
+
+        private static Baseline ContinueWait(Baseline preReady, Baseline carried, ProbeSnapshot current, AuditLog log)
+        {
+            try
+            {
+                RequireReadyAbsent(preReady.Snapshot, preReady.Marker);
+                var after = ValidateContinuity(carried, current);
+                if (!SafeIsReadyRow(after, carried.Marker, carried.ReadyRow))
+                    return RebaseReady(carried, null, current, log, "YIELD_REENTRY");
+                // Same row: still the one Ready of this code, and today's poll-to-poll rule against the carried binding.
+                if (ReadyRow(after, carried.Marker) != carried.ReadyRow) return null;
+                ValidatePlainHistoryPrefix(carried.Snapshot, current, null, carried, acceptedRequest: false);
+                return CreateBaseline(current, carried.Marker, true, carried.ReadyRow);
+            }
+            catch (MonitorException) { return null; } // Today's re-binding decides, with its own reason.
         }
 
         // The older snapshot's rows before Ready, Ready itself and the rows after it that today's check protects (up to
@@ -1250,7 +1296,7 @@ namespace RemoteMonitorMaster
                 {
                     Baseline ready;
                     var readyWait = Stopwatch.StartNew();
-                    while ((ready = BindReadyBoundary(baseline, firstSnapshot, log)) == null)
+                    while ((ready = RebindWait(baseline, firstSnapshot, log)) == null)
                     {
                         phaseClock.Restart(); // Each retry capture gets its own snapshot budget; the wait is bounded below.
                         Alive();
@@ -1365,6 +1411,7 @@ namespace RemoteMonitorMaster
                     {
                         baseline = rebased;
                         previousCandidate = null;
+                        if (continuousWait) RememberWait(suppliedBaseline, rebased); // A yield re-enters from this row.
                     }
                     else if (plainCommands && previous != null)
                         ValidatePlainHistoryPrefix(previous, current, log, baseline, acceptedRequest: acceptedProof != null);
@@ -2251,6 +2298,65 @@ namespace RemoteMonitorMaster
             var movedHit = Poll(ref movedBound, boundSnapshot, movedWindow);
             Need(Evaluate(plain, plainWindow) == Slot(plainWindow, slots + 2) && movedBound.ReadyRow == slots - 3 &&
                 movedHit == Slot(movedWindow, slots - 1), "RECEIVE_SELF_TEST_READY_SHIFT_TODAY_RULE");
+
+            // ---- Watchdog yield re-entry (the wait's binding is carried across the yield; StatusSession keeps the same
+            // pre-Ready baseline object for a re-entered wait, and RebindWait continues from its last bound Ready row).
+            Baseline FreshWait()
+            {
+                var waitBaseline = CreateBaseline(Window(Previous()), marker, true);
+                var first = RebindWait(waitBaseline, Tail(Plus(Previous(), readyText)));
+                Need(first != null && first.ReadyRow == slots - 1, "RECEIVE_SELF_TEST_YIELD_SHIFT_FIRST_BIND");
+                return waitBaseline;
+            }
+            List<string> Chat(List<string> rows, int messages)
+            {
+                var copy = rows.ToList();
+                for (var i = 0; i < messages; i++) copy.Add("chat while checking " + i);
+                return copy;
+            }
+            foreach (var evicted in new[] { 1, MaxEvictedRows })
+            {
+                var waitBaseline = FreshWait();
+                var during = Chat(Plus(Previous(), readyText), evicted); // Each ignored message evicted one top row.
+                var reentry = RebindWait(waitBaseline, Tail(during));
+                Need(reentry != null && reentry.ReadyRow == slots - 1 - evicted, "RECEIVE_SELF_TEST_YIELD_SHIFT_REENTRY");
+                // The command that follows (one more eviction) is admitted as today: two observations, first command row.
+                var command = Plus(during, "pwrsi");
+                var p1 = Tail(command);
+                var p2 = Tail(command);
+                var waiting = reentry;
+                var c1 = Poll(ref waiting, reentry.Snapshot, p1);
+                var c2 = Poll(ref waiting, p1, p2);
+                Need(c1 == Slot(p1, slots - 1) && c2 == Slot(p2, slots - 1) && SameCandidate(p1, c1, p2, c2) &&
+                    waiting.ReadyRow == slots - 2 - evicted, "RECEIVE_SELF_TEST_YIELD_SHIFT_COMMAND");
+            }
+            // Re-entry with rows after Ready and no further eviction keeps the carried row (today's re-binding alone fails).
+            var grownWait = FreshWait();
+            var grownWindow = Tail(Chat(Plus(Previous(), readyText), 1), slots + 1);
+            Refused(() => BindReadyBoundary(grownWait, grownWindow), "RECEIVE_READY_NOT_APPENDED");
+            var grownReentry = RebindWait(grownWait, grownWindow);
+            Need(grownReentry != null && grownReentry.ReadyRow == slots - 1, "RECEIVE_SELF_TEST_YIELD_SHIFT_SAME_ROW");
+            // Refusals keep today's re-binding and its reason: 9 rows in one step, an earlier row changed, a second Ready.
+            Refused(() => RebindWait(FreshWait(), Tail(Chat(Plus(Previous(), readyText), MaxEvictedRows + 1))),
+                "RECEIVE_READY_NOT_APPENDED");
+            Refused(() => RebindWait(FreshWait(), Tail(Chat(Plus(changedEarlier, readyText), 1))), "RECEIVE_READY_NOT_APPENDED");
+            Refused(() => RebindWait(FreshWait(), Tail(Plus(Chat(Plus(Previous(), readyText), 1), readyText))),
+                "RECEIVE_READY_BOUNDARY_AMBIGUOUS");
+
+            // Yield, one eviction before the notice, a two-part watchdog notice (each part evicts a row), then SendReady.
+            var noticeWait = FreshWait();
+            var beforeNotice = Chat(Plus(Previous(), readyText), 1);
+            var notice1 = "WATCHDOG D456789 | 완료 알림 | PART 001/002";
+            var notice2 = "WATCHDOG D456789 | 완료 알림 | PART 002/002";
+            StatusSession.RequireNoPendingCommand(noticeWait, Tail(beforeNotice)); // Before: RECEIVE_READY_NOT_APPENDED.
+            StatusSession.RequireNoPendingCommand(noticeWait, Tail(Plus(beforeNotice, notice1)));
+            Refused(() => StatusSession.RequireNoPendingCommand(noticeWait, Tail(Plus(beforeNotice, notice1, "pwrsi"))),
+                "WATCHDOG_NOTICE_COMMAND_PENDING"); // A command that arrived first is still handled first.
+            // SendReady's pre-Ready baseline is the Ready send's own current capture; the new Ready lands last, one row evicted.
+            var afterNotices = Plus(beforeNotice, notice1, notice2);
+            var nextWait = CreateBaseline(Tail(afterNotices), "M345678", true);
+            var nextBound = RebindWait(nextWait, Tail(Plus(afterNotices, SupervisedSendTest.ReadyText("D345678"))));
+            Need(nextBound != null && nextBound.ReadyRow == slots - 1, "RECEIVE_SELF_TEST_YIELD_SHIFT_NOTICE_READY");
         }
 
         // Test-only: give each history row (root and Texts) the runtime id found at the same index of an unshifted
