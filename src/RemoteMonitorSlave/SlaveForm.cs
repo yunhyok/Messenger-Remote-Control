@@ -966,10 +966,7 @@ namespace RemoteMonitorSlave
                                 try { log.WriteOutputBufferRead(sample.Process.Pid, sample.Buffer); } catch { }
                                 if (IsPending(sample.Buffer.Code)) throw new InvalidDataException("SC_PENDING");
                                 // A timed-out text provider is not permission to try input against the same application.
-                                bool copyAllowed = sample.Buffer.Text == null &&
-                                    sample.Buffer.Code.StartsWith("BUFFER_", StringComparison.Ordinal) &&
-                                    sample.Buffer.Code != "BUFFER_TIMEOUT" && sample.Buffer.Code != "BUFFER_WORKER_FAILED" &&
-                                    sample.Buffer.Code != "BUFFER_SIZE" && sample.Buffer.Code != "BUFFER_TOO_LARGE";
+                                bool copyAllowed = OutputAnchorStore.ReadPermitsInput(sample.Buffer);
                                 // LLM off or not configured: the LLM-free routes still run when auto copy is on, the read failure
                                 // permits input and an aim may exist (own stored position or Output scope rectangle). Otherwise
                                 // exactly as before: no capture, no input.

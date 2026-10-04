@@ -257,6 +257,15 @@ namespace RemoteMonitorSlave
             return processAnchor ? "ANCHOR" : scopeRect ? "SCOPE" : layoutAnchor ? "LAYOUT" : null;
         }
 
+        // Whether a direct read failure may be followed by input at all: any BUFFER_* failure without text (the scope-rect
+        // codes and BUFFER_OUTPUT_NO_HWND alike), but never after a timed-out or failed provider or a size refusal.
+        internal static bool ReadPermitsInput(OutputBufferResult read)
+        {
+            return read != null && read.Text == null && read.Code != null && read.Code.StartsWith("BUFFER_", StringComparison.Ordinal) &&
+                read.Code != "BUFFER_TIMEOUT" && read.Code != "BUFFER_WORKER_FAILED" && read.Code != "BUFFER_SIZE" &&
+                read.Code != "BUFFER_TOO_LARGE";
+        }
+
         // Vision off, before any capture (the client size that keys every aim is not known yet): only a read failure that
         // permits input, with this process's stored position or the buffer read's Output scope rectangle, is worth the
         // activation and capture. LAYOUT needs that scope rectangle as well (OffersLayout), so it adds nothing here.
@@ -551,6 +560,28 @@ namespace RemoteMonitorSlave
                 DecideBlindFallback(false, true, true, true, true) && !DecideBlindFallback(false, true, true, false, false) &&
                 !DecideBlindFallback(false, false, true, true, true) && !DecideBlindFallback(false, true, false, true, true) &&
                 !DecideBlindFallback(true, true, true, true, true), "vision off: capture only with a possible aim");
+            // A windowless "Output" dock (BUFFER_OUTPUT_NO_HWND) aims SCOPE exactly like BUFFER_STANDARD_TEXT_NOT_FOUND, after a
+            // model failure and with the LLM off; BUFFER_OUTPUT_NOT_IDENTIFIED has no rectangle and no SCOPE.
+            OutputBufferResult Read(string readCode, string readDetail, string text = null)
+            { return new OutputBufferResult { Code = readCode, Method = "NATIVE_WM_GETTEXT", Detail = readDetail, Text = text }; }
+            var noHwnd = Read("BUFFER_OUTPUT_NO_HWND", "B1|37|0|0|143|R|315|735|300|265");
+            var customText = Read("BUFFER_STANDARD_TEXT_NOT_FOUND", "B1|37|1|0|0|R|315|735|300|265");
+            var notIdentified = Read("BUFFER_OUTPUT_NOT_IDENTIFIED", "B1|37|0|0|143");
+            foreach (var aimed in new[] { noHwnd, customText })
+            {
+                bool scope = PowerSiOutputBuffer.HasScopeRect(aimed.Detail), permits = ReadPermitsInput(aimed);
+                Need(scope && permits && DecideFallbackRoute(true, true, permits, "OUTPUT_REGION_UNCONFIRMED", false, scope, false) == "SCOPE" &&
+                    DecideFallbackRoute(true, true, permits, "VISION_TIMEOUT", false, scope, true) == "SCOPE" &&
+                    DecideFallbackRoute(false, true, permits, "VISION_NOT_CONFIGURED", false, scope, false) == "SCOPE" &&
+                    DecideBlindFallback(false, true, permits, false, scope) && DecideFallbackRoute(true, false, permits, "VISION_TIMEOUT", false, scope, false) == null,
+                    "SCOPE route for " + aimed.Code);
+            }
+            Need(ReadPermitsInput(notIdentified) && !PowerSiOutputBuffer.HasScopeRect(notIdentified.Detail) &&
+                !DecideBlindFallback(false, true, true, false, false) &&
+                DecideFallbackRoute(true, true, true, "VISION_TIMEOUT", false, false, false) == null, "no rectangle, no SCOPE");
+            foreach (var refused in new[] { Read("BUFFER_TIMEOUT", "NONE"), Read("BUFFER_WORKER_FAILED", "NONE"), Read("BUFFER_SIZE", "NONE"),
+                Read("BUFFER_TOO_LARGE", "NONE"), Read("BUFFER_READ", "B1|2|1|1|0", "text"), Read("SC_PENDING", "NONE"), Read(null, "NONE"), null })
+                Need(!ReadPermitsInput(refused), "read refuses input: " + (refused?.Code ?? "null"));
             var success = PowerSiObservation.VisionLogExcerpt(null, learned);
             var empty = PowerSiObservation.VisionLogExcerpt(null, learned); empty.LocalVisibleEmpty = true;
             var unreadable = PowerSiObservation.VisionUnavailable("OUTPUT_UNAVAILABLE"); unreadable.LocalFailure = "LOCATE_OUTPUT_OUTPUT_UNREADABLE";

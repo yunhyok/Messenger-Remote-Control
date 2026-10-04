@@ -45,6 +45,7 @@ namespace RemoteMonitorLink
             int uiaVisited = 0, textCandidates = 0;
             string code = "BUFFER_FAILED";
             string largeRead = ""; // "|E|kind|declared|copied|stable" once a Unicode RichEdit above 64K was read.
+            string noHwndRect = ""; // "|R|x|y|w|h" of the one HWND-less "Output" element's UIA geometry (BUFFER_OUTPUT_NO_HWND).
             IntPtr output = IntPtr.Zero; // Set only once exactly one outer Output scope HWND is identified.
             try
             {
@@ -89,9 +90,16 @@ namespace RemoteMonitorLink
                 }
                 // Native captions and UIA names are different contracts. In this same attempt, link the semantic dock
                 // to its non-root HWND rather than guessing a body rectangle beneath a label.
+                var geometry = Rectangle.Empty;
                 if (scopes.Count == 0)
-                    DiscoverUiaScopes(root, pid, scopes, ref uiaVisited);
+                    geometry = DiscoverUiaScopes(root, pid, scopes, ref uiaVisited);
                 var outerScopes = scopes.Where(s => !scopes.Any(other => other != s && IsChild(other, s))).ToArray();
+                // Found by name but windowless (no HWND to read): only its UIA geometry, for the separately guarded SCOPE copy.
+                if (outerScopes.Length == 0 && !geometry.IsEmpty)
+                {
+                    noHwndRect = RectSuffix(geometry);
+                    throw new ReadFailure("BUFFER_OUTPUT_NO_HWND");
+                }
                 Require(outerScopes.Length != 0, "BUFFER_OUTPUT_NOT_IDENTIFIED");
                 Require(outerScopes.Length == 1, "BUFFER_OUTPUT_AMBIGUOUS");
                 output = outerScopes[0];
@@ -149,9 +157,12 @@ namespace RemoteMonitorLink
             // followed by the large-RichEdit read fields when that read was attempted.
             var detail = Detail(nodes.Count, scopes.Count, textCandidates, uiaVisited) + largeRead;
             if (output != IntPtr.Zero && ScopeRectCodes.Contains(code, StringComparer.Ordinal)) detail += ScopeRectSuffix(root, output);
+            else if (code == "BUFFER_OUTPUT_NO_HWND") detail += noHwndRect;
             return new OutputBufferResult { Code = code, Method = "NATIVE_WM_GETTEXT", Detail = detail };
         }
 
+        // Codes of an identified Output scope HWND that carry its rectangle. BUFFER_OUTPUT_NO_HWND carries the UIA geometry
+        // of its single windowless "Output" element instead (same "|R|x|y|w|h" root-client shape).
         private static readonly string[] ScopeRectCodes = { "BUFFER_STANDARD_TEXT_NOT_FOUND", "BUFFER_TEXT_AMBIGUOUS",
             "BUFFER_RICHEDIT_LARGE_UNSUPPORTED", "BUFFER_READ_TIMEOUT", "BUFFER_INCOMPLETE", "BUFFER_CHANGED_DURING_READ",
             "BUFFER_RICHEDIT_UNSTABLE" };
@@ -159,6 +170,32 @@ namespace RemoteMonitorLink
         {
             return string.Format(CultureInfo.InvariantCulture, "B1|{0}|{1}|{2}|{3}", nodes, scopes, candidates, uia);
         }
+        private static string RectSuffix(Rectangle rect)
+        {
+            return string.Format(CultureInfo.InvariantCulture, "|R|{0}|{1}|{2}|{3}", rect.X, rect.Y, rect.Width, rect.Height);
+        }
+
+        // UIA geometry of the one windowless "Output" element, in root client pixels. chain[0] is that element's
+        // BoundingRectangle, chain[1..4] its ancestors (the caller stops early at the root window, another process or a tab
+        // that is not selected). The first element of at least 240x120 decides: a caption bar or tab label is smaller, so
+        // its dock or tab pane is chosen; one larger than 90% of the client in either dimension is the main area or the
+        // whole window, and one not fully inside the client is not this window's pane. Either refuses (Empty), as do zero or
+        // several "Output" elements, no such element within 4 ancestors, or an empty client. Never clipped or guessed.
+        internal static Rectangle SelectOutputGeometry(int outputElements, IList<Rectangle> chain, Size client)
+        {
+            if (outputElements != 1 || chain == null || client.Width < 1 || client.Height < 1) return Rectangle.Empty;
+            for (int index = 0; index < chain.Count && index <= GeometryAncestors; index++)
+            {
+                var rect = chain[index];
+                if (rect.Width < GeometryMinWidth || rect.Height < GeometryMinHeight) continue;
+                if ((long)rect.Width * 10 > (long)client.Width * 9 || (long)rect.Height * 10 > (long)client.Height * 9 ||
+                    rect.X < 0 || rect.Y < 0 || (long)rect.X + rect.Width > client.Width || (long)rect.Y + rect.Height > client.Height)
+                    return Rectangle.Empty;
+                return rect;
+            }
+            return Rectangle.Empty;
+        }
+        private const int GeometryMinWidth = 240, GeometryMinHeight = 120, GeometryAncestors = 4;
         // WM_GETTEXT into declared + 2 characters (declared + 1 text characters and the terminator): a copy that fills
         // the buffer (capacity - 1 characters) may have been cut. The marshaler returns the text up to the first NUL.
         private static string ReadText(IntPtr window, int declared, out UIntPtr copied, out int capacity)
@@ -294,8 +331,18 @@ namespace RemoteMonitorLink
                 .Contains(name, StringComparer.OrdinalIgnoreCase);
         }
 
-        private static void DiscoverUiaScopes(IntPtr root, uint pid, HashSet<IntPtr> scopes, ref int visited)
+        // "Output" elements of the UIA pass: how many, and the one that has no HWND of its own (no handle or only the root's).
+        private sealed class UiaMarkers
         {
+            internal int Count;
+            internal AutomationElement WithoutHandle;
+        }
+
+        // Adds the Output scope HWNDs found by name. When none is found and exactly one "Output" element exists without an
+        // HWND, returns its UIA geometry in root client pixels (SelectOutputGeometry), otherwise Empty.
+        private static Rectangle DiscoverUiaScopes(IntPtr root, uint pid, HashSet<IntPtr> scopes, ref int visited)
+        {
+            var found = new UiaMarkers();
             try
             {
                 var request = new CacheRequest { TreeScope = TreeScope.Element, TreeFilter = Automation.RawViewCondition,
@@ -303,13 +350,60 @@ namespace RemoteMonitorLink
                 request.Add(AutomationElement.NameProperty); request.Add(AutomationElement.ControlTypeProperty);
                 request.Add(AutomationElement.ProcessIdProperty); request.Add(AutomationElement.NativeWindowHandleProperty);
                 request.Add(AutomationElement.IsOffscreenProperty);
-                WalkUia(AutomationElement.FromHandle(root).GetUpdatedCache(request), null, 0, root, pid, scopes, request, ref visited);
+                WalkUia(AutomationElement.FromHandle(root).GetUpdatedCache(request), null, 0, root, pid, scopes, request, ref visited, found);
             }
             catch (ReadFailure) { throw; }
             catch { throw new ReadFailure("BUFFER_UIA_UNAVAILABLE"); }
+            return scopes.Count == 0 && found.Count == 1 && found.WithoutHandle != null
+                ? OutputGeometry(root, pid, found.WithoutHandle) : Rectangle.Empty;
         }
+
+        // Fail closed: any UIA failure, another process, the root window itself or a tab that is not the selected one ends
+        // the ancestor chain, and only SelectOutputGeometry decides. Geometry only: no Name or text is read here.
+        private static Rectangle OutputGeometry(IntPtr root, uint pid, AutomationElement marker)
+        {
+            try
+            {
+                NativeRect client;
+                if (!GetClientRect(root, out client)) return Rectangle.Empty;
+                var request = new CacheRequest { TreeScope = TreeScope.Element, TreeFilter = Automation.RawViewCondition,
+                    AutomationElementMode = AutomationElementMode.Full };
+                request.Add(AutomationElement.BoundingRectangleProperty); request.Add(AutomationElement.ControlTypeProperty);
+                request.Add(AutomationElement.ProcessIdProperty); request.Add(AutomationElement.NativeWindowHandleProperty);
+                request.Add(SelectionItemPattern.IsSelectedProperty);
+                var walker = TreeWalker.RawViewWalker;
+                var chain = new List<Rectangle>();
+                var element = marker.GetUpdatedCache(request);
+                for (int level = 0; element != null && level <= GeometryAncestors; level++)
+                {
+                    if ((int)element.GetCachedPropertyValue(AutomationElement.ProcessIdProperty) != (int)pid ||
+                        new IntPtr((int)element.GetCachedPropertyValue(AutomationElement.NativeWindowHandleProperty)) == root) break;
+                    // The pane above an unselected tab shows another page: never aim there.
+                    if (element.GetCachedPropertyValue(AutomationElement.ControlTypeProperty) as ControlType == ControlType.TabItem &&
+                        !(element.GetCachedPropertyValue(SelectionItemPattern.IsSelectedProperty) is bool selected && selected)) break;
+                    chain.Add(ToClient(root, (System.Windows.Rect)element.GetCachedPropertyValue(AutomationElement.BoundingRectangleProperty)));
+                    element = level < GeometryAncestors ? walker.GetParent(element, request) : null;
+                }
+                return SelectOutputGeometry(1, chain, new Size(client.Right - client.Left, client.Bottom - client.Top));
+            }
+            catch { return Rectangle.Empty; }
+        }
+
+        // Screen to root client pixels exactly like ScopeRectSuffix (ScreenToClient of both corners, mirrored roots normalized).
+        private static Rectangle ToClient(IntPtr root, System.Windows.Rect screen)
+        {
+            if (screen.IsEmpty || double.IsNaN(screen.Left) || double.IsNaN(screen.Top) || double.IsInfinity(screen.Width) ||
+                double.IsInfinity(screen.Height) || screen.Width <= 0 || screen.Height <= 0 ||
+                Math.Abs(screen.Left) > 1e7 || Math.Abs(screen.Top) > 1e7 || screen.Width > 1e7 || screen.Height > 1e7) return Rectangle.Empty;
+            var a = new NativePoint { X = (int)Math.Round(screen.Left), Y = (int)Math.Round(screen.Top) };
+            var b = new NativePoint { X = (int)Math.Round(screen.Right), Y = (int)Math.Round(screen.Bottom) };
+            if (!ScreenToClient(root, ref a) || !ScreenToClient(root, ref b)) return Rectangle.Empty;
+            long x = Math.Min(a.X, b.X), y = Math.Min(a.Y, b.Y), w = Math.Abs((long)b.X - a.X), h = Math.Abs((long)b.Y - a.Y);
+            return w <= 0 || h <= 0 || w > int.MaxValue || h > int.MaxValue ? Rectangle.Empty : new Rectangle((int)x, (int)y, (int)w, (int)h);
+        }
+
         private static void WalkUia(AutomationElement element, AutomationElement parent, int depth, IntPtr root, uint pid,
-            HashSet<IntPtr> scopes, CacheRequest request, ref int visited)
+            HashSet<IntPtr> scopes, CacheRequest request, ref int visited, UiaMarkers found)
         {
             Require(depth <= 20 && visited++ < MaxUiaNodes, "BUFFER_UIA_LIMIT");
             Require((int)element.GetCachedPropertyValue(AutomationElement.ProcessIdProperty) == pid, "BUFFER_TARGET_CHANGED");
@@ -321,14 +415,14 @@ namespace RemoteMonitorLink
                  type == ControlType.Text || type == ControlType.TitleBar || type == ControlType.Window);
             if (marker)
             {
+                found.Count++;
                 var scope = type == ControlType.Text || type == ControlType.TitleBar ? parent : element;
-                if (scope != null)
-                {
-                    var handle = new IntPtr((int)scope.GetCachedPropertyValue(AutomationElement.NativeWindowHandleProperty));
-                    uint owner;
-                    if (handle != IntPtr.Zero && handle != root && IsChild(root, handle) && IsWindowVisible(handle) &&
-                        GetWindowThreadProcessId(handle, out owner) != 0 && owner == pid) scopes.Add(handle);
-                }
+                var handle = scope == null ? IntPtr.Zero :
+                    new IntPtr((int)scope.GetCachedPropertyValue(AutomationElement.NativeWindowHandleProperty));
+                uint owner;
+                if (handle != IntPtr.Zero && handle != root && IsChild(root, handle) && IsWindowVisible(handle) &&
+                    GetWindowThreadProcessId(handle, out owner) != 0 && owner == pid) scopes.Add(handle);
+                else if (handle == IntPtr.Zero || handle == root) found.WithoutHandle = element;
                 return;
             }
             // Same bounded dock-discovery pruning as PowerSiObservation; never scan individual net/log rows.
@@ -337,7 +431,7 @@ namespace RemoteMonitorLink
                 type == ControlType.Document || type == ControlType.Edit) return;
             var walker = TreeWalker.RawViewWalker;
             for (var child = walker.GetFirstChild(element, request); child != null; child = walker.GetNextSibling(child, request))
-                WalkUia(child, element, depth + 1, root, pid, scopes, request, ref visited);
+                WalkUia(child, element, depth + 1, root, pid, scopes, request, ref visited, found);
         }
 
         private static int CountLines(string text)
@@ -370,7 +464,8 @@ namespace RemoteMonitorLink
             ValidateLength(MaxCharacters, true, true);
             LargeReadSelfTest();
             ScopeRectParseSelfTest();
-            Console.WriteLine("PASS: buffer RichEdit above 64K acceptance table (declared/copied/capacity/line breaks/stable) and B1 scope-rect parser");
+            GeometrySelfTest();
+            Console.WriteLine("PASS: buffer RichEdit above 64K acceptance table (declared/copied/capacity/line breaks/stable), B1 scope-rect parser, windowless Output geometry table");
             // Owned offscreen HWND fixture. Never changes another application's focus, input, or clipboard.
             var root = CreateWindowEx(0x08000080, "Static", "Owned buffer self-test", 0x80000000 | Visible,
                 -32000, -32000, 420, 280, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
@@ -453,6 +548,43 @@ namespace RemoteMonitorLink
                     !HasScopeRect(big.Detail), "TEST_RICHEDIT_LARGE");
             }
             finally { DestroyWindow(root); }
+        }
+
+        // Synthetic root-client rectangles of a 1920x1009 PowerSI window; no UIA.
+        private static void GeometrySelfTest()
+        {
+            var client = new Size(1920, 1009);
+            var caption = new Rectangle(315, 735, 300, 22);
+            var dock = new Rectangle(315, 735, 300, 265);
+            Rectangle Pick(int names, params Rectangle[] chain) { return SelectOutputGeometry(names, chain, client); }
+            Require(Pick(1, caption, dock) == dock && Pick(1, caption, dock, new Rectangle(0, 0, 1920, 1009)) == dock,
+                "TEST_GEOMETRY_CAPTION_TO_PANE");
+            // Tab label -> tab item -> tab strip (wide but 26 px high) -> the tab control's pane.
+            var tabPane = new Rectangle(315, 736, 600, 264);
+            Require(Pick(1, new Rectangle(320, 740, 60, 20), new Rectangle(318, 738, 64, 24), new Rectangle(315, 736, 600, 26), tabPane) == tabPane,
+                "TEST_GEOMETRY_TAB_LABEL");
+            Require(Pick(1, dock, new Rectangle(300, 700, 700, 300)) == dock && Pick(1, new Rectangle(0, 0, 240, 120)) == new Rectangle(0, 0, 240, 120),
+                "TEST_GEOMETRY_ALREADY_LARGE");
+            // The first large enough element decides: the whole window or main area refuses rather than looking further up.
+            Require(Pick(1, caption, new Rectangle(0, 0, 1920, 1009)).IsEmpty && Pick(1, caption, new Rectangle(0, 40, 1729, 600), dock).IsEmpty &&
+                Pick(1, caption, new Rectangle(10, 0, 600, 909)).IsEmpty && Pick(1, new Rectangle(0, 0, 1728, 908)) == new Rectangle(0, 0, 1728, 908),
+                "TEST_GEOMETRY_TOO_LARGE");
+            Require(Pick(2, caption, dock).IsEmpty && Pick(0, caption, dock).IsEmpty, "TEST_GEOMETRY_NAMES");
+            Require(Pick(1, caption, new Rectangle(1700, 735, 300, 265)).IsEmpty && Pick(1, caption, new Rectangle(-5, 735, 300, 265)).IsEmpty &&
+                Pick(1, caption, new Rectangle(315, 800, 300, 265)).IsEmpty && Pick(1, caption, new Rectangle(315, -1, 300, 265)).IsEmpty,
+                "TEST_GEOMETRY_OUTSIDE_CLIENT");
+            Require(Pick(1, new Rectangle(0, 0, 239, 400), new Rectangle(0, 0, 400, 119)).IsEmpty && Pick(1, caption).IsEmpty &&
+                Pick(1).IsEmpty && SelectOutputGeometry(1, null, client).IsEmpty && SelectOutputGeometry(1, new[] { dock }, Size.Empty).IsEmpty,
+                "TEST_GEOMETRY_NONE");
+            // At most 4 ancestors above the element itself.
+            var small = Rectangle.Empty;
+            Require(Pick(1, caption, small, small, small, dock) == dock && Pick(1, caption, small, small, small, small, dock).IsEmpty,
+                "TEST_GEOMETRY_FOUR_ANCESTORS");
+            // BUFFER_OUTPUT_NO_HWND carries the same "|R|x|y|w|h" root-client shape as the HWND scope codes.
+            var detail = Detail(37, 0, 0, 143) + RectSuffix(dock);
+            Rectangle parsed;
+            Require(detail == "B1|37|0|0|143|R|315|735|300|265" && TryScopeRect(detail, client, out parsed) && parsed == dock &&
+                HasScopeRect(detail) && !HasScopeRect(Detail(37, 0, 0, 143)), "TEST_GEOMETRY_SCOPE_RECT");
         }
 
         private static void LargeReadSelfTest()
@@ -547,6 +679,7 @@ namespace RemoteMonitorLink
         [StructLayout(LayoutKind.Sequential)] private struct NativeRect { internal int Left, Top, Right, Bottom; }
         [StructLayout(LayoutKind.Sequential)] private struct NativePoint { internal int X, Y; }
         [DllImport("user32.dll")] private static extern bool GetWindowRect(IntPtr window, out NativeRect rect);
+        [DllImport("user32.dll")] private static extern bool GetClientRect(IntPtr window, out NativeRect rect);
         [DllImport("user32.dll")] private static extern bool ScreenToClient(IntPtr window, ref NativePoint point);
         [DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
         [DllImport("user32.dll")] private static extern uint GetClipboardSequenceNumber();
