@@ -344,7 +344,7 @@ namespace RemoteMonitorMaster
                     var notice = SupervisedSendTest.Consent.ForAbortNotice("D" + requestMarker.Substring(1), confirmed, prepared);
                     Volatile.Write(ref activeNotice, notice);
                     Alive();
-                    progress(CompletedRounds, "NOTICE_ABORT", requestMarker);
+                    progress(CompletedRounds, "NOTICE_ABORT:" + confirmed.ToString(System.Globalization.CultureInfo.InvariantCulture) + "/" + prepared.ToString(System.Globalization.CultureInfo.InvariantCulture), requestMarker);
                     SupervisedSendTest.Outcome result = null;
                     string reason;
                     try
