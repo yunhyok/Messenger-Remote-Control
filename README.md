@@ -84,3 +84,7 @@ powershell -ExecutionPolicy Bypass -File scripts/build-installers.ps1
 [SLAVE-TEST.md](SLAVE-TEST.md)와 [WIN7-TEST.md](WIN7-TEST.md)는 새 모바일 보고 경로의 짧은 현장 확인 안내입니다. 빌드 산출물·검증 자료·개인 설정은 Git에서 제외합니다. 문서만 정리한 커밋은 앱 버전이나 기존 Release 설치파일을 바꾸지 않습니다.
 
 출발 소스: [Remote-Control-App v0.1.58](https://github.com/yunhyok/Remote-Control-App/tree/1365e2c249d00b2a73634c77cd7bc82247f82405). 이 저장소는 해당 커밋의 공개 가능한 소스와 빌드 파일을 독립적으로 복사했습니다. 기존 저장소 및 HFSS 작업은 변경하지 않습니다.
+
+## Installer 0.3.12
+
+The destination page is shown on fresh installs and reinstalls, with a Browse button for another drive or folder. New all-user installs default to Windows Program Files. Existing install mode, selected path and user settings are preserved. Choosing the current-user mode keeps its per-user default and needs no administrator rights.

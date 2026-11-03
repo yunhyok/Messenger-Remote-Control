@@ -1,3 +1,5 @@
+v0.3.12 설치 경로 수정: 신규·재설치 모두 경로와 Browse 표시. 신규 전체 사용자 설치 기본 위치는 Program Files. 기존 설치 모드·선택 경로·설정·연결파일 유지. 현재 사용자 설치 선택 시 관리자 권한 불필요. 통신 규약·수집·입력 동작 변경 없음. GitHub Windows runner에서 설치·재설치·삭제 검증, Win7/Win11 실기 확인 별도.
+
 # 설치·업그레이드·운영 안내 — v0.3.11
 
 v0.3.11은 2026-10-04 현장 로그(Master·Slave 0.3.10)에서 긴 `pwrsi` 회신 도중 운용이 멈춘 문제에 대한 Master·Slave 변경판입니다. Master는 `pwrsi`의 대상별 Output을 끝 3,000자만 표시하고(머리글 `…마지막 3,000자:`와 생략 글자 수 표시, 전송 이력은 전체 본문 기준), 버퍼·자동 복사로 읽은 대상에 완료 판정 줄을 붙이며, 긴 회신 중 메신저가 대화 기록 위쪽 행을 8개 이하로 정리해도 접수한 명령을 본문으로 다시 찾아 이어 갑니다. 앞부분이 정상 전송된 뒤 멈추면 `보고 전송을 중단했습니다 (c/p 전송됨). …` 안내와 새 `Master Ready`를 보냅니다. Slave는 PowerSI와 같은 실행 파일인 PowerDC 모드 창을 읽기·입력 없이 제외하고(watchdog은 그 PID를 알리고 감시에서 뺌), 65,535자를 넘는 Unicode RichEdit Output을 직접 읽으며, 창 핸들 없는 Output 영역을 찾아 대체 복사에 씁니다. LM Studio 설정 창의 새 확인란 "LLM을 쓰지 않을 때도 대체 복사 허용 (저장 위치·Output 창 구조로 Ctrl+A/C)"(`local-vision.json`의 `blind_copy`)은 기본 꺼짐이고 업그레이드나 설정 초기화로 켜지지 않으며, 켜면 LLM 판독이 꺼져 있어도 PowerSI 창에 Ctrl+A/C 입력을 보냅니다. 접수·전송·Pending 규칙과 프로토콜 0.3.0은 그대로이고 현장 확인 전입니다.
@@ -37,7 +39,7 @@ v0.3.3은 분할 회신 중 접수한 명령을 다시 확인할 때 이전 Read
 ## 설치
 
 1. 해당 역할의 기존 Remote Monitor 프로그램만 종료합니다. PowerSI와 HFSS를 종료할 필요는 없습니다.
-2. 설치 파일을 실행하고 설치 위치를 확인합니다. 기본 위치는 현재 사용자의 `%LOCALAPPDATA%\Programs\Messenger Remote Control\Master` 또는 `Slave`입니다. 프로그램 설치는 일반 사용자로 진행하며, Master에 필요한 .NET 런타임이 없는 경우에만 Microsoft 런타임 설치에 관리자 승인이 필요합니다.
+2. 설치 파일을 실행하고 설치 위치를 확인합니다. 신규 전체 사용자 설치의 기본 위치는 Windows Program Files 아래 `Messenger Remote Control\Master` 또는 `Slave`입니다. Browse로 다른 드라이브·폴더를 선택할 수 있습니다. 기존 현재 사용자 설치의 모드·경로는 유지됩니다. 전체 사용자 설치와 .NET 런타임 설치에는 관리자 승인이 필요합니다.
 3. 시작 메뉴의 **Messenger Remote Control Master** 또는 **Messenger Remote Control Slave**를 실행합니다. 창 제목에서 **v0.3.11**을 확인합니다. 0.3.10부터 설치파일·바로가기와 Master/Slave 창의 제목 표시줄·작업 표시줄에 새 아이콘(Master: 메신저 말풍선과 원격 신호, Slave: 작업용 화면과 주파수 스윕·완료 체크)이 표시됩니다. Master 허브 화면의 "Slave 통신 규약"은 앱 버전이 아니라 프로토콜(0.3.0)입니다.
 
 Master 설치 파일에는 Microsoft 공식 .NET Framework **4.8** 오프라인 설치본이 들어 있습니다. 런타임이 이미 있으면 설치를 건너뛰며, 없으면 포함된 설치본을 실행합니다. 재부팅이 필요하면 안내한 뒤 사용자가 재부팅하고 Master 설치를 다시 실행합니다. 강제로 재부팅하지 않습니다.

@@ -29,7 +29,7 @@ function Get-UninstallEntries {
 function Invoke-Setup {
     param([string]$Path, [string]$InstallDirectory)
     $log = Join-Path $workRoot (([IO.Path]::GetFileNameWithoutExtension($Path)) + '-' + [Guid]::NewGuid().ToString('N') + '.log')
-    $arguments = "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /RESTARTEXITCODE=3010 /LOG=`"$log`""
+    $arguments = "/CURRENTUSER /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /RESTARTEXITCODE=3010 /LOG=`"$log`""
     if ($InstallDirectory) { $arguments += " /DIR=`"$InstallDirectory`"" }
     $process = Start-Process -FilePath $Path -ArgumentList $arguments -Wait -PassThru -WindowStyle Hidden
     # /RESTARTEXITCODE=3010 asks Setup to report a pending restart instead of restarting this PC.
