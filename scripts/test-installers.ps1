@@ -134,6 +134,7 @@ try {
         }
         foreach ($path in $preserved.Keys) { Set-Content -LiteralPath $path -Value $preserved[$path] -NoNewline -Encoding UTF8 }
 
+        & (Join-Path $PSScriptRoot 'Test-InstallerWizard.ps1') -Setup $roleSpec.Installer -Mode '/ALLUSERS'
         if ((Invoke-Setup -Path $roleSpec.Installer -InstallDirectory $installDirectory) -eq 3010) {
             Write-Host "$($roleSpec.Product): the installer reported exit 3010 (restart required) - reboot, then re-run this script. The upgrade and uninstall checks were not run."
             $restartRequired = $true
@@ -168,6 +169,7 @@ try {
             [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell)
         }
 
+        & (Join-Path $PSScriptRoot 'Test-InstallerWizard.ps1') -Setup $roleSpec.Installer -Mode '/CURRENTUSER' -ExpectedDirectory $installDirectory
         if ((Invoke-Setup -Path $roleSpec.Installer -InstallDirectory $null) -eq 3010) {
             Write-Host "$($roleSpec.Product): the same-version reinstall reported exit 3010 (restart required) - reboot, then re-run this script. The upgrade and uninstall checks were not run."
             $restartRequired = $true
